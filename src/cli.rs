@@ -9,8 +9,6 @@ pub enum NetMode {
     Host,
     /// Empty network namespace with zero connectivity
     Isolate,
-    /// User-mode networking via pasta (tap device with DHCP)
-    Pasta,
 }
 
 impl std::fmt::Display for NetMode {
@@ -18,7 +16,6 @@ impl std::fmt::Display for NetMode {
         match self {
             NetMode::Host => write!(f, "host"),
             NetMode::Isolate => write!(f, "isolate"),
-            NetMode::Pasta => write!(f, "pasta"),
         }
     }
 }
@@ -38,14 +35,9 @@ pub struct Cli {
     #[arg(long)]
     pub passthrough: Vec<PathBuf>,
 
-    /// Network mode: host (default), isolate, or pasta
+    /// Network mode: host (default) or isolate
     #[arg(long, value_enum, default_value_t)]
     pub net: NetMode,
-
-    /// Hostnames allowed through the SNI proxy (comma-separated). When set with
-    /// --net pasta, an sni-proxy is launched that only permits HTTPS to these hosts.
-    #[arg(long, value_delimiter = ',')]
-    pub allowed_hosts: Vec<String>,
 
     /// Command and arguments to run inside the sandbox
     #[arg(last = true, required = true)]
@@ -155,52 +147,8 @@ mod tests {
     }
 
     #[test]
-    fn test_net_pasta() {
-        let cli = Cli::parse_from(["hermit", "--net", "pasta", "--", "make"]);
-        assert_eq!(cli.net, NetMode::Pasta);
-    }
-
-    #[test]
     fn test_net_invalid_value() {
         let result = Cli::try_parse_from(["hermit", "--net", "bogus", "--", "make"]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_allowed_hosts_default_empty() {
-        let cli = Cli::parse_from(["hermit", "--", "make"]);
-        assert!(cli.allowed_hosts.is_empty());
-    }
-
-    #[test]
-    fn test_allowed_hosts_single() {
-        let cli = Cli::parse_from(["hermit", "--allowed-hosts", "example.com", "--", "make"]);
-        assert_eq!(cli.allowed_hosts, vec!["example.com"]);
-    }
-
-    #[test]
-    fn test_allowed_hosts_multiple_comma() {
-        let cli = Cli::parse_from([
-            "hermit",
-            "--allowed-hosts",
-            "a.com,b.com,c.com",
-            "--",
-            "make",
-        ]);
-        assert_eq!(cli.allowed_hosts, vec!["a.com", "b.com", "c.com"]);
-    }
-
-    #[test]
-    fn test_allowed_hosts_multiple_flags() {
-        let cli = Cli::parse_from([
-            "hermit",
-            "--allowed-hosts",
-            "a.com",
-            "--allowed-hosts",
-            "b.com",
-            "--",
-            "make",
-        ]);
-        assert_eq!(cli.allowed_hosts, vec!["a.com", "b.com"]);
     }
 }

@@ -56,5 +56,5 @@ fn run() -> Result<i32> {
 
     info!("command: {}", cli.command.join(" "));
 
-    run_sandboxed(&project_dir, &passthrough, &cli.command, &cli.net, &cli.allowed_hosts)
+    run_sandboxed(&project_dir, &passthrough, &cli.command, &cli.net)
 }

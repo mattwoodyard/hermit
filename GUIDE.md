@@ -1,8 +1,8 @@
 # Hermit User Guide
 
 Hermit is a lightweight sandbox that runs build commands with filesystem and
-network isolation. It uses Linux user namespaces (no root required), Landlock
-MAC policies, and optionally pasta for user-mode networking.
+network isolation. It uses Linux user namespaces (no root required) and Landlock
+MAC policies.
 
 ## Installation
 
@@ -12,13 +12,6 @@ cargo build --release
 # optional: copy to a directory on $PATH
 cp target/release/hermit ~/.local/bin/
 ```
-
-### Optional dependencies
-
-| Tool | Required for | Install |
-|------|-------------|---------|
-| pasta (passt) | `--net pasta` | `apt install passt` or https://passt.top |
-| sni-proxy | `--allowed-hosts` | `cargo install --path ../sni-proxy` |
 
 ## Quick start
 
@@ -43,8 +36,7 @@ hermit [OPTIONS] -- <COMMAND>...
 |------|---------|-------------|
 | `--project-dir <DIR>` | `.` | Directory with read-write access inside the sandbox |
 | `--passthrough <DIR>` | _(none)_ | Extra read-write directory (repeatable) |
-| `--net <MODE>` | `host` | Network mode: `host`, `isolate`, or `pasta` |
-| `--allowed-hosts <HOSTS>` | _(none)_ | Comma-separated hostnames for SNI proxy (requires `--net pasta`) |
+| `--net <MODE>` | `host` | Network mode: `host` or `isolate` |
 | `-v` / `--verbose` | off | Verbosity: `-v` info, `-vv` debug, `-vvv` trace |
 
 ## Filesystem isolation
@@ -85,25 +77,6 @@ Shares the host network. No isolation.
 
 Empty network namespace. Only the loopback interface exists. All outbound
 connections fail. Good for hermetic builds.
-
-### `--net pasta`
-
-User-mode networking via [pasta/passt](https://passt.top). Creates a TAP
-device with DHCP in the sandbox, translating L2 traffic to host L4 sockets.
-The sandbox gets full internet access through the host.
-
-### `--net pasta --allowed-hosts`
-
-Same as `--net pasta`, but also launches an **sni-proxy** alongside pasta.
-The proxy listens on `127.0.0.1:1443` and only allows HTTPS connections to
-the listed hostnames.
-
-```sh
-hermit --net pasta --allowed-hosts crates.io,github.com -- cargo build
-```
-
-> **Note:** In this release, the proxy is started but traffic is not yet
-> transparently routed through it. Routing is a follow-up.
 
 ## Smoke tests
 
@@ -154,31 +127,13 @@ hermit --net isolate --project-dir /tmp -- sh -c 'ls /sys/class/net/'
 # Expected: only "lo"
 ```
 
-### 6. Pasta networking
-
-Requires `pasta` installed.
-
-```sh
-hermit --net pasta --project-dir /tmp -- sh -c 'ls /sys/class/net/'
-# Expected: "lo" plus a tap interface (e.g. "tap0")
-```
-
-### 7. SNI proxy startup
-
-Requires both `pasta` and `sni-proxy` installed.
-
-```sh
-hermit -v --net pasta --allowed-hosts example.com --project-dir /tmp -- echo proxy_ok
-# Expected: prints "proxy_ok", verbose output shows sni-proxy starting and stopping
-```
-
 ## Running the test suite
 
 ```sh
 # Unit tests (always work, no special dependencies)
 cargo test --lib
 
-# Integration tests (some tests skip if pasta/sni-proxy not installed)
+# Integration tests
 cargo test --test integration_test
 
 # All tests

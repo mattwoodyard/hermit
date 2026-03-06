@@ -7,7 +7,6 @@ use crate::cli::NetMode;
 use crate::home_files::load_home_files;
 use crate::landlock::apply_landlock;
 use crate::namespace::setup_namespace;
-use crate::pasta;
 use crate::process;
 
 /// Build the read-write path list for landlock from the sandbox parameters.
@@ -30,29 +29,17 @@ fn build_rw_paths<'a>(
 
 /// Run a command inside the sandbox and return its exit code.
 ///
-/// When `net` is `Isolate` or `Pasta`, the command runs in a forked child
-/// with an empty network namespace. In `Pasta` mode, the pasta daemon is
-/// also launched to provide user-mode networking. In `Host` mode, the
-/// command runs directly in-process with the host network.
+/// When `net` is `Isolate`, the command runs in a forked child with an empty
+/// network namespace. In `Host` mode, the command runs directly in-process
+/// with the host network.
 pub fn run_sandboxed(
     project_dir: &Path,
     passthrough: &[PathBuf],
     command: &[String],
     net: &NetMode,
-    allowed_hosts: &[String],
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
-    }
-
-    // Fail-fast: verify pasta is available before forking
-    if *net == NetMode::Pasta {
-        pasta::find_pasta()?;
-    }
-
-    // Fail-fast: verify sni-proxy is available if allowed_hosts requested
-    if !allowed_hosts.is_empty() {
-        pasta::find_sni_proxy()?;
     }
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -69,11 +56,10 @@ pub fn run_sandboxed(
         NetMode::Host => {
             run_sandboxed_direct(home_path, project_dir, passthrough, &home_files, &rw_paths, command)
         }
-        NetMode::Isolate | NetMode::Pasta => {
+        NetMode::Isolate => {
             info!("using forked sandbox with network isolation (mode: {})", net);
             process::run_forked(
                 home_path, project_dir, passthrough, &home_files, &rw_paths, command, net,
-                allowed_hosts,
             )
         }
     }
@@ -114,29 +100,16 @@ mod tests {
 
     #[test]
     fn test_empty_command_fails() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host, &[]);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
 
     #[test]
     fn test_empty_command_fails_net_isolate() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate, &[]);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
-    }
-
-    #[test]
-    fn test_empty_command_fails_net_pasta() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Pasta, &[]);
-        assert!(result.is_err());
-        // Either "no command specified" or "pasta not found" depending on system
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("no command specified") || msg.contains("pasta not found"),
-            "unexpected error: {}",
-            msg
-        );
     }
 
     #[test]

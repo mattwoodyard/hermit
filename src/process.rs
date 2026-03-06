@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
-use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::os::unix::process::CommandExt;
@@ -12,7 +12,6 @@ use crate::cli::NetMode;
 use crate::home_files::HomeFileDirective;
 use crate::landlock::apply_landlock;
 use crate::namespace::setup_namespace;
-use crate::pasta;
 
 /// PID of the child process, used by signal handlers.
 /// 0 means no child yet (signals are no-ops).
@@ -138,10 +137,6 @@ fn wait_for_child(pid: Pid) -> Result<i32> {
 /// The parent forks, the child sets up namespaces (including CLONE_NEWNET)
 /// and landlock, signals readiness, then exec's the command. The parent
 /// installs signal forwarding and waits for the child to exit.
-///
-/// When `net == Pasta`, a second "pasta-ready" pipe is used:
-///   Child: namespace setup → landlock → signal ns-ready → **wait pasta-ready** → exec
-///   Parent: wait ns-ready → launch_pasta(child_pid) → signal pasta-ready → wait exit
 pub fn run_forked(
     home_path: &Path,
     project_dir: &Path,
@@ -149,49 +144,32 @@ pub fn run_forked(
     home_files: &[HomeFileDirective],
     rw_paths: &[&Path],
     command: &[String],
-    net: &NetMode,
-    allowed_hosts: &[String],
+    _net: &NetMode,
 ) -> Result<i32> {
     let (ns_reader, ns_writer) = readiness_pipe()?;
-
-    // Second pipe for Pasta mode: child waits on this after namespace setup,
-    // parent signals it after pasta has configured the tap device.
-    let (pasta_reader, pasta_writer) = if *net == NetMode::Pasta {
-        let (r, w) = readiness_pipe()?;
-        (Some(r), Some(w))
-    } else {
-        (None, None)
-    };
 
     match unsafe { fork() }.context("fork failed")? {
         ForkResult::Child => {
             drop(ns_reader);
-            drop(pasta_writer); // child doesn't write to pasta pipe
-            child_main(ns_writer, pasta_reader, home_path, project_dir, passthrough, home_files, rw_paths, command, allowed_hosts);
+            child_main(ns_writer, home_path, project_dir, passthrough, home_files, rw_paths, command);
         }
         ForkResult::Parent { child } => {
             drop(ns_writer);
-            drop(pasta_reader); // parent doesn't read from pasta pipe
-            parent_main(ns_reader, pasta_writer, child, allowed_hosts)
+            parent_main(ns_reader, child)
         }
     }
 }
 
 /// Child side of the fork. Sets up namespaces + landlock, signals ready, execs.
 /// This function never returns — it either execs or exits with 126.
-///
-/// When `pasta_ready` is Some, the child waits for the parent to signal that
-/// pasta has configured the tap device before exec'ing.
 fn child_main(
     ns_ready: ReadyWriter,
-    pasta_ready: Option<ReadyReader>,
     home_path: &Path,
     project_dir: &Path,
     passthrough: &[PathBuf],
     home_files: &[HomeFileDirective],
     rw_paths: &[&Path],
     command: &[String],
-    allowed_hosts: &[String],
 ) -> ! {
     // If the parent dies, kill us immediately
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
@@ -211,30 +189,6 @@ fn child_main(
     // Signal parent that namespace + landlock are ready
     ns_ready.signal();
 
-    // If pasta mode: wait for parent to finish launching pasta
-    if let Some(reader) = pasta_ready {
-        if let Err(e) = reader.wait() {
-            eprintln!("hermit: waiting for pasta setup failed: {:#}", e);
-            std::process::exit(126);
-        }
-        info!("child: pasta tap device ready");
-
-        // Redirect outbound HTTPS to the SNI proxy on the host via iptables DNAT.
-        // Pasta's --map-host-loopback maps the gateway to host loopback, so
-        // DNAT to gateway:proxy_port reaches the SNI proxy on the host.
-        if !allowed_hosts.is_empty() {
-            let proxy_port: u16 = pasta::SNI_PROXY_LISTEN
-                .rsplit(':')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .expect("invalid SNI_PROXY_LISTEN port");
-            if let Err(e) = pasta::setup_sni_redirect(proxy_port) {
-                eprintln!("hermit: SNI redirect setup failed: {:#}", e);
-                std::process::exit(126);
-            }
-        }
-    }
-
     info!("child: exec {:?}", command);
     let err = Command::new(&command[0]).args(&command[1..]).exec();
     eprintln!("hermit: exec failed: {}", err);
@@ -242,19 +196,9 @@ fn child_main(
 }
 
 /// Parent side of the fork. Forwards signals and waits for child exit.
-///
-/// When `pasta_writer` is Some (pasta mode):
-///   1. Wait for ns-ready (child has namespace + landlock set up)
-///   2. Launch pasta against child PID (creates tap device)
-///   3. Signal pasta-ready so child can exec
-///
-/// If pasta fails, the pasta_writer is dropped without signaling (child sees
-/// EOF and exits 126), then the child is killed and reaped.
 fn parent_main(
     ns_reader: ReadyReader,
-    pasta_writer: Option<ReadyWriter>,
     child: Pid,
-    allowed_hosts: &[String],
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
@@ -262,49 +206,8 @@ fn parent_main(
     ns_reader.wait()?;
     info!("parent: child namespace ready");
 
-    // RAII handle — dropped at end of scope, killing the proxy
-    let mut _sni_proxy_handle: Option<pasta::SniProxyChild> = None;
-
-    // If pasta mode, launch pasta now and signal the child
-    if let Some(writer) = pasta_writer {
-        match pasta::launch_pasta(child) {
-            Ok(()) => {
-                info!("parent: pasta ready");
-            }
-            Err(e) => {
-                drop(writer);
-                info!("parent: pasta failed, killing child");
-                let _ = kill(child, Signal::SIGKILL);
-                let _ = waitpid(child, None);
-                return Err(e).context("pasta setup failed");
-            }
-        }
-
-        // Launch sni-proxy if allowed_hosts is non-empty
-        if !allowed_hosts.is_empty() {
-            match pasta::launch_sni_proxy(pasta::SNI_PROXY_LISTEN, allowed_hosts) {
-                Ok(handle) => {
-                    info!("parent: sni-proxy running");
-                    _sni_proxy_handle = Some(handle);
-                }
-                Err(e) => {
-                    drop(writer);
-                    info!("parent: sni-proxy failed, killing child");
-                    let _ = kill(child, Signal::SIGKILL);
-                    let _ = waitpid(child, None);
-                    return Err(e).context("sni-proxy setup failed");
-                }
-            }
-        }
-
-        writer.signal();
-        info!("parent: signaled child to proceed");
-    }
-
     info!("parent: waiting for child exit");
-    let exit_code = wait_for_child(child);
-    // _sni_proxy_handle dropped here → proxy killed
-    exit_code
+    wait_for_child(child)
 }
 
 #[cfg(test)]
@@ -333,41 +236,5 @@ mod tests {
     fn test_child_pid_atomic_default() {
         // CHILD_PID starts at 0
         assert_eq!(CHILD_PID.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_two_phase_pipe_round_trip() {
-        // Simulate the two-phase protocol: ns-ready then pasta-ready
-        let (ns_reader, ns_writer) = readiness_pipe().unwrap();
-        let (pasta_reader, pasta_writer) = readiness_pipe().unwrap();
-
-        // "Child" signals ns-ready
-        ns_writer.signal();
-        // "Parent" waits for ns-ready
-        ns_reader.wait().unwrap();
-        // "Parent" signals pasta-ready
-        pasta_writer.signal();
-        // "Child" waits for pasta-ready
-        pasta_reader.wait().unwrap();
-    }
-
-    #[test]
-    fn test_two_phase_pipe_dropped_writer_produces_error() {
-        // Simulate pasta failure: parent drops pasta_writer without signaling
-        let (ns_reader, ns_writer) = readiness_pipe().unwrap();
-        let (pasta_reader, pasta_writer) = readiness_pipe().unwrap();
-
-        ns_writer.signal();
-        ns_reader.wait().unwrap();
-
-        // Parent drops pasta writer without signaling (pasta failed)
-        drop(pasta_writer);
-
-        // Child should see an error
-        let result = pasta_reader.wait();
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("died before signaling"),
-        );
     }
 }

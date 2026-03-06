@@ -133,6 +133,10 @@ fn reject_dotdot(path: &Path, line_num: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that read/write the HERMIT_HOME_FILES env var.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_parse_empty_content() {
@@ -301,6 +305,7 @@ mod tests {
 
     #[test]
     fn test_load_env_var_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // HERMIT_HOME_FILES selects only that file
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("custom-home-files");
@@ -330,6 +335,7 @@ mod tests {
 
     #[test]
     fn test_load_project_and_user_merge() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
 
         let project = dir.path().join("proj");
@@ -354,6 +360,7 @@ mod tests {
 
     #[test]
     fn test_load_project_only_no_user() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
 
         let project = dir.path().join("proj");
@@ -375,6 +382,7 @@ mod tests {
 
     #[test]
     fn test_load_user_only_no_project() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
 
         let project = dir.path().join("proj");
@@ -396,6 +404,7 @@ mod tests {
 
     #[test]
     fn test_load_env_var_nonexistent_file_errors() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvGuard::set("HERMIT_HOME_FILES", "/nonexistent/path/home-files");
 
         let result = load_home_files(Path::new("/tmp"), Path::new("/tmp"));
