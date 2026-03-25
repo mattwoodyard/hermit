@@ -1,0 +1,7 @@
+pass /home/matt/.local/share/claude
+copy /home/matt/.bashrc
+pass /home/matt/.local/bin/claude
+pass /home/matt/.claude
+pass /home/matt/.claude.json
+read /home/matt/.rustup
+read /home/matt/.cargo

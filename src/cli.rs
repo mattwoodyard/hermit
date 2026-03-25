@@ -39,6 +39,13 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t)]
     pub net: NetMode,
 
+    /// Hostnames allowed through the network proxy (implies --net isolate).
+    /// Comma-separated. When set, an SNI proxy and fake DNS server are
+    /// started inside the network namespace to allow TLS connections to
+    /// these hosts.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_hosts: Vec<String>,
+
     /// Command and arguments to run inside the sandbox
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -144,6 +151,24 @@ mod tests {
     fn test_net_isolate() {
         let cli = Cli::parse_from(["hermit", "--net", "isolate", "--", "make"]);
         assert_eq!(cli.net, NetMode::Isolate);
+    }
+
+    #[test]
+    fn test_allowed_hosts_empty_default() {
+        let cli = Cli::parse_from(["hermit", "--", "make"]);
+        assert!(cli.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_allowed_hosts_comma_separated() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "--allowed-hosts",
+            "foo.com,bar.com",
+            "--",
+            "make",
+        ]);
+        assert_eq!(cli.allowed_hosts, vec!["foo.com", "bar.com"]);
     }
 
     #[test]

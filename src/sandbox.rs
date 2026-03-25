@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,14 +30,18 @@ fn build_rw_paths<'a>(
 
 /// Run a command inside the sandbox and return its exit code.
 ///
-/// When `net` is `Isolate`, the command runs in a forked child with an empty
-/// network namespace. In `Host` mode, the command runs directly in-process
-/// with the host network.
+/// When `net` is `Isolate` and `allowed_hosts` is non-empty, the command runs
+/// in a network namespace with an SNI proxy and fake DNS server that allow
+/// TLS connections to the listed hosts. When `allowed_hosts` is empty, the
+/// network namespace has zero connectivity.
+///
+/// In `Host` mode, the command runs directly with the host network.
 pub fn run_sandboxed(
     project_dir: &Path,
     passthrough: &[PathBuf],
     command: &[String],
     net: &NetMode,
+    allowed_hosts: &[String],
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
@@ -56,8 +61,18 @@ pub fn run_sandboxed(
         NetMode::Host => {
             run_sandboxed_direct(home_path, project_dir, passthrough, &home_files, &rw_paths, command)
         }
+        NetMode::Isolate if !allowed_hosts.is_empty() => {
+            info!(
+                "using proxied sandbox with network isolation ({} allowed hosts)",
+                allowed_hosts.len()
+            );
+            let hosts: HashSet<String> = allowed_hosts.iter().cloned().collect();
+            process::run_forked_proxied(
+                home_path, project_dir, passthrough, &home_files, &rw_paths, command, hosts,
+            )
+        }
         NetMode::Isolate => {
-            info!("using forked sandbox with network isolation (mode: {})", net);
+            info!("using forked sandbox with full network isolation");
             process::run_forked(
                 home_path, project_dir, passthrough, &home_files, &rw_paths, command, net,
             )
@@ -100,14 +115,14 @@ mod tests {
 
     #[test]
     fn test_empty_command_fails() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host, &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
 
     #[test]
     fn test_empty_command_fails_net_isolate() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate, &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }

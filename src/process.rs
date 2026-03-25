@@ -1,21 +1,31 @@
 use anyhow::{bail, Context, Result};
-use log::{debug, info};
+use log::{debug, error, info};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
+use std::collections::HashSet;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 
 use crate::cli::NetMode;
+use crate::fdpass;
 use crate::home_files::HomeFileDirective;
 use crate::landlock::apply_landlock;
 use crate::namespace::setup_namespace;
+use crate::netns;
 
 /// PID of the child process, used by signal handlers.
 /// 0 means no child yet (signals are no-ops).
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Port the SNI proxy listens on inside the network namespace.
+const PROXY_LISTEN_PORT: u16 = 1443;
+/// Port to redirect (HTTPS) to the SNI proxy.
+const HTTPS_PORT: u16 = 443;
 
 // --- Readiness pipe ---
 
@@ -130,7 +140,9 @@ fn wait_for_child(pid: Pid) -> Result<i32> {
     }
 }
 
-// --- Forked sandbox entry point ---
+// =========================================================================
+// Plain isolated fork (no proxy)
+// =========================================================================
 
 /// Run a sandboxed command in a forked child with network namespace isolation.
 ///
@@ -208,6 +220,210 @@ fn parent_main(
 
     info!("parent: waiting for child exit");
     wait_for_child(child)
+}
+
+// =========================================================================
+// Proxied fork (SNI proxy + fake DNS in parent, nftables in child)
+// =========================================================================
+
+/// Run a sandboxed command with SNI proxy and fake DNS.
+///
+/// Architecture:
+/// 1. Create socketpair for fd passing + readiness pipe
+/// 2. Fork
+/// 3. Child: unshare(user+mount+net), bring up loopback, create TCP/UDP
+///    listener sockets, set up nftables REDIRECT, send socket fds to parent,
+///    bind-mount resolv.conf, apply landlock, signal readiness, exec command
+/// 4. Parent: receive socket fds, wait for readiness, start tokio runtime
+///    with SNI proxy + DNS server, wait for child to exit, shut down
+pub fn run_forked_proxied(
+    home_path: &Path,
+    project_dir: &Path,
+    passthrough: &[PathBuf],
+    home_files: &[HomeFileDirective],
+    rw_paths: &[&Path],
+    command: &[String],
+    allowed_hosts: HashSet<String>,
+) -> Result<i32> {
+    let (ns_reader, ns_writer) = readiness_pipe()?;
+    let (parent_sock, child_sock) = fdpass::socketpair()?;
+
+    match unsafe { fork() }.context("fork failed")? {
+        ForkResult::Child => {
+            drop(ns_reader);
+            fdpass::close_fd(parent_sock);
+            child_main_proxied(
+                ns_writer,
+                child_sock,
+                home_path,
+                project_dir,
+                passthrough,
+                home_files,
+                rw_paths,
+                command,
+            );
+        }
+        ForkResult::Parent { child } => {
+            drop(ns_writer);
+            fdpass::close_fd(child_sock);
+            parent_main_proxied(ns_reader, child, parent_sock, allowed_hosts)
+        }
+    }
+}
+
+/// Child side of the proxied fork.
+///
+/// Sets up the network namespace with loopback + nftables REDIRECT,
+/// creates listener sockets, sends them to the parent, then execs the command.
+fn child_main_proxied(
+    ns_ready: ReadyWriter,
+    sock_fd: i32,
+    home_path: &Path,
+    project_dir: &Path,
+    passthrough: &[PathBuf],
+    home_files: &[HomeFileDirective],
+    rw_paths: &[&Path],
+    command: &[String],
+) -> ! {
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+
+    if let Err(e) = child_proxied_setup(
+        sock_fd, home_path, project_dir, passthrough, home_files, rw_paths,
+    ) {
+        eprintln!("hermit: proxied namespace setup failed: {:#}", e);
+        std::process::exit(126);
+    }
+
+    ns_ready.signal();
+
+    info!("child: exec {:?}", command);
+    let err = Command::new(&command[0]).args(&command[1..]).exec();
+    eprintln!("hermit: exec failed: {}", err);
+    std::process::exit(126);
+}
+
+/// All fallible setup for the proxied child, collected so errors propagate cleanly.
+fn child_proxied_setup(
+    sock_fd: i32,
+    home_path: &Path,
+    project_dir: &Path,
+    passthrough: &[PathBuf],
+    home_files: &[HomeFileDirective],
+    rw_paths: &[&Path],
+) -> Result<()> {
+    // Set up namespace isolation (user + mount + net)
+    setup_namespace(home_path, project_dir, passthrough, home_files, true)?;
+
+    // Network namespace setup
+    netns::bring_up_loopback()?;
+    netns::ensure_nft_nat_table()?;
+    netns::add_nft_redirect(HTTPS_PORT, PROXY_LISTEN_PORT)?;
+
+    // Create listener sockets inside the new network namespace.
+    // These will be transferred to the parent via SCM_RIGHTS.
+    let tcp_listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", PROXY_LISTEN_PORT))
+        .context("failed to bind SNI proxy listener")?;
+    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:53")
+        .context("failed to bind DNS socket")?;
+
+    info!(
+        "child: created proxy listener on :{}  and DNS on :53",
+        PROXY_LISTEN_PORT
+    );
+
+    // Send the fds to the parent
+    fdpass::send_fds(sock_fd, &[tcp_listener.as_raw_fd(), udp_socket.as_raw_fd()])
+        .context("failed to send listener fds to parent")?;
+    fdpass::close_fd(sock_fd);
+
+    // Override /etc/resolv.conf to point at our fake DNS server
+    netns::write_resolv_conf()?;
+
+    // Apply landlock MAC policy
+    apply_landlock(rw_paths)?;
+
+    Ok(())
+}
+
+/// Parent side of the proxied fork.
+///
+/// Receives listener fds from the child, starts the SNI proxy and DNS server
+/// on a tokio runtime, then blocks waiting for the child to exit.
+fn parent_main_proxied(
+    ns_reader: ReadyReader,
+    child: Pid,
+    sock_fd: i32,
+    allowed_hosts: HashSet<String>,
+) -> Result<i32> {
+    install_signal_forwarding(child);
+
+    // Receive the TCP listener and UDP socket fds from the child
+    info!("parent: waiting for listener fds from child");
+    let fds = fdpass::recv_fds(sock_fd, 2)
+        .context("failed to receive listener fds from child")?;
+    fdpass::close_fd(sock_fd);
+    let tcp_raw_fd = fds[0];
+    let udp_raw_fd = fds[1];
+
+    // Wait for child to complete all setup (namespace, nftables, landlock)
+    ns_reader.wait()?;
+    info!("parent: child namespace ready, starting proxy services");
+
+    // Build a tokio runtime for the proxy and DNS server
+    let rt = tokio::runtime::Runtime::new()
+        .context("failed to create tokio runtime")?;
+
+    // Convert raw fds to std types, then to tokio types
+    let tcp_listener = unsafe { std::net::TcpListener::from_raw_fd(tcp_raw_fd) };
+    tcp_listener
+        .set_nonblocking(true)
+        .context("failed to set TCP listener non-blocking")?;
+
+    let udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(udp_raw_fd) };
+    udp_socket
+        .set_nonblocking(true)
+        .context("failed to set UDP socket non-blocking")?;
+
+    let tokio_listener = rt
+        .block_on(async { tokio::net::TcpListener::from_std(tcp_listener) })
+        .context("failed to register TCP listener with tokio")?;
+
+    let tokio_udp = rt
+        .block_on(async { tokio::net::UdpSocket::from_std(udp_socket) })
+        .context("failed to register UDP socket with tokio")?;
+
+    // Set up the proxy and DNS with the shared policy
+    let policy = Arc::new(sni_proxy::policy::AllowList::new(allowed_hosts));
+
+    let proxy_config = Arc::new(sni_proxy::proxy::ProxyConfig {
+        policy: Arc::clone(&policy),
+        connector: Arc::new(sni_proxy::connector::DirectConnector),
+        upstream_port: HTTPS_PORT,
+    });
+
+    let dns_server = sni_proxy::dns::DnsServer::new(Arc::clone(&policy));
+
+    // Spawn proxy and DNS on the runtime
+    rt.spawn(async move {
+        if let Err(e) = sni_proxy::proxy::run(tokio_listener, proxy_config).await {
+            error!("proxy error: {}", e);
+        }
+    });
+
+    rt.spawn(async move {
+        if let Err(e) = dns_server.run(tokio_udp).await {
+            error!("dns server error: {}", e);
+        }
+    });
+
+    info!("parent: proxy services running, waiting for child exit");
+    let exit_code = wait_for_child(child)?;
+
+    // Child exited — shut down the proxy services
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    info!("parent: proxy services stopped");
+
+    Ok(exit_code)
 }
 
 #[cfg(test)]

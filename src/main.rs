@@ -4,7 +4,7 @@ use log::info;
 use std::path::PathBuf;
 use std::process;
 
-use hermit::cli::Cli;
+use hermit::cli::{Cli, NetMode};
 use hermit::sandbox::run_sandboxed;
 
 fn main() {
@@ -54,7 +54,15 @@ fn run() -> Result<i32> {
         info!("passthrough: {}", p.display());
     }
 
+    // --allowed-hosts implies --net isolate
+    let net = if !cli.allowed_hosts.is_empty() && cli.net == NetMode::Host {
+        info!("--allowed-hosts set, implying --net isolate");
+        NetMode::Isolate
+    } else {
+        cli.net
+    };
+
     info!("command: {}", cli.command.join(" "));
 
-    run_sandboxed(&project_dir, &passthrough, &cli.command, &cli.net)
+    run_sandboxed(&project_dir, &passthrough, &cli.command, &net, &cli.allowed_hosts)
 }
