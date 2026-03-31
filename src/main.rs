@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::info;
+use sni_proxy::policy::AccessRule;
 use std::path::PathBuf;
 use std::process;
 
@@ -54,9 +55,12 @@ fn run() -> Result<i32> {
         info!("passthrough: {}", p.display());
     }
 
-    // --allowed-hosts implies --net isolate
-    let net = if !cli.allowed_hosts.is_empty() && cli.net == NetMode::Host {
-        info!("--allowed-hosts set, implying --net isolate");
+    // Build access rules from --allowed-hosts (hostname-only) and --allow (full rules)
+    let rules = build_rules(&cli.allowed_hosts, &cli.allow)?;
+
+    // --allow or --allowed-hosts implies --net isolate
+    let net = if !rules.is_empty() && cli.net == NetMode::Host {
+        info!("access rules set, implying --net isolate");
         NetMode::Isolate
     } else {
         cli.net
@@ -64,5 +68,23 @@ fn run() -> Result<i32> {
 
     info!("command: {}", cli.command.join(" "));
 
-    run_sandboxed(&project_dir, &passthrough, &cli.command, &net, &cli.allowed_hosts)
+    run_sandboxed(&project_dir, &passthrough, &cli.command, &net, rules)
+}
+
+/// Merge --allowed-hosts and --allow into a single list of AccessRules.
+fn build_rules(allowed_hosts: &[String], allow: &[String]) -> Result<Vec<AccessRule>> {
+    let mut rules: Vec<AccessRule> = Vec::new();
+
+    for host in allowed_hosts {
+        rules.push(AccessRule::host_only(host));
+    }
+
+    for raw in allow {
+        let rule: AccessRule = raw
+            .parse()
+            .with_context(|| format!("invalid --allow rule: '{}'", raw))?;
+        rules.push(rule);
+    }
+
+    Ok(rules)
 }

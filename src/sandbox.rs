@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
-use std::collections::HashSet;
+use sni_proxy::policy::{AccessRule, RuleSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::cli::NetMode;
 use crate::home_files::load_home_files;
@@ -30,10 +31,9 @@ fn build_rw_paths<'a>(
 
 /// Run a command inside the sandbox and return its exit code.
 ///
-/// When `net` is `Isolate` and `allowed_hosts` is non-empty, the command runs
-/// in a network namespace with an SNI proxy and fake DNS server that allow
-/// TLS connections to the listed hosts. When `allowed_hosts` is empty, the
-/// network namespace has zero connectivity.
+/// When `net` is `Isolate` and `rules` is non-empty, the command runs in a
+/// network namespace with a proxy and fake DNS server that enforce the rules.
+/// When `rules` is empty, the network namespace has zero connectivity.
 ///
 /// In `Host` mode, the command runs directly with the host network.
 pub fn run_sandboxed(
@@ -41,7 +41,7 @@ pub fn run_sandboxed(
     passthrough: &[PathBuf],
     command: &[String],
     net: &NetMode,
-    allowed_hosts: &[String],
+    rules: Vec<AccessRule>,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
@@ -61,14 +61,14 @@ pub fn run_sandboxed(
         NetMode::Host => {
             run_sandboxed_direct(home_path, project_dir, passthrough, &home_files, &rw_paths, command)
         }
-        NetMode::Isolate if !allowed_hosts.is_empty() => {
+        NetMode::Isolate if !rules.is_empty() => {
             info!(
-                "using proxied sandbox with network isolation ({} allowed hosts)",
-                allowed_hosts.len()
+                "using proxied sandbox with network isolation ({} rules)",
+                rules.len()
             );
-            let hosts: HashSet<String> = allowed_hosts.iter().cloned().collect();
+            let policy = Arc::new(RuleSet::new(rules));
             process::run_forked_proxied(
-                home_path, project_dir, passthrough, &home_files, &rw_paths, command, hosts,
+                home_path, project_dir, passthrough, &home_files, &rw_paths, command, policy,
             )
         }
         NetMode::Isolate => {
@@ -115,14 +115,14 @@ mod tests {
 
     #[test]
     fn test_empty_command_fails() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host, &[]);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host, vec![]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
 
     #[test]
     fn test_empty_command_fails_net_isolate() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate, &[]);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate, vec![]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }

@@ -40,11 +40,20 @@ pub struct Cli {
     pub net: NetMode,
 
     /// Hostnames allowed through the network proxy (implies --net isolate).
-    /// Comma-separated. When set, an SNI proxy and fake DNS server are
-    /// started inside the network namespace to allow TLS connections to
-    /// these hosts.
+    /// Comma-separated. Shorthand for hostname-only rules.
+    /// Equivalent to `--allow host` for each hostname.
     #[arg(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Access rules for network filtering (implies --net isolate).
+    /// Format: `host[/path][=METHOD,...]`. Repeatable.
+    ///
+    /// Examples:
+    ///   --allow registry.npmjs.org
+    ///   --allow "github.com/api/v3/=GET"
+    ///   --allow "example.com/upload/=POST,PUT"
+    #[arg(long)]
+    pub allow: Vec<String>,
 
     /// Command and arguments to run inside the sandbox
     #[arg(last = true, required = true)]
@@ -175,5 +184,44 @@ mod tests {
     fn test_net_invalid_value() {
         let result = Cli::try_parse_from(["hermit", "--net", "bogus", "--", "make"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_allow_default_empty() {
+        let cli = Cli::parse_from(["hermit", "--", "make"]);
+        assert!(cli.allow.is_empty());
+    }
+
+    #[test]
+    fn test_allow_single() {
+        let cli = Cli::parse_from(["hermit", "--allow", "example.com", "--", "make"]);
+        assert_eq!(cli.allow, vec!["example.com"]);
+    }
+
+    #[test]
+    fn test_allow_multiple() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "--allow", "example.com",
+            "--allow", "github.com/api/=GET",
+            "--",
+            "make",
+        ]);
+        assert_eq!(cli.allow.len(), 2);
+        assert_eq!(cli.allow[0], "example.com");
+        assert_eq!(cli.allow[1], "github.com/api/=GET");
+    }
+
+    #[test]
+    fn test_allow_and_allowed_hosts_together() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "--allowed-hosts", "foo.com",
+            "--allow", "bar.com/api/=GET",
+            "--",
+            "make",
+        ]);
+        assert_eq!(cli.allowed_hosts, vec!["foo.com"]);
+        assert_eq!(cli.allow, vec!["bar.com/api/=GET"]);
     }
 }

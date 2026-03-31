@@ -6,7 +6,12 @@ description = "SNI-sniffing TCP proxy with hostname whitelisting"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+rcgen = "0.13"
+httparse = "1"
 anyhow = "1"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }

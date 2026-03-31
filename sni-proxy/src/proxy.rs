@@ -121,7 +121,7 @@ where
 /// Attempt to recover the original destination address from a REDIRECTed socket.
 ///
 /// Returns `None` if the getsockopt fails (e.g. not a redirected connection).
-fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
+pub fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();

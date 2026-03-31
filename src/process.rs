@@ -3,7 +3,7 @@ use log::{debug, error, info};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
-use std::collections::HashSet;
+use sni_proxy::policy::RuleSet;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -22,10 +22,14 @@ use crate::netns;
 /// 0 means no child yet (signals are no-ops).
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
-/// Port the SNI proxy listens on inside the network namespace.
+/// Port the MITM proxy listens on inside the network namespace (HTTPS).
 const PROXY_LISTEN_PORT: u16 = 1443;
-/// Port to redirect (HTTPS) to the SNI proxy.
+/// Port the HTTP proxy listens on inside the network namespace.
+const HTTP_PROXY_LISTEN_PORT: u16 = 1080;
+/// Port to redirect (HTTPS) to the MITM proxy.
 const HTTPS_PORT: u16 = 443;
+/// Port to redirect (HTTP) to the HTTP proxy.
+const HTTP_PORT: u16 = 80;
 
 // --- Readiness pipe ---
 
@@ -243,8 +247,15 @@ pub fn run_forked_proxied(
     home_files: &[HomeFileDirective],
     rw_paths: &[&Path],
     command: &[String],
-    allowed_hosts: HashSet<String>,
+    policy: Arc<RuleSet>,
 ) -> Result<i32> {
+    // Generate the ephemeral CA before fork so both parent and child can use it.
+    let ca = Arc::new(
+        sni_proxy::ca::CertificateAuthority::new()
+            .context("failed to generate ephemeral CA")?,
+    );
+    let ca_pem = ca.ca_cert_pem().to_string();
+
     let (ns_reader, ns_writer) = readiness_pipe()?;
     let (parent_sock, child_sock) = fdpass::socketpair()?;
 
@@ -255,6 +266,7 @@ pub fn run_forked_proxied(
             child_main_proxied(
                 ns_writer,
                 child_sock,
+                &ca_pem,
                 home_path,
                 project_dir,
                 passthrough,
@@ -266,7 +278,7 @@ pub fn run_forked_proxied(
         ForkResult::Parent { child } => {
             drop(ns_writer);
             fdpass::close_fd(child_sock);
-            parent_main_proxied(ns_reader, child, parent_sock, allowed_hosts)
+            parent_main_proxied(ns_reader, child, parent_sock, policy, ca)
         }
     }
 }
@@ -278,6 +290,7 @@ pub fn run_forked_proxied(
 fn child_main_proxied(
     ns_ready: ReadyWriter,
     sock_fd: i32,
+    ca_pem: &str,
     home_path: &Path,
     project_dir: &Path,
     passthrough: &[PathBuf],
@@ -288,7 +301,7 @@ fn child_main_proxied(
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
     if let Err(e) = child_proxied_setup(
-        sock_fd, home_path, project_dir, passthrough, home_files, rw_paths,
+        sock_fd, ca_pem, home_path, project_dir, passthrough, home_files, rw_paths,
     ) {
         eprintln!("hermit: proxied namespace setup failed: {:#}", e);
         std::process::exit(126);
@@ -305,6 +318,7 @@ fn child_main_proxied(
 /// All fallible setup for the proxied child, collected so errors propagate cleanly.
 fn child_proxied_setup(
     sock_fd: i32,
+    ca_pem: &str,
     home_path: &Path,
     project_dir: &Path,
     passthrough: &[PathBuf],
@@ -318,26 +332,36 @@ fn child_proxied_setup(
     netns::bring_up_loopback()?;
     netns::ensure_nft_nat_table()?;
     netns::add_nft_redirect(HTTPS_PORT, PROXY_LISTEN_PORT)?;
+    netns::add_nft_redirect(HTTP_PORT, HTTP_PROXY_LISTEN_PORT)?;
 
     // Create listener sockets inside the new network namespace.
     // These will be transferred to the parent via SCM_RIGHTS.
-    let tcp_listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", PROXY_LISTEN_PORT))
-        .context("failed to bind SNI proxy listener")?;
+    let https_listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", PROXY_LISTEN_PORT))
+        .context("failed to bind MITM proxy listener")?;
+    let http_listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", HTTP_PROXY_LISTEN_PORT))
+        .context("failed to bind HTTP proxy listener")?;
     let udp_socket = std::net::UdpSocket::bind("127.0.0.1:53")
         .context("failed to bind DNS socket")?;
 
     info!(
-        "child: created proxy listener on :{}  and DNS on :53",
-        PROXY_LISTEN_PORT
+        "child: created HTTPS proxy on :{}, HTTP proxy on :{}, DNS on :53",
+        PROXY_LISTEN_PORT, HTTP_PROXY_LISTEN_PORT
     );
 
-    // Send the fds to the parent
-    fdpass::send_fds(sock_fd, &[tcp_listener.as_raw_fd(), udp_socket.as_raw_fd()])
-        .context("failed to send listener fds to parent")?;
+    // Send the fds to the parent (HTTPS, HTTP, DNS)
+    fdpass::send_fds(
+        sock_fd,
+        &[https_listener.as_raw_fd(), http_listener.as_raw_fd(), udp_socket.as_raw_fd()],
+    )
+    .context("failed to send listener fds to parent")?;
     fdpass::close_fd(sock_fd);
 
     // Override /etc/resolv.conf to point at our fake DNS server
     netns::write_resolv_conf()?;
+
+    // Install the ephemeral CA cert in the sandbox trust store
+    crate::trust::install_ca_cert(ca_pem)
+        .context("failed to install CA certificate")?;
 
     // Apply landlock MAC policy
     apply_landlock(rw_paths)?;
@@ -353,65 +377,69 @@ fn parent_main_proxied(
     ns_reader: ReadyReader,
     child: Pid,
     sock_fd: i32,
-    allowed_hosts: HashSet<String>,
+    policy: Arc<RuleSet>,
+    ca: Arc<sni_proxy::ca::CertificateAuthority>,
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
-    // Receive the TCP listener and UDP socket fds from the child
+    // Receive the listener fds from the child (HTTPS, HTTP, DNS)
     info!("parent: waiting for listener fds from child");
-    let fds = fdpass::recv_fds(sock_fd, 2)
+    let fds = fdpass::recv_fds(sock_fd, 3)
         .context("failed to receive listener fds from child")?;
     fdpass::close_fd(sock_fd);
-    let tcp_raw_fd = fds[0];
-    let udp_raw_fd = fds[1];
+    let https_raw_fd = fds[0];
+    let http_raw_fd = fds[1];
+    let udp_raw_fd = fds[2];
 
     // Wait for child to complete all setup (namespace, nftables, landlock)
     ns_reader.wait()?;
     info!("parent: child namespace ready, starting proxy services");
 
-    // Build a tokio runtime for the proxy and DNS server
+    // Build a tokio runtime for the proxy services
     let rt = tokio::runtime::Runtime::new()
         .context("failed to create tokio runtime")?;
 
-    // Convert raw fds to std types, then to tokio types
-    let tcp_listener = unsafe { std::net::TcpListener::from_raw_fd(tcp_raw_fd) };
-    tcp_listener
-        .set_nonblocking(true)
-        .context("failed to set TCP listener non-blocking")?;
+    // Convert raw fds to tokio types
+    let https_listener = fd_to_tokio_listener(https_raw_fd, &rt)
+        .context("HTTPS listener setup")?;
+    let http_listener = fd_to_tokio_listener(http_raw_fd, &rt)
+        .context("HTTP listener setup")?;
+    let udp_socket = fd_to_tokio_udp(udp_raw_fd, &rt)
+        .context("DNS socket setup")?;
 
-    let udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(udp_raw_fd) };
-    udp_socket
-        .set_nonblocking(true)
-        .context("failed to set UDP socket non-blocking")?;
-
-    let tokio_listener = rt
-        .block_on(async { tokio::net::TcpListener::from_std(tcp_listener) })
-        .context("failed to register TCP listener with tokio")?;
-
-    let tokio_udp = rt
-        .block_on(async { tokio::net::UdpSocket::from_std(udp_socket) })
-        .context("failed to register UDP socket with tokio")?;
-
-    // Set up the proxy and DNS with the shared policy
-    let policy = Arc::new(sni_proxy::policy::AllowList::new(allowed_hosts));
-
-    let proxy_config = Arc::new(sni_proxy::proxy::ProxyConfig {
+    // MITM proxy for HTTPS (port 443 -> 1443)
+    let mitm_config = Arc::new(sni_proxy::mitm::MitmConfig {
         policy: Arc::clone(&policy),
         connector: Arc::new(sni_proxy::connector::DirectConnector),
+        ca,
         upstream_port: HTTPS_PORT,
     });
 
+    // HTTP proxy for port 80 -> 1080
+    let http_config = Arc::new(sni_proxy::http_proxy::HttpProxyConfig {
+        policy: Arc::clone(&policy),
+        connector: Arc::new(sni_proxy::connector::DirectConnector),
+        upstream_port: HTTP_PORT,
+    });
+
+    // DNS server
     let dns_server = sni_proxy::dns::DnsServer::new(Arc::clone(&policy));
 
-    // Spawn proxy and DNS on the runtime
+    // Spawn all services
     rt.spawn(async move {
-        if let Err(e) = sni_proxy::proxy::run(tokio_listener, proxy_config).await {
-            error!("proxy error: {}", e);
+        if let Err(e) = sni_proxy::mitm::run(https_listener, mitm_config).await {
+            error!("mitm proxy error: {}", e);
         }
     });
 
     rt.spawn(async move {
-        if let Err(e) = dns_server.run(tokio_udp).await {
+        if let Err(e) = sni_proxy::http_proxy::run(http_listener, http_config).await {
+            error!("http proxy error: {}", e);
+        }
+    });
+
+    rt.spawn(async move {
+        if let Err(e) = dns_server.run(udp_socket).await {
             error!("dns server error: {}", e);
         }
     });
@@ -424,6 +452,36 @@ fn parent_main_proxied(
     info!("parent: proxy services stopped");
 
     Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// fd conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a raw fd to a tokio TcpListener.
+fn fd_to_tokio_listener(
+    fd: i32,
+    rt: &tokio::runtime::Runtime,
+) -> Result<tokio::net::TcpListener> {
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener
+        .set_nonblocking(true)
+        .context("failed to set listener non-blocking")?;
+    rt.block_on(async { tokio::net::TcpListener::from_std(listener) })
+        .context("failed to register listener with tokio")
+}
+
+/// Convert a raw fd to a tokio UdpSocket.
+fn fd_to_tokio_udp(
+    fd: i32,
+    rt: &tokio::runtime::Runtime,
+) -> Result<tokio::net::UdpSocket> {
+    let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    socket
+        .set_nonblocking(true)
+        .context("failed to set UDP socket non-blocking")?;
+    rt.block_on(async { tokio::net::UdpSocket::from_std(socket) })
+        .context("failed to register UDP socket with tokio")
 }
 
 #[cfg(test)]

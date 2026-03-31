@@ -6,3 +6,4 @@ pub mod namespace;
 pub mod netns;
 pub mod process;
 pub mod sandbox;
+pub mod trust;

@@ -1,0 +1,282 @@
+//! Minimal HTTP/1.1 request parsing and forwarding.
+//!
+//! Uses `httparse` for zero-copy header parsing. Bodies are streamed
+//! (not buffered) using Content-Length or chunked transfer encoding.
+
+use anyhow::{bail, Context, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// A parsed HTTP request line + headers.
+#[derive(Debug)]
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub version: u8, // 0 = HTTP/1.0, 1 = HTTP/1.1
+    /// Raw header bytes (request line + headers + \r\n\r\n), ready to forward.
+    pub head_bytes: Vec<u8>,
+    /// Content-Length if present, None otherwise.
+    pub content_length: Option<u64>,
+    /// Whether Transfer-Encoding: chunked is set.
+    pub chunked: bool,
+    /// The Host header value.
+    pub host: Option<String>,
+}
+
+/// Read and parse an HTTP request from the stream.
+///
+/// Returns `None` if the connection was cleanly closed (EOF before any data).
+/// Returns `Err` if the request is malformed or the connection drops mid-request.
+pub async fn read_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Request>> {
+    let mut buf = Vec::with_capacity(8192);
+
+    loop {
+        let mut tmp = [0u8; 4096];
+        let n = reader.read(&mut tmp).await.context("reading request")?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(None); // Clean close
+            }
+            bail!("connection closed mid-request");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Try to parse headers
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(&buf) {
+            Ok(httparse::Status::Complete(head_len)) => {
+                let method = req.method.unwrap_or("").to_string();
+                let path = req.path.unwrap_or("/").to_string();
+                let version = req.version.unwrap_or(1);
+
+                let mut content_length = None;
+                let mut chunked = false;
+                let mut host = None;
+
+                for h in req.headers.iter() {
+                    if h.name.eq_ignore_ascii_case("content-length") {
+                        let val = std::str::from_utf8(h.value)
+                            .context("invalid content-length")?;
+                        content_length = Some(val.trim().parse::<u64>()
+                            .context("invalid content-length value")?);
+                    } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                        let val = std::str::from_utf8(h.value)
+                            .context("invalid transfer-encoding")?;
+                        chunked = val.to_ascii_lowercase().contains("chunked");
+                    } else if h.name.eq_ignore_ascii_case("host") {
+                        host = Some(
+                            std::str::from_utf8(h.value)
+                                .context("invalid host header")?
+                                .to_string(),
+                        );
+                    }
+                }
+
+                let head_bytes = buf[..head_len].to_vec();
+
+                return Ok(Some(Request {
+                    method,
+                    path,
+                    version,
+                    head_bytes,
+                    content_length,
+                    chunked,
+                    host,
+                }));
+            }
+            Ok(httparse::Status::Partial) => {
+                if buf.len() > 64 * 1024 {
+                    bail!("request headers too large (>64KB)");
+                }
+                continue;
+            }
+            Err(e) => bail!("HTTP parse error: {}", e),
+        }
+    }
+}
+
+/// Forward exactly `len` bytes from `reader` to `writer`.
+pub async fn forward_body_content_length<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    remaining: u64,
+    // Any leftover bytes from the header read buffer
+    leftover: &[u8],
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut remaining = remaining;
+
+    // First, write any leftover bytes from the header buffer
+    let to_write = std::cmp::min(leftover.len() as u64, remaining) as usize;
+    if to_write > 0 {
+        writer.write_all(&leftover[..to_write]).await.context("writing leftover body")?;
+        remaining -= to_write as u64;
+    }
+
+    // Stream the rest
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = std::cmp::min(buf.len() as u64, remaining) as usize;
+        let n = reader.read(&mut buf[..to_read]).await.context("reading body")?;
+        if n == 0 {
+            bail!("connection closed with {} bytes remaining", remaining);
+        }
+        writer.write_all(&buf[..n]).await.context("writing body")?;
+        remaining -= n as u64;
+    }
+
+    Ok(())
+}
+
+/// Write an HTTP 403 Forbidden response.
+pub async fn write_403<W: AsyncWrite + Unpin>(writer: &mut W, reason: &str) -> Result<()> {
+    let body = format!("403 Forbidden: {}\r\n", reason);
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    writer.write_all(response.as_bytes()).await.context("writing 403 response")?;
+    writer.flush().await.context("flushing 403 response")?;
+    Ok(())
+}
+
+/// Read the full HTTP response headers from upstream, returning the raw
+/// head bytes and parsed content-length/chunked info.
+pub struct Response {
+    pub head_bytes: Vec<u8>,
+    pub content_length: Option<u64>,
+    pub chunked: bool,
+}
+
+pub async fn read_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Response, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(8192);
+
+    loop {
+        let mut tmp = [0u8; 4096];
+        let n = reader.read(&mut tmp).await.context("reading response")?;
+        if n == 0 {
+            if buf.is_empty() {
+                bail!("upstream closed before sending response");
+            }
+            bail!("upstream closed mid-response headers");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut resp = httparse::Response::new(&mut headers);
+        match resp.parse(&buf) {
+            Ok(httparse::Status::Complete(head_len)) => {
+                let mut content_length = None;
+                let mut chunked = false;
+
+                for h in resp.headers.iter() {
+                    if h.name.eq_ignore_ascii_case("content-length") {
+                        let val = std::str::from_utf8(h.value)
+                            .context("invalid content-length")?;
+                        content_length = Some(val.trim().parse::<u64>()
+                            .context("invalid content-length value")?);
+                    } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                        let val = std::str::from_utf8(h.value)
+                            .context("invalid transfer-encoding")?;
+                        chunked = val.to_ascii_lowercase().contains("chunked");
+                    }
+                }
+
+                let head_bytes = buf[..head_len].to_vec();
+                let leftover = buf[head_len..].to_vec();
+
+                return Ok((
+                    Response {
+                        head_bytes,
+                        content_length,
+                        chunked,
+                    },
+                    leftover,
+                ));
+            }
+            Ok(httparse::Status::Partial) => {
+                if buf.len() > 64 * 1024 {
+                    bail!("response headers too large (>64KB)");
+                }
+                continue;
+            }
+            Err(e) => bail!("HTTP response parse error: {}", e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn parse_simple_get() {
+        let data = b"GET /foo HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut reader = &data[..];
+        let req = read_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/foo");
+        assert_eq!(req.host.as_deref(), Some("example.com"));
+        assert!(req.content_length.is_none());
+        assert!(!req.chunked);
+    }
+
+    #[tokio::test]
+    async fn parse_post_with_content_length() {
+        let data = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader = &data[..];
+        let req = read_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/upload");
+        assert_eq!(req.content_length, Some(5));
+    }
+
+    #[tokio::test]
+    async fn parse_eof_returns_none() {
+        let data: &[u8] = b"";
+        let mut reader = data;
+        let req = read_request(&mut reader).await.unwrap();
+        assert!(req.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_403_response() {
+        let (mut client, mut server) = duplex(1024);
+        tokio::spawn(async move {
+            write_403(&mut server, "blocked by policy").await.unwrap();
+        });
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("HTTP/1.1 403"));
+        assert!(s.contains("blocked by policy"));
+    }
+
+    #[tokio::test]
+    async fn forward_content_length_body() {
+        let body = b"hello";
+        let (mut tx, mut rx) = duplex(1024);
+        let (mut out_tx, mut out_rx) = duplex(1024);
+
+        tokio::spawn(async move {
+            tx.write_all(body).await.unwrap();
+            tx.shutdown().await.unwrap();
+        });
+
+        tokio::spawn(async move {
+            forward_body_content_length(&mut rx, &mut out_tx, 5, &[])
+                .await
+                .unwrap();
+            out_tx.shutdown().await.unwrap();
+        });
+
+        let mut result = Vec::new();
+        out_rx.read_to_end(&mut result).await.unwrap();
+        assert_eq!(result, b"hello");
+    }
+}
