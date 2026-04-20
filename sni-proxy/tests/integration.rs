@@ -7,8 +7,16 @@ use sni_proxy::connector::DirectConnector;
 use sni_proxy::policy::{AllowList, AllowAll};
 use sni_proxy::proxy::{self, ProxyConfig};
 
+/// Install rustls' default crypto provider. rustls 0.23 requires a
+/// process-wide provider and will panic on first use otherwise. This is
+/// idempotent; the second caller's Err is ignored.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Generate a real TLS ClientHello for the given hostname using rustls.
 fn make_client_hello(server_name: &str) -> Vec<u8> {
+    install_crypto_provider();
     use rustls::ClientConnection;
 
     let config = rustls::ClientConfig::builder()
@@ -128,6 +136,7 @@ async fn garbage_input_returns_error() {
 /// Test the SNI extraction directly with a Cursor (buffer-only, no network).
 #[test]
 fn sni_extraction_roundtrip() {
+    install_crypto_provider();
     let hello = make_client_hello("myhost.example.org");
     let mut cursor = Cursor::new(&hello);
     let mut acceptor = rustls::server::Acceptor::default();

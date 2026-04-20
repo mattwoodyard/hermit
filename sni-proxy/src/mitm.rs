@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use crate::ca::CertificateAuthority;
 use crate::connector::UpstreamConnector;
 use crate::http;
+use crate::network_policy::{render_inject_value, NetworkPolicy};
 use crate::policy::{RequestPolicy, Verdict};
 use crate::proxy::{get_original_dst, read_sni_with_buffer};
 
@@ -30,6 +31,10 @@ pub struct MitmConfig<P, C> {
     pub connector: Arc<C>,
     pub ca: Arc<CertificateAuthority>,
     pub upstream_port: u16,
+    /// Optional credential-injection policy. When set, each request is
+    /// matched against its rules and the first matching rule's credential
+    /// is acquired and injected as configured headers.
+    pub network_policy: Option<Arc<NetworkPolicy>>,
 }
 
 /// Run the MITM proxy accept loop.
@@ -104,7 +109,7 @@ where
     // Step 4-7: HTTP request/response loop (keep-alive)
     loop {
         // Read HTTP request from the decrypted client stream
-        let request = match http::read_request(&mut client_tls).await {
+        let mut request = match http::read_request(&mut client_tls).await {
             Ok(Some(req)) => req,
             Ok(None) => {
                 debug!(%client_addr, "mitm: client closed connection");
@@ -131,6 +136,11 @@ where
             );
             http::write_403(&mut client_tls, "blocked by hermit policy").await?;
             return Ok(());
+        }
+
+        // Credential injection (if a network policy is configured)
+        if let Some(np) = &config.network_policy {
+            apply_injection(np, &hostname, &mut request).await;
         }
 
         // Connect upstream with real TLS
@@ -329,6 +339,73 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
+}
+
+/// Match the request against the network policy and, if a rule matches,
+/// acquire the credential and overwrite the configured headers in
+/// `request.head_bytes`.
+///
+/// Failures (bad URI, credential acquisition error, header edit error)
+/// log a warning and leave the request unmodified — access control is
+/// handled upstream, so a missing credential must never hide a request.
+pub async fn apply_injection(
+    np: &NetworkPolicy,
+    hostname: &str,
+    request: &mut http::Request,
+) {
+    let req_for_match = match build_match_request(request, hostname) {
+        Some(r) => r,
+        None => return,
+    };
+    let rule = match np.resolve(&req_for_match) {
+        Some(r) => r,
+        None => return,
+    };
+    let value = match np.acquire(rule, Some(hostname)).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%hostname, credential = %rule.credential, error = %e,
+                "credential acquisition failed; forwarding without injection");
+            return;
+        }
+    };
+    let actions = match np.inject_actions(rule) {
+        Some(a) => a,
+        None => return,
+    };
+    for action in actions {
+        let rendered = render_inject_value(&action.value, &value);
+        if let Err(e) = http::set_header(&mut request.head_bytes, &action.header, &rendered) {
+            warn!(%hostname, header = %action.header, error = %e,
+                "failed to set injected header; continuing");
+        }
+    }
+    info!(%hostname, credential = %rule.credential, "injected credential");
+}
+
+/// Build an `http::Request<()>` from our parsed request for DSL matching.
+///
+/// Scheme is hardcoded to `https` (MITM only sees HTTPS); host comes from
+/// the `Host` header (port stripped); headers are re-parsed from head_bytes.
+fn build_match_request(
+    request: &http::Request,
+    fallback_host: &str,
+) -> Option<::http::Request<()>> {
+    let host_raw = request.host.as_deref().unwrap_or(fallback_host);
+    let host = host_raw.split(':').next().unwrap_or(host_raw);
+    let uri = format!("https://{host}{}", request.path);
+
+    let mut builder = ::http::Request::builder()
+        .method(request.method.as_str())
+        .uri(&uri);
+
+    let mut header_buf = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Request::new(&mut header_buf);
+    parsed.parse(&request.head_bytes).ok()?;
+    for h in parsed.headers.iter() {
+        builder = builder.header(h.name, h.value);
+    }
+    builder.body(()).ok()
 }
 
 #[cfg(test)]

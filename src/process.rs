@@ -248,6 +248,7 @@ pub fn run_forked_proxied(
     rw_paths: &[&Path],
     command: &[String],
     policy: Arc<RuleSet>,
+    network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
 ) -> Result<i32> {
     // Generate the ephemeral CA before fork so both parent and child can use it.
     let ca = Arc::new(
@@ -278,7 +279,7 @@ pub fn run_forked_proxied(
         ForkResult::Parent { child } => {
             drop(ns_writer);
             fdpass::close_fd(child_sock);
-            parent_main_proxied(ns_reader, child, parent_sock, policy, ca)
+            parent_main_proxied(ns_reader, child, parent_sock, policy, ca, network_policy)
         }
     }
 }
@@ -379,6 +380,7 @@ fn parent_main_proxied(
     sock_fd: i32,
     policy: Arc<RuleSet>,
     ca: Arc<sni_proxy::ca::CertificateAuthority>,
+    network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
@@ -413,6 +415,7 @@ fn parent_main_proxied(
         connector: Arc::new(sni_proxy::connector::DirectConnector),
         ca,
         upstream_port: HTTPS_PORT,
+        network_policy: network_policy.clone(),
     });
 
     // HTTP proxy for port 80 -> 1080

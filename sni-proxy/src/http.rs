@@ -209,6 +209,63 @@ pub async fn read_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Resp
     }
 }
 
+/// Set a header on a raw HTTP head-bytes buffer.
+///
+/// The buffer must end with `\r\n\r\n` (head terminator). Any existing
+/// header with the same name (case-insensitive) is removed; the new
+/// header is inserted just before the terminating blank line.
+///
+/// Returns an error if the buffer does not contain `\r\n\r\n`.
+pub fn set_header(head: &mut Vec<u8>, name: &str, value: &str) -> Result<()> {
+    let terminator = find_headers_terminator(head)
+        .context("head bytes missing terminating CRLF CRLF")?;
+
+    // Drop any existing header line with this name, starting after the
+    // request line and ending just before the terminator.
+    let first_line_end = find_crlf(head, 0)
+        .context("head bytes missing request-line CRLF")?;
+    let body_start = first_line_end + 2;
+
+    let mut cursor = body_start;
+    while cursor < terminator {
+        let line_end = find_crlf(head, cursor).unwrap_or(terminator);
+        if header_name_matches(&head[cursor..line_end], name) {
+            // Remove line including its CRLF
+            let drop_end = line_end + 2;
+            head.drain(cursor..drop_end);
+            // Restart scan (indices shifted)
+            return set_header(head, name, value);
+        }
+        cursor = line_end + 2;
+    }
+
+    let terminator = find_headers_terminator(head)
+        .context("head bytes missing terminating CRLF CRLF after edits")?;
+    let line = format!("{name}: {value}\r\n");
+    head.splice(terminator..terminator, line.bytes());
+    Ok(())
+}
+
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    buf[from..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|i| from + i)
+}
+
+fn find_headers_terminator(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 2)
+}
+
+fn header_name_matches(line: &[u8], name: &str) -> bool {
+    let colon = match line.iter().position(|&b| b == b':') {
+        Some(i) => i,
+        None => return false,
+    };
+    let line_name = &line[..colon];
+    line_name.eq_ignore_ascii_case(name.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +312,52 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("HTTP/1.1 403"));
         assert!(s.contains("blocked by policy"));
+    }
+
+    #[test]
+    fn set_header_inserts_new() {
+        let mut h = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        set_header(&mut h, "Authorization", "Bearer abc").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&h).unwrap(),
+            "GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn set_header_replaces_existing_case_insensitive() {
+        let mut h = b"GET / HTTP/1.1\r\nHost: x\r\nauthorization: old\r\n\r\n".to_vec();
+        set_header(&mut h, "Authorization", "Bearer new").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&h).unwrap(),
+            "GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer new\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn set_header_replaces_all_duplicates() {
+        let mut h =
+            b"GET / HTTP/1.1\r\nHost: x\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n".to_vec();
+        set_header(&mut h, "Cookie", "only=this").unwrap();
+        let out = std::str::from_utf8(&h).unwrap();
+        assert_eq!(out.matches("Cookie:").count(), 1);
+        assert!(out.contains("Cookie: only=this"));
+    }
+
+    #[test]
+    fn set_header_preserves_body() {
+        let mut h =
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        set_header(&mut h, "X-Injected", "yes").unwrap();
+        let out = std::str::from_utf8(&h).unwrap();
+        assert!(out.ends_with("\r\n\r\nhello"));
+        assert!(out.contains("X-Injected: yes"));
+    }
+
+    #[test]
+    fn set_header_errors_without_terminator() {
+        let mut h = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        assert!(set_header(&mut h, "X", "y").is_err());
     }
 
     #[tokio::test]

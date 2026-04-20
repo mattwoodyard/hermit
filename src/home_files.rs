@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use log::debug;
 use std::path::{Path, PathBuf};
 
 /// A directive from a `home-files` config.
@@ -21,8 +22,14 @@ pub fn parse_home_files_from(
     home_dir: &Path,
 ) -> Result<Vec<HomeFileDirective>> {
     let content = match std::fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(c) => {
+            debug!("loaded home-files config: {}", config_path.display());
+            c
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("home-files config not found: {}", config_path.display());
+            return Ok(Vec::new());
+        }
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("failed to read {}", config_path.display()));
@@ -45,6 +52,7 @@ pub fn load_home_files(
 ) -> Result<Vec<HomeFileDirective>> {
     if let Ok(env_path) = std::env::var("HERMIT_HOME_FILES") {
         let path = PathBuf::from(&env_path);
+        debug!("HERMIT_HOME_FILES override: loading config from {}", path.display());
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("HERMIT_HOME_FILES={}: failed to read", env_path))?;
         return parse_home_files_content(&content, home_dir);

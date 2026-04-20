@@ -1,9 +1,12 @@
 pub mod ca;
 pub mod connector;
+pub mod credential;
 pub mod dns;
 pub mod http;
 pub mod http_proxy;
+pub mod match_dsl;
 pub mod mitm;
+pub mod network_policy;
 pub mod policy;
 pub mod proxy;
 pub mod sni;

@@ -30,6 +30,8 @@ impl Drop for OwnedFd {
 enum MountLocation {
     UnderHome,
     UnderTmp,
+    /// Descendant of another passthrough entry (not $HOME or /tmp).
+    UnderEntry,
 }
 
 /// Whether a passthrough path is a file or directory.
@@ -198,10 +200,18 @@ fn save_passthrough_fds(entries: &[(&Path, bool)], home_dir: &Path) -> Result<Ve
         // the home classification — the $HOME overlay handles those stubs.
         let under_tmp =
             !under_home && path.starts_with("/tmp") && path != Path::new("/tmp");
+        // Check if this path is a descendant of another entry in the list.
+        let under_entry = !under_home
+            && !under_tmp
+            && entries
+                .iter()
+                .any(|&(other, _)| other != path && path.starts_with(other));
         let location = if under_home {
             MountLocation::UnderHome
         } else if under_tmp {
             MountLocation::UnderTmp
+        } else if under_entry {
+            MountLocation::UnderEntry
         } else {
             debug!("mount: skipping fd save for {} (not under $HOME or /tmp)", path.display());
             continue;
@@ -214,6 +224,7 @@ fn save_passthrough_fds(entries: &[(&Path, bool)], home_dir: &Path) -> Result<Ve
         let loc_label = match location {
             MountLocation::UnderHome => "under $HOME",
             MountLocation::UnderTmp => "under /tmp",
+            MountLocation::UnderEntry => "under another entry",
         };
         let kind_label = match kind {
             EntryKind::File => "file",
@@ -237,6 +248,8 @@ fn save_passthrough_fds(entries: &[(&Path, bool)], home_dir: &Path) -> Result<Ve
             readonly,
         });
     }
+    // Sort so that ancestors are mounted before descendants — shorter paths first.
+    saved_fds.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(saved_fds)
 }
 
@@ -343,11 +356,14 @@ fn bind_mount_passthroughs(saved_fds: &[SavedFd]) -> Result<()> {
     }
     info!("mount: binding {} passthrough path(s)", saved_fds.len());
     for saved in saved_fds {
-        if let MountLocation::UnderTmp = saved.location {
-            debug!("mount: recreating stub under /tmp for {}", saved.path.display());
-            create_mount_stub(&saved.path, &saved.kind).with_context(|| {
-                format!("failed to recreate mount point {}", saved.path.display())
-            })?;
+        match saved.location {
+            MountLocation::UnderTmp | MountLocation::UnderEntry => {
+                debug!("mount: recreating stub for {}", saved.path.display());
+                create_mount_stub(&saved.path, &saved.kind).with_context(|| {
+                    format!("failed to recreate mount point {}", saved.path.display())
+                })?;
+            }
+            _ => {}
         }
 
         let fd_path = format!("/proc/self/fd/{}", saved.fd.raw());
@@ -592,5 +608,43 @@ mod tests {
         let stub = dir.path().join("deep/nested/subdir");
         create_mount_stub(&stub, &EntryKind::Directory).unwrap();
         assert!(stub.is_dir());
+    }
+
+    #[test]
+    fn test_save_fds_descendant_of_another_entry() {
+        // When a path is a descendant of another entry (and not under $HOME or /tmp),
+        // it should still get an fd saved with UnderEntry location.
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let parent = dir.path().to_path_buf();
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        let home = Path::new("/nonexistent_home_for_hermit_test");
+        let entries: Vec<(&Path, bool)> = vec![(parent.as_path(), false), (child.as_path(), false)];
+        let saved = save_passthrough_fds(&entries, home).unwrap();
+
+        // parent is not under $HOME, /tmp, or another entry — skipped.
+        // child is a descendant of parent — saved as UnderEntry.
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].path, child);
+        assert!(matches!(saved[0].location, MountLocation::UnderEntry));
+    }
+
+    #[test]
+    fn test_save_fds_sorted_ancestors_before_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = home.join("project");
+        let subdir = home.join("project/sub");
+        fs::create_dir_all(&subdir).unwrap();
+
+        // Pass in reverse order — subdir before project
+        let entries: Vec<(&Path, bool)> = vec![(&subdir, false), (&project, false)];
+        let saved = save_passthrough_fds(&entries, &home).unwrap();
+
+        // Both should be saved (under $HOME), and sorted with project before subdir
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].path, project);
+        assert_eq!(saved[1].path, subdir);
     }
 }

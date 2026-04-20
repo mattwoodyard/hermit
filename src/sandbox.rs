@@ -6,16 +6,33 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::cli::NetMode;
-use crate::home_files::load_home_files;
+use crate::home_files::{load_home_files, HomeFileDirective};
 use crate::landlock::apply_landlock;
 use crate::namespace::setup_namespace;
 use crate::process;
+
+/// Load `{project_dir}/.hermit/network-policy.toml` if present. Missing
+/// file → `Ok(None)`. Malformed file → error (fail closed: bad policy
+/// must not silently disable credential injection).
+fn load_network_policy(
+    project_dir: &Path,
+) -> Result<Option<Arc<sni_proxy::network_policy::NetworkPolicy>>> {
+    let path = project_dir.join(".hermit/network-policy.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    info!("loading network policy from {}", path.display());
+    let np = sni_proxy::network_policy::NetworkPolicy::load(&path)
+        .with_context(|| format!("failed to load network policy {}", path.display()))?;
+    Ok(Some(Arc::new(np)))
+}
 
 /// Build the read-write path list for landlock from the sandbox parameters.
 fn build_rw_paths<'a>(
     home_path: &'a Path,
     project_dir: &'a Path,
     passthrough: &'a [PathBuf],
+    home_files: &'a [HomeFileDirective],
 ) -> Vec<&'a Path> {
     let mut rw_paths: Vec<&Path> = vec![
         Path::new("/tmp"),
@@ -25,6 +42,11 @@ fn build_rw_paths<'a>(
     ];
     for p in passthrough {
         rw_paths.push(p.as_path());
+    }
+    for d in home_files {
+        if let HomeFileDirective::Pass(ref p) = d {
+            rw_paths.push(p.as_path());
+        }
     }
     rw_paths
 }
@@ -50,12 +72,23 @@ pub fn run_sandboxed(
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let home_path = Path::new(&home);
 
-    info!("loading home-files config");
+    if let Ok(env_path) = std::env::var("HERMIT_HOME_FILES") {
+        info!("loading home-files config from {}", env_path);
+    } else {
+        info!(
+            "loading home-files config from {} and {}",
+            project_dir.join(".hermit/home-files").display(),
+            home_path.join(".hermit/home-files").display(),
+        );
+    }
     let home_files = load_home_files(project_dir, home_path)
         .context("failed to load home-files config")?;
     debug!("home-files entries: {}", home_files.len());
+    for d in &home_files {
+        debug!("  home-file: {:?}", d);
+    }
 
-    let rw_paths = build_rw_paths(home_path, project_dir, passthrough);
+    let rw_paths = build_rw_paths(home_path, project_dir, passthrough, &home_files);
 
     match net {
         NetMode::Host => {
@@ -67,8 +100,16 @@ pub fn run_sandboxed(
                 rules.len()
             );
             let policy = Arc::new(RuleSet::new(rules));
+            let network_policy = load_network_policy(project_dir)?;
             process::run_forked_proxied(
-                home_path, project_dir, passthrough, &home_files, &rw_paths, command, policy,
+                home_path,
+                project_dir,
+                passthrough,
+                &home_files,
+                &rw_paths,
+                command,
+                policy,
+                network_policy,
             )
         }
         NetMode::Isolate => {
@@ -131,7 +172,7 @@ mod tests {
     fn test_build_rw_paths_includes_defaults() {
         let home = Path::new("/home/test");
         let project = Path::new("/tmp/project");
-        let paths = build_rw_paths(home, project, &[]);
+        let paths = build_rw_paths(home, project, &[], &[]);
         assert!(paths.contains(&Path::new("/tmp")));
         assert!(paths.contains(&home));
         assert!(paths.contains(&project));
@@ -143,7 +184,24 @@ mod tests {
         let home = Path::new("/home/test");
         let project = Path::new("/tmp/project");
         let extra = vec![PathBuf::from("/opt/extra")];
-        let paths = build_rw_paths(home, project, &extra);
+        let paths = build_rw_paths(home, project, &extra, &[]);
         assert!(paths.contains(&extra[0].as_path()));
+    }
+
+    #[test]
+    fn test_build_rw_paths_includes_pass_directives() {
+        let home = Path::new("/home/test");
+        let project = Path::new("/tmp/project");
+        let home_files = vec![
+            HomeFileDirective::Pass(PathBuf::from("/opt/data")),
+            HomeFileDirective::Copy(PathBuf::from("/home/test/.bashrc")),
+            HomeFileDirective::Read(PathBuf::from("/home/test/.config")),
+        ];
+        let paths = build_rw_paths(home, project, &[], &home_files);
+        // Pass directives should be included
+        assert!(paths.contains(&Path::new("/opt/data")));
+        // Copy and Read directives should not grant rw
+        assert!(!paths.contains(&Path::new("/home/test/.bashrc")));
+        assert!(!paths.contains(&Path::new("/home/test/.config")));
     }
 }
