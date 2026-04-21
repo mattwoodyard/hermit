@@ -23,15 +23,19 @@ use crate::match_dsl::Expr;
 #[derive(Debug, Deserialize)]
 struct PolicyFile {
     #[serde(default)]
-    rule: Vec<RuleSpec>,
+    rule: Vec<MatchRuleSpec>,
     #[serde(default)]
     credential: HashMap<String, Credential>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RuleSpec {
-    r#match: String,
-    credential: String,
+/// Serde-shape of a single `[[rule]]` entry: a DSL match expression and
+/// the name of the credential to inject when it fires. Exposed so callers
+/// that already have these values parsed (e.g. from a larger config file)
+/// can build a `NetworkPolicy` without re-serializing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MatchRuleSpec {
+    pub r#match: String,
+    pub credential: String,
 }
 
 pub struct CompiledRule {
@@ -55,11 +59,19 @@ impl NetworkPolicy {
     pub fn from_toml(text: &str) -> Result<Self> {
         let parsed: PolicyFile =
             toml::from_str(text).context("parsing network policy TOML")?;
+        Self::compile(parsed.rule, parsed.credential)
+    }
 
-        // Compile rules; error if a rule references an unknown credential.
-        let mut rules = Vec::with_capacity(parsed.rule.len());
-        for (i, r) in parsed.rule.into_iter().enumerate() {
-            if !parsed.credential.contains_key(&r.credential) {
+    /// Build a policy from already-deserialized rule specs and credentials.
+    /// Use this when the rules/credentials live inside a larger config
+    /// document (see hermit::config).
+    pub fn compile(
+        rule_specs: Vec<MatchRuleSpec>,
+        credentials: HashMap<String, Credential>,
+    ) -> Result<Self> {
+        let mut rules = Vec::with_capacity(rule_specs.len());
+        for (i, r) in rule_specs.into_iter().enumerate() {
+            if !credentials.contains_key(&r.credential) {
                 return Err(anyhow!(
                     "rule #{i} references unknown credential {:?}",
                     r.credential
@@ -75,7 +87,7 @@ impl NetworkPolicy {
 
         Ok(Self {
             rules,
-            resolver: CredentialResolver::new(parsed.credential),
+            resolver: CredentialResolver::new(credentials),
         })
     }
 

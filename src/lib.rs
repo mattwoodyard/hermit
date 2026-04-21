@@ -1,4 +1,6 @@
 pub mod cli;
+pub mod config;
+pub mod config_loader;
 pub mod fdpass;
 pub mod home_files;
 pub mod landlock;
@@ -6,4 +8,5 @@ pub mod namespace;
 pub mod netns;
 pub mod process;
 pub mod sandbox;
+pub mod signature;
 pub mod trust;

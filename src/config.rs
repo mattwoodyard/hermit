@@ -1,0 +1,414 @@
+//! Unified configuration schema for hermit.
+//!
+//! A hermit config is a single TOML file that bundles what used to live
+//! across `.hermit/home-files`, `.hermit/network-policy.toml`, and a
+//! pile of CLI flags. It ends with a `[signature]` section over which
+//! hermit enforces an x509-signed trust anchor.
+//!
+//! ```toml
+//! [sandbox]
+//! net = "isolate"
+//! passthrough = ["/opt/data"]
+//!
+//! [[home_file]]
+//! action = "pass"
+//! path = "~/.ssh"
+//!
+//! [[access_rule]]
+//! host = "api.github.com"
+//! methods = ["GET"]
+//!
+//! [[rule]]
+//! match = 'url.host == "api.github.com"'
+//! credential = "gh"
+//!
+//! [credential.gh]
+//! source = { type = "env", name = "GITHUB_TOKEN" }
+//! inject = [{ header = "Authorization", value = "Bearer {cred}" }]
+//!
+//! [signature]
+//! cert = "<base64 DER>"
+//! signature = "<base64 bytes>"
+//! algorithm = "ed25519"
+//! ```
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use sni_proxy::credential::Credential;
+use sni_proxy::network_policy::{MatchRuleSpec, NetworkPolicy};
+use sni_proxy::policy::{AccessRule, HttpMethod};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use crate::home_files::HomeFileDirective;
+
+/// Whole deserialized config. Fields group by TOML section; each is
+/// optional so a minimal config with just `[sandbox]` is valid.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+
+    #[serde(default, rename = "home_file")]
+    pub home_files: Vec<HomeFileSpec>,
+
+    #[serde(default, rename = "access_rule")]
+    pub access_rules: Vec<AccessRuleSpec>,
+
+    #[serde(default, rename = "rule")]
+    pub injection_rules: Vec<MatchRuleSpec>,
+
+    #[serde(default)]
+    pub credential: HashMap<String, Credential>,
+
+    /// Present only after signing. Missing during the signing step.
+    #[serde(default)]
+    pub signature: Option<SignatureSection>,
+}
+
+/// `[sandbox]` section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub net: NetMode,
+
+    #[serde(default)]
+    pub passthrough: Vec<PathBuf>,
+}
+
+/// Network isolation mode (config form). Converts to [`crate::cli::NetMode`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetMode {
+    #[default]
+    Host,
+    Isolate,
+}
+
+impl NetMode {
+    pub fn to_cli(self) -> crate::cli::NetMode {
+        match self {
+            NetMode::Host => crate::cli::NetMode::Host,
+            NetMode::Isolate => crate::cli::NetMode::Isolate,
+        }
+    }
+}
+
+/// `[[home_file]]` entry. `action` picks among copy/pass/read mirroring
+/// the verbs in the old line-based format.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeFileSpec {
+    pub action: HomeFileAction,
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HomeFileAction {
+    Copy,
+    Pass,
+    Read,
+}
+
+/// `[[access_rule]]` entry — hostname plus optional path prefix / methods.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRuleSpec {
+    pub host: String,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+}
+
+/// `[signature]` section — x509 cert (DER, base64) plus signature bytes.
+/// Only ed25519 is accepted for now; the `algorithm` field is explicit to
+/// make future rollover obvious.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureSection {
+    /// Base64-encoded signer cert (DER form).
+    pub cert: String,
+    /// Base64-encoded signature bytes over the content *before* the
+    /// `[signature]` line (see `crate::signature` for exact framing).
+    pub signature: String,
+    #[serde(default = "default_algorithm")]
+    pub algorithm: String,
+}
+
+fn default_algorithm() -> String {
+    "ed25519".to_string()
+}
+
+impl Config {
+    /// Parse a TOML string into a `Config`. Signature verification is
+    /// handled separately by [`crate::signature`] against the raw bytes —
+    /// this function only concerns itself with schema.
+    pub fn parse(text: &str) -> Result<Self> {
+        toml::from_str(text).context("parsing hermit config TOML")
+    }
+
+    /// Adapt `[[home_file]]` entries into the existing `HomeFileDirective`
+    /// enum, expanding `~` against `home_dir` and rejecting `..`.
+    pub fn home_file_directives(
+        &self,
+        home_dir: &Path,
+    ) -> Result<Vec<HomeFileDirective>> {
+        self.home_files
+            .iter()
+            .enumerate()
+            .map(|(i, hf)| {
+                let expanded = expand_tilde(&hf.path, home_dir);
+                reject_dotdot(&expanded, i)?;
+                Ok(match hf.action {
+                    HomeFileAction::Copy => HomeFileDirective::Copy(expanded),
+                    HomeFileAction::Pass => HomeFileDirective::Pass(expanded),
+                    HomeFileAction::Read => HomeFileDirective::Read(expanded),
+                })
+            })
+            .collect()
+    }
+
+    /// Adapt `[[access_rule]]` entries into sni-proxy's `AccessRule`.
+    pub fn access_rules(&self) -> Result<Vec<AccessRule>> {
+        self.access_rules
+            .iter()
+            .enumerate()
+            .map(|(i, ar)| {
+                let methods = match &ar.methods {
+                    None => None,
+                    Some(list) => {
+                        let mut set = HashSet::new();
+                        for m in list {
+                            let method = HttpMethod::from_str(m)
+                                .with_context(|| format!("access_rule #{i}: method {m:?}"))?;
+                            set.insert(method);
+                        }
+                        if set.is_empty() {
+                            bail!("access_rule #{i}: empty methods list (omit the field to allow any method)");
+                        }
+                        Some(set)
+                    }
+                };
+                Ok(AccessRule {
+                    hostname: ar.host.to_ascii_lowercase(),
+                    path_prefix: ar.path_prefix.clone(),
+                    methods,
+                })
+            })
+            .collect()
+    }
+
+    /// Build a `NetworkPolicy` (credential injection) from the
+    /// `[[rule]]` + `[credential.*]` sections. Returns `None` when there
+    /// are no injection rules, avoiding the cost of compiling an empty
+    /// policy.
+    pub fn network_policy(&self) -> Result<Option<NetworkPolicy>> {
+        if self.injection_rules.is_empty() {
+            return Ok(None);
+        }
+        let np = NetworkPolicy::compile(
+            self.injection_rules.clone(),
+            self.credential.clone(),
+        )
+        .context("compiling credential-injection rules")?;
+        Ok(Some(np))
+    }
+}
+
+fn expand_tilde(raw: &str, home_dir: &Path) -> PathBuf {
+    if raw == "~" {
+        home_dir.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home_dir.join(rest)
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+fn reject_dotdot(path: &Path, index: usize) -> Result<()> {
+    for c in path.components() {
+        if let std::path::Component::ParentDir = c {
+            bail!(
+                "home_file #{index} path must not contain '..': {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FULL: &str = r#"
+[sandbox]
+net = "isolate"
+passthrough = ["/opt/extra"]
+
+[[home_file]]
+action = "pass"
+path = "~/.ssh"
+
+[[home_file]]
+action = "copy"
+path = "~/.gitconfig"
+
+[[access_rule]]
+host = "registry.npmjs.org"
+
+[[access_rule]]
+host = "api.github.com"
+path_prefix = "/repos/"
+methods = ["GET", "POST"]
+
+[[rule]]
+match = 'url.host == "api.github.com"'
+credential = "gh"
+
+[credential.gh]
+source = { type = "env", name = "GITHUB_TOKEN" }
+inject = [{ header = "Authorization", value = "Bearer {cred}" }]
+
+[signature]
+cert = "BASE64_CERT"
+signature = "BASE64_SIG"
+algorithm = "ed25519"
+"#;
+
+    #[test]
+    fn parses_full_example() {
+        let c = Config::parse(FULL).unwrap();
+        assert_eq!(c.sandbox.net, NetMode::Isolate);
+        assert_eq!(c.sandbox.passthrough, vec![PathBuf::from("/opt/extra")]);
+        assert_eq!(c.home_files.len(), 2);
+        assert_eq!(c.access_rules.len(), 2);
+        assert_eq!(c.injection_rules.len(), 1);
+        assert_eq!(c.credential.len(), 1);
+        let sig = c.signature.as_ref().unwrap();
+        assert_eq!(sig.algorithm, "ed25519");
+    }
+
+    #[test]
+    fn home_files_adapt_and_expand_tilde() {
+        let c = Config::parse(FULL).unwrap();
+        let dirs = c.home_file_directives(Path::new("/home/u")).unwrap();
+        assert_eq!(
+            dirs,
+            vec![
+                HomeFileDirective::Pass(PathBuf::from("/home/u/.ssh")),
+                HomeFileDirective::Copy(PathBuf::from("/home/u/.gitconfig")),
+            ]
+        );
+    }
+
+    #[test]
+    fn home_files_reject_dotdot() {
+        let toml = r#"
+[[home_file]]
+action = "pass"
+path = "../escape"
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert!(c.home_file_directives(Path::new("/home/u")).is_err());
+    }
+
+    #[test]
+    fn access_rules_adapt_with_methods() {
+        let c = Config::parse(FULL).unwrap();
+        let rules = c.access_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].hostname, "registry.npmjs.org");
+        assert!(rules[0].methods.is_none());
+        assert_eq!(rules[1].hostname, "api.github.com");
+        assert_eq!(rules[1].path_prefix.as_deref(), Some("/repos/"));
+        assert_eq!(rules[1].methods.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn access_rule_unknown_method_is_error() {
+        let toml = r#"
+[[access_rule]]
+host = "x"
+methods = ["BOGUS"]
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert!(c.access_rules().is_err());
+    }
+
+    #[test]
+    fn access_rule_empty_methods_list_is_error() {
+        let toml = r#"
+[[access_rule]]
+host = "x"
+methods = []
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert!(c.access_rules().is_err());
+    }
+
+    #[test]
+    fn network_policy_present_when_rules_exist() {
+        let c = Config::parse(FULL).unwrap();
+        assert!(c.network_policy().unwrap().is_some());
+    }
+
+    #[test]
+    fn network_policy_absent_when_no_rules() {
+        let c = Config::parse("[sandbox]\nnet = \"host\"").unwrap();
+        assert!(c.network_policy().unwrap().is_none());
+    }
+
+    #[test]
+    fn network_policy_rule_refers_unknown_credential_errors() {
+        let toml = r#"
+[[rule]]
+match = 'url.host == "x"'
+credential = "ghost"
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert!(c.network_policy().is_err());
+    }
+
+    #[test]
+    fn minimal_config_parses() {
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.sandbox.net, NetMode::Host);
+        assert!(c.home_files.is_empty());
+        assert!(c.access_rules.is_empty());
+        assert!(c.signature.is_none());
+    }
+
+    #[test]
+    fn unknown_top_level_field_is_error() {
+        let toml = r#"
+[sandbox]
+net = "host"
+
+[what_is_this]
+nope = true
+"#;
+        assert!(Config::parse(toml).is_err());
+    }
+
+    #[test]
+    fn unknown_sandbox_field_is_error() {
+        let toml = r#"
+[sandbox]
+net = "host"
+rogue_field = 1
+"#;
+        assert!(Config::parse(toml).is_err());
+    }
+
+    #[test]
+    fn net_mode_conversion() {
+        assert_eq!(NetMode::Host.to_cli(), crate::cli::NetMode::Host);
+        assert_eq!(NetMode::Isolate.to_cli(), crate::cli::NetMode::Isolate);
+    }
+}

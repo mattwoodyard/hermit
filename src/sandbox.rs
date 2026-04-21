@@ -1,31 +1,16 @@
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
-use sni_proxy::policy::{AccessRule, RuleSet};
+use sni_proxy::policy::RuleSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use crate::cli::NetMode;
-use crate::home_files::{load_home_files, HomeFileDirective};
+use crate::config::Config;
+use crate::home_files::HomeFileDirective;
 use crate::landlock::apply_landlock;
 use crate::namespace::setup_namespace;
 use crate::process;
-
-/// Load `{project_dir}/.hermit/network-policy.toml` if present. Missing
-/// file → `Ok(None)`. Malformed file → error (fail closed: bad policy
-/// must not silently disable credential injection).
-fn load_network_policy(
-    project_dir: &Path,
-) -> Result<Option<Arc<sni_proxy::network_policy::NetworkPolicy>>> {
-    let path = project_dir.join(".hermit/network-policy.toml");
-    if !path.exists() {
-        return Ok(None);
-    }
-    info!("loading network policy from {}", path.display());
-    let np = sni_proxy::network_policy::NetworkPolicy::load(&path)
-        .with_context(|| format!("failed to load network policy {}", path.display()))?;
-    Ok(Some(Arc::new(np)))
-}
 
 /// Build the read-write path list for landlock from the sandbox parameters.
 fn build_rw_paths<'a>(
@@ -51,19 +36,20 @@ fn build_rw_paths<'a>(
     rw_paths
 }
 
-/// Run a command inside the sandbox and return its exit code.
+/// Run a command inside the sandbox using a verified config. Returns
+/// the child's exit code.
 ///
-/// When `net` is `Isolate` and `rules` is non-empty, the command runs in a
-/// network namespace with a proxy and fake DNS server that enforce the rules.
-/// When `rules` is empty, the network namespace has zero connectivity.
-///
-/// In `Host` mode, the command runs directly with the host network.
+/// Network mode is taken from `config.sandbox.net`:
+///   * `host` — share the host network, no isolation.
+///   * `isolate` with access rules — run a network namespace with the
+///     hermit proxy enforcing the rules (plus optional credential
+///     injection from `[[rule]]` + `[credential.*]`).
+///   * `isolate` without access rules — empty network namespace, zero
+///     connectivity.
 pub fn run_sandboxed(
     project_dir: &Path,
-    passthrough: &[PathBuf],
     command: &[String],
-    net: &NetMode,
-    rules: Vec<AccessRule>,
+    config: &Config,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
@@ -72,39 +58,39 @@ pub fn run_sandboxed(
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let home_path = Path::new(&home);
 
-    if let Ok(env_path) = std::env::var("HERMIT_HOME_FILES") {
-        info!("loading home-files config from {}", env_path);
-    } else {
-        info!(
-            "loading home-files config from {} and {}",
-            project_dir.join(".hermit/home-files").display(),
-            home_path.join(".hermit/home-files").display(),
-        );
-    }
-    let home_files = load_home_files(project_dir, home_path)
-        .context("failed to load home-files config")?;
+    let home_files = config.home_file_directives(home_path)?;
     debug!("home-files entries: {}", home_files.len());
     for d in &home_files {
         debug!("  home-file: {:?}", d);
     }
 
-    let rw_paths = build_rw_paths(home_path, project_dir, passthrough, &home_files);
+    let passthrough: Vec<PathBuf> = config.sandbox.passthrough.clone();
+    let rw_paths = build_rw_paths(home_path, project_dir, &passthrough, &home_files);
+
+    let net = config.sandbox.net.to_cli();
+    let access_rules = config.access_rules()?;
 
     match net {
         NetMode::Host => {
-            run_sandboxed_direct(home_path, project_dir, passthrough, &home_files, &rw_paths, command)
+            if !access_rules.is_empty() {
+                info!(
+                    "net=host: ignoring {} access_rule entries (only meaningful in net=isolate)",
+                    access_rules.len()
+                );
+            }
+            run_sandboxed_direct(home_path, project_dir, &passthrough, &home_files, &rw_paths, command)
         }
-        NetMode::Isolate if !rules.is_empty() => {
+        NetMode::Isolate if !access_rules.is_empty() => {
             info!(
                 "using proxied sandbox with network isolation ({} rules)",
-                rules.len()
+                access_rules.len()
             );
-            let policy = Arc::new(RuleSet::new(rules));
-            let network_policy = load_network_policy(project_dir)?;
+            let policy = Arc::new(RuleSet::new(access_rules));
+            let network_policy = config.network_policy()?.map(Arc::new);
             process::run_forked_proxied(
                 home_path,
                 project_dir,
-                passthrough,
+                &passthrough,
                 &home_files,
                 &rw_paths,
                 command,
@@ -115,7 +101,7 @@ pub fn run_sandboxed(
         NetMode::Isolate => {
             info!("using forked sandbox with full network isolation");
             process::run_forked(
-                home_path, project_dir, passthrough, &home_files, &rw_paths, command, net,
+                home_path, project_dir, &passthrough, &home_files, &rw_paths, command, &net,
             )
         }
     }
@@ -156,14 +142,16 @@ mod tests {
 
     #[test]
     fn test_empty_command_fails() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Host, vec![]);
+        let config = Config::default();
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
 
     #[test]
     fn test_empty_command_fails_net_isolate() {
-        let result = run_sandboxed(Path::new("/tmp"), &[], &[], &NetMode::Isolate, vec![]);
+        let config = Config::parse("[sandbox]\nnet = \"isolate\"\n").unwrap();
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }

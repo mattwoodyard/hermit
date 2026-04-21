@@ -1,12 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use log::info;
-use sni_proxy::policy::AccessRule;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use hermit::cli::{Cli, NetMode};
-use hermit::sandbox::run_sandboxed;
+use hermit::cli::{Cli, Command, RunArgs, SignArgs, VerifyArgs};
+use hermit::{config::Config, config_loader, sandbox::run_sandboxed, signature};
 
 fn main() {
     let exit_code = match run() {
@@ -16,75 +15,106 @@ fn main() {
             1
         }
     };
-
     process::exit(exit_code);
 }
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
+    match cli.command {
+        Command::Run(args) => run_subcommand(args),
+        Command::Sign(args) => sign_subcommand(args),
+        Command::Verify(args) => verify_subcommand(args),
+    }
+}
 
-    let log_level = match cli.verbose {
+fn init_logging(verbose: u8) {
+    let level = match verbose {
         0 => log::LevelFilter::Warn,
         1 => log::LevelFilter::Info,
         2 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
     env_logger::Builder::new()
-        .filter_level(log_level)
+        .filter_level(level)
         .format_target(false)
         .format_timestamp(None)
         .init();
-
-    let project_dir = cli
-        .project_dir
-        .canonicalize()
-        .with_context(|| format!("--project-dir '{}' does not exist", cli.project_dir.display()))?;
-
-    info!("project dir: {}", project_dir.display());
-
-    let passthrough: Vec<PathBuf> = cli
-        .passthrough
-        .iter()
-        .map(|p| {
-            p.canonicalize()
-                .with_context(|| format!("--passthrough '{}' does not exist", p.display()))
-        })
-        .collect::<Result<_>>()?;
-
-    for p in &passthrough {
-        info!("passthrough: {}", p.display());
-    }
-
-    // Build access rules from --allowed-hosts (hostname-only) and --allow (full rules)
-    let rules = build_rules(&cli.allowed_hosts, &cli.allow)?;
-
-    // --allow or --allowed-hosts implies --net isolate
-    let net = if !rules.is_empty() && cli.net == NetMode::Host {
-        info!("access rules set, implying --net isolate");
-        NetMode::Isolate
-    } else {
-        cli.net
-    };
-
-    info!("command: {}", cli.command.join(" "));
-
-    run_sandboxed(&project_dir, &passthrough, &cli.command, &net, rules)
 }
 
-/// Merge --allowed-hosts and --allow into a single list of AccessRules.
-fn build_rules(allowed_hosts: &[String], allow: &[String]) -> Result<Vec<AccessRule>> {
-    let mut rules: Vec<AccessRule> = Vec::new();
+fn run_subcommand(args: RunArgs) -> Result<i32> {
+    init_logging(args.verbose);
 
-    for host in allowed_hosts {
-        rules.push(AccessRule::host_only(host));
+    let project_dir = args
+        .project_dir
+        .canonicalize()
+        .with_context(|| format!("--project-dir '{}' does not exist", args.project_dir.display()))?;
+    info!("project dir: {}", project_dir.display());
+    info!("config URL: {}", args.config);
+
+    let bytes = config_loader::fetch(&args.config)?;
+    let trust_dir = default_trust_dir()?;
+    let trusted = signature::verify(&bytes, &trust_dir)
+        .with_context(|| format!("verifying {}", args.config))?;
+    info!("config verified by trusted key: {}", trusted.path.display());
+
+    let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
+    let config = Config::parse(text)?;
+
+    info!("command: {}", args.command.join(" "));
+    run_sandboxed(&project_dir, &args.command, &config)
+}
+
+fn sign_subcommand(args: SignArgs) -> Result<i32> {
+    init_logging(0);
+    let cert_pem = std::fs::read_to_string(&args.cert)
+        .with_context(|| format!("reading cert {}", args.cert.display()))?;
+    let key_pem = std::fs::read_to_string(&args.key)
+        .with_context(|| format!("reading key {}", args.key.display()))?;
+    let unsigned = std::fs::read(&args.config)
+        .with_context(|| format!("reading config {}", args.config.display()))?;
+    let signed = signature::sign(&unsigned, &cert_pem, &key_pem)?;
+    let output = args.output.as_ref().unwrap_or(&args.config);
+    std::fs::write(output, &signed)
+        .with_context(|| format!("writing signed config {}", output.display()))?;
+    println!("signed -> {}", output.display());
+    Ok(0)
+}
+
+fn verify_subcommand(args: VerifyArgs) -> Result<i32> {
+    init_logging(0);
+    let trust_dir = match args.trust_dir {
+        Some(p) => p,
+        None => default_trust_dir()?,
+    };
+    let bytes = config_loader::fetch(&args.config)?;
+    let trusted = signature::verify(&bytes, &trust_dir)
+        .with_context(|| format!("verifying {}", args.config))?;
+    println!("OK: verified by {}", trusted.path.display());
+    Ok(0)
+}
+
+/// Resolve the trust directory. `HERMIT_TRUST_DIR` wins over the
+/// default `~/.hermit/keys` so tests can point hermit at a scoped trust
+/// anchor without relying on a host `~/.hermit`.
+fn default_trust_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("HERMIT_TRUST_DIR") {
+        let dir = PathBuf::from(p);
+        if !dir.exists() {
+            bail!(
+                "HERMIT_TRUST_DIR={} does not exist",
+                dir.display()
+            );
+        }
+        return Ok(dir);
     }
-
-    for raw in allow {
-        let rule: AccessRule = raw
-            .parse()
-            .with_context(|| format!("invalid --allow rule: '{}'", raw))?;
-        rules.push(rule);
+    let home = std::env::var("HOME")
+        .context("cannot locate trust directory: $HOME is not set")?;
+    let dir = Path::new(&home).join(".hermit/keys");
+    if !dir.exists() {
+        bail!(
+            "trust directory {} does not exist; create it and add trusted ed25519 cert .pem files",
+            dir.display()
+        );
     }
-
-    Ok(rules)
+    Ok(dir)
 }
