@@ -3,6 +3,10 @@
 //! These are designed to be called after `unshare(CLONE_NEWUSER | CLONE_NEWNET)`
 //! when the process is uid 0 inside its own user+net namespace.
 //!
+//! nftables rules are programmed directly via netlink (the `rustables`
+//! crate). There is no dependency on an external `nft` binary — hermit
+//! talks to the kernel's netfilter subsystem itself.
+//!
 //! Each function does one thing and can be composed in the caller:
 //!
 //! ```no_run
@@ -15,7 +19,11 @@
 
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
-use std::process::Command;
+use rustables::{
+    expr::{Immediate, Nat, NatType, Register},
+    Batch, Chain, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule, Table,
+};
+use std::os::fd::AsRawFd;
 
 // ---------------------------------------------------------------------------
 // Loopback
@@ -100,84 +108,224 @@ fn set_interface_up(sock: i32, ifname: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// nftables rules
+// nftables rules — programmed via netlink (rustables), not the nft binary
 // ---------------------------------------------------------------------------
 
-/// Path to the nft binary. Resolved once at first use.
-fn nft_path() -> Result<std::path::PathBuf> {
-    which::which("nft").context(
-        "nft not found in PATH; install nftables to use network isolation",
-    )
+/// Name of the nftables table hermit creates inside the child netns.
+/// Single name (one place to change) and scoped so it can't collide with
+/// host rules even if the netns ever leaked.
+const TABLE_NAME: &str = "hermit_nat";
+
+/// Build the `Table` descriptor used across this module. Not a real kernel
+/// resource — just the rustables handle that batch operations target.
+fn hermit_table() -> Table {
+    Table::new(ProtocolFamily::Ipv4).with_name(TABLE_NAME)
 }
 
-/// Run an `nft` command with the given arguments.
-fn run_nft(args: &[&str]) -> Result<()> {
-    let nft = nft_path()?;
-    debug!("netns: nft {}", args.join(" "));
-    let output = Command::new(&nft)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run nft {}", args.join(" ")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("nft {} failed: {}", args.join(" "), stderr.trim());
+/// Send a rustables `Batch` to the kernel via netlink.
+///
+/// We avoid `Batch::send()` because rustables 0.8.7 has an I/O-safety bug
+/// there — the netlink socket fd is both closed manually (via
+/// `nix::unistd::close`) and then a second time by the `OwnedFd::Drop`
+/// that wraps the same fd. In a forking program like hermit this triggers
+/// `fatal runtime error: IO Safety violation: owned file descriptor
+/// already closed, aborting`. We use `Batch::finalize()` to obtain the
+/// serialized netlink bytes and ship them ourselves with proper fd
+/// ownership.
+fn send_batch(batch: Batch) -> Result<()> {
+    use nix::sys::socket::{
+        self, AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType,
+    };
+
+    let bytes = batch.finalize();
+
+    let sock = socket::socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::empty(),
+        SockProtocol::NetlinkNetFilter,
+    )
+    .context("opening netlink socket")?;
+
+    socket::bind(sock.as_raw_fd(), &NetlinkAddr::new(0, 0))
+        .context("binding netlink socket")?;
+
+    // 5-second ceiling on the *first* blocking recv so a missing kernel
+    // reply can't hang us forever. Subsequent recvs use MSG_DONTWAIT so
+    // we don't burn this timeout per batch — see the drain loop below.
+    let timeout = nix::sys::time::TimeVal::new(5, 0);
+    socket::setsockopt(&sock, nix::sys::socket::sockopt::ReceiveTimeout, &timeout)
+        .context("setting SO_RCVTIMEO on netlink socket")?;
+
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let n = socket::send(sock.as_raw_fd(), &bytes[sent..], MsgFlags::empty())
+            .context("netlink send")?;
+        if n == 0 {
+            bail!("netlink send returned 0 bytes");
+        }
+        sent += n;
+    }
+
+    // Rustables sets NLM_F_ACK on every object message, so the kernel
+    // replies with an `nlmsgerr` per message (error=0 = success). In
+    // practice all ACKs for a small batch come back in a single datagram.
+    //
+    // Strategy: one blocking recv to catch the initial reply, then drain
+    // anything else non-blocking. The drain returns EAGAIN immediately
+    // once the socket queue is empty — no dead wait on SO_RCVTIMEO.
+    let mut buf = vec![0u8; 32 * 1024];
+    match socket::recv(sock.as_raw_fd(), &mut buf, MsgFlags::empty()) {
+        Ok(0) => return Ok(()),
+        Ok(n) => check_netlink_acks(&buf[..n])?,
+        Err(e) => bail!("netlink recv (first ack): {e}"),
+    }
+    loop {
+        match socket::recv(sock.as_raw_fd(), &mut buf, MsgFlags::MSG_DONTWAIT) {
+            Ok(0) => break,
+            Ok(n) => check_netlink_acks(&buf[..n])?,
+            // EAGAIN and EWOULDBLOCK are the same errno on Linux, but we
+            // write them separately for portability — `#[allow]` keeps
+            // the duplicate arm from tripping unreachable_patterns.
+            #[allow(unreachable_patterns)]
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EWOULDBLOCK) => break,
+            Err(e) => bail!("netlink recv (drain): {e}"),
+        }
+    }
+
+    // OwnedFd dropped here — closed exactly once.
+    Ok(())
+}
+
+/// Walk a block of netlink messages looking for `nlmsgerr` entries.
+/// Return `Err` on the first nonzero error code. Success ACKs (error=0)
+/// are acceptable and silently consumed.
+fn check_netlink_acks(buf: &[u8]) -> Result<()> {
+    const NLMSG_HDR_LEN: usize = 16;
+    let mut offset = 0;
+    while offset + NLMSG_HDR_LEN <= buf.len() {
+        let nlmsg_len = u32::from_ne_bytes(
+            buf[offset..offset + 4].try_into().unwrap(),
+        ) as usize;
+        let nlmsg_type = u16::from_ne_bytes(
+            buf[offset + 4..offset + 6].try_into().unwrap(),
+        );
+        if nlmsg_len < NLMSG_HDR_LEN || offset + nlmsg_len > buf.len() {
+            break;
+        }
+        if nlmsg_type == libc::NLMSG_ERROR as u16 {
+            if offset + NLMSG_HDR_LEN + 4 > buf.len() {
+                break;
+            }
+            let err = i32::from_ne_bytes(
+                buf[offset + NLMSG_HDR_LEN..offset + NLMSG_HDR_LEN + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if err != 0 {
+                // Kernel reports negative errno; flip the sign for the os_error.
+                let errno = -err;
+                bail!(
+                    "nftables netlink error: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+            }
+        }
+        // Netlink messages are aligned to 4 bytes.
+        offset += (nlmsg_len + 3) & !3;
     }
     Ok(())
 }
 
-/// Create the nftables nat table and output chain (idempotent).
+/// Build the output-hook nat chain descriptor on `table`.
+fn output_chain(table: &Table) -> Chain {
+    Chain::new(table)
+        .with_name("output")
+        .with_hook(Hook::new(HookClass::Out, 0))
+        .with_type(ChainType::Nat)
+}
+
+/// Create the nftables nat table and output chain.
 ///
-/// Must be called before `add_nft_redirect`. Safe to call multiple times.
+/// Must be called before `add_nft_redirect`. Safe to call multiple times:
+/// `MsgType::Add` without `NLM_F_EXCL` is a no-op when the object already
+/// exists, matching the semantics of `nft add table ...`.
 pub fn ensure_nft_nat_table() -> Result<()> {
-    info!("netns: ensuring nftables nat table exists");
-    run_nft(&["add", "table", "ip", "hermit_nat"])?;
-    run_nft(&[
-        "add",
-        "chain",
-        "ip",
-        "hermit_nat",
-        "output",
-        "{ type nat hook output priority 0 ; }",
-    ])?;
+    info!("netns: ensuring nftables nat table exists (via netlink)");
+    let table = hermit_table();
+    let chain = output_chain(&table);
+
+    let mut batch = Batch::new();
+    batch.add(&table, MsgType::Add);
+    batch.add(&chain, MsgType::Add);
+    send_batch(batch).context("creating nat table/chain")?;
     Ok(())
 }
 
-/// Add an nftables REDIRECT rule: connections to `from_port` are redirected
-/// to `to_port` on localhost where the SNI proxy listens.
+/// Add a nat rule: TCP traffic to `from_port` is DNAT'd to
+/// `127.0.0.1:to_port` where the hermit proxy listens.
+///
+/// Note: this is DNAT-to-loopback, not `REDIRECT`. For output-hook NAT
+/// the two behave equivalently (REDIRECT is shorthand for DNAT to the
+/// interface's primary address; here we target loopback explicitly).
+/// rustables 0.8 does not expose the `redir` expression, so DNAT is the
+/// supported path.
 ///
 /// Call `ensure_nft_nat_table` first.
 pub fn add_nft_redirect(from_port: u16, to_port: u16) -> Result<()> {
     info!(
-        "netns: adding nftables redirect tcp:{} -> :{}",
+        "netns: adding nat rule tcp dport {} -> 127.0.0.1:{} (via netlink)",
         from_port, to_port
     );
-    let rule = format!("tcp dport {} redirect to :{}", from_port, to_port);
-    run_nft(&[
-        "add",
-        "rule",
-        "ip",
-        "hermit_nat",
-        "output",
-        &rule,
-    ])
+    let table = hermit_table();
+    let chain = output_chain(&table);
+
+    // DNAT reads destination address from `Reg1` and destination port from
+    // `Reg2`. `Immediate` expressions load each value (in network byte
+    // order) into those registers before the `Nat` expression runs.
+    let dst_ip: [u8; 4] = [127, 0, 0, 1];
+    let dst_port: [u8; 2] = to_port.to_be_bytes();
+
+    let rule = Rule::new(&chain)
+        .context("constructing nat rule")?
+        .dport(from_port, Protocol::TCP)
+        .with_expr(Immediate::new_data(dst_ip.to_vec(), Register::Reg1))
+        .with_expr(Immediate::new_data(dst_port.to_vec(), Register::Reg2))
+        .with_expr(
+            Nat::default()
+                .with_nat_type(NatType::DNat)
+                .with_family(ProtocolFamily::Ipv4)
+                .with_ip_register(Register::Reg1)
+                .with_port_register(Register::Reg2),
+        );
+
+    let mut batch = Batch::new();
+    batch.add(&rule, MsgType::Add);
+    send_batch(batch)
+        .with_context(|| format!("adding rule tcp:{from_port} -> :{to_port}"))?;
+    Ok(())
 }
 
-/// Remove all hermit nftables rules (cleanup).
+/// Remove the hermit nftables table (and everything in it).
+///
+/// Uses the Add+Del idempotency pattern so this succeeds whether or not
+/// the table already exists. Matches the shell-out semantics where
+/// `nft delete table` on a missing table would error.
 pub fn cleanup_nft() -> Result<()> {
-    info!("netns: removing nftables hermit_nat table");
-    // "delete table" removes the table and all chains/rules in it
-    run_nft(&["delete", "table", "ip", "hermit_nat"])
+    info!("netns: removing nftables {} table (via netlink)", TABLE_NAME);
+    let table = hermit_table();
+    let mut batch = Batch::new();
+    batch.add(&table, MsgType::Add); // make Del succeed if table is absent
+    batch.add(&table, MsgType::Del);
+    send_batch(batch).context("deleting nat table")?;
+    Ok(())
 }
 
-/// List current nftables ruleset (for debugging).
-pub fn list_nft_ruleset() -> Result<String> {
-    let nft = nft_path()?;
-    let output = Command::new(&nft)
-        .args(["list", "ruleset"])
-        .output()
-        .context("failed to run nft list ruleset")?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
+// `list_nft_ruleset` was intentionally dropped along with the shell-out —
+// the rustables `list_*` helpers share the same I/O-safety bug as
+// `Batch::send`, and nothing in hermit's runtime path consumed it.
+// Reintroduce with our own netlink list path if we ever need it for
+// debugging.
 
 // ---------------------------------------------------------------------------
 // resolv.conf
@@ -237,9 +385,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nft_path_finds_binary_or_errors() {
-        // Just verify it doesn't panic — result depends on system
-        let _ = nft_path();
+    fn table_descriptor_has_expected_name() {
+        let t = hermit_table();
+        assert_eq!(t.get_name().map(|s| s.as_str()), Some(TABLE_NAME));
+    }
+
+    #[test]
+    fn output_chain_descriptor_is_nat_on_output_hook() {
+        let t = hermit_table();
+        let c = output_chain(&t);
+        assert_eq!(c.get_name().map(|s| s.as_str()), Some("output"));
+        assert_eq!(c.get_type(), Some(&ChainType::Nat));
+        let hook = c.get_hook().expect("hook set");
+        // get_class returns the raw NF_INET_LOCAL_OUT value, not the enum.
+        assert_eq!(hook.get_class().copied(), Some(libc::NF_INET_LOCAL_OUT as u32));
+    }
+
+    #[test]
+    fn redirect_rule_builds_without_error() {
+        // We can construct the rule descriptor without touching the kernel.
+        // Sending the batch would need CAP_NET_ADMIN; we don't do that here.
+        let t = hermit_table();
+        let c = output_chain(&t);
+        let r = Rule::new(&c)
+            .expect("rule constructor")
+            .dport(443, Protocol::TCP)
+            .with_expr(Immediate::new_data(vec![127, 0, 0, 1], Register::Reg1))
+            .with_expr(Immediate::new_data(1443u16.to_be_bytes().to_vec(), Register::Reg2))
+            .with_expr(
+                Nat::default()
+                    .with_nat_type(NatType::DNat)
+                    .with_family(ProtocolFamily::Ipv4)
+                    .with_ip_register(Register::Reg1)
+                    .with_port_register(Register::Reg2),
+            );
+        // Non-empty expression list == builder succeeded.
+        assert!(r.get_expressions().is_some());
     }
 
     #[test]

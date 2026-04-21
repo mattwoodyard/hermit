@@ -13,9 +13,9 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 landlock = "0.4"
-nix = { version = "0.29", features = ["sched", "mount", "process", "user", "signal"] }
+nix = { version = "0.29", features = ["sched", "mount", "process", "user", "signal", "socket", "net", "time"] }
 libc = "0.2"
-which = "7"
+rustables = "0.8"
 sni-proxy = { path = "sni-proxy" }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 serde = { version = "1", features = ["derive"] }

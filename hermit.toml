@@ -1,0 +1,49 @@
+# hermit config — mirrors .hermit/home-files + restricts network to
+# claude.ai and api.anthropic.com only. Sign with `hermit sign`, or run
+# under `hermit run --allow-unsigned --config file://…` for local dev.
+
+[sandbox]
+net = "isolate"
+
+# --- home-files (mirrored from .hermit/home-files) -----------------------
+# Each entry in the old format becomes one [[home_file]] section here.
+
+[[home_file]]
+action = "pass"
+path = "~/.local/share/claude"
+
+[[home_file]]
+action = "copy"
+path = "~/.bashrc"
+
+[[home_file]]
+action = "pass"
+path = "~/.local/bin/claude"
+
+[[home_file]]
+action = "pass"
+path = "~/.claude"
+
+[[home_file]]
+action = "pass"
+path = "~/.claude.json"
+
+[[home_file]]
+action = "read"
+path = "~/.rustup"
+
+[[home_file]]
+action = "read"
+path = "~/.cargo"
+
+# --- network: allow only claude.ai and its API ---------------------------
+# Any other host (DNS or TLS SNI) is dropped by the proxy. To extend the
+# allowlist, add more [[access_rule]] entries — e.g. statsig.anthropic.com
+# or sentry for telemetry, or a specific cdn host if claude.ai pulls
+# assets from one at runtime.
+
+[[access_rule]]
+host = "claude.ai"
+
+[[access_rule]]
+host = "api.anthropic.com"
