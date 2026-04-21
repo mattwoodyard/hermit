@@ -41,6 +41,8 @@ pub enum Command {
     Sign(SignArgs),
     /// Verify a signed config URL against trusted keys in `~/.hermit/keys`.
     Verify(VerifyArgs),
+    /// Generate a fresh ed25519 signer keypair + self-signed x509 cert.
+    Keygen(KeygenArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -48,6 +50,12 @@ pub struct RunArgs {
     /// URL of the signed config. `file://...` or `https://...`.
     #[arg(long)]
     pub config: String,
+
+    /// Skip signature verification and accept a config without a
+    /// `[signature]` section. Intended for local development — a
+    /// loud warning is logged when this is used.
+    #[arg(long)]
+    pub allow_unsigned: bool,
 
     /// Verbose output. `-v` info, `-vv` debug, `-vvv` trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -88,6 +96,26 @@ pub struct VerifyArgs {
     /// Override the trust directory. Defaults to `~/.hermit/keys`.
     #[arg(long)]
     pub trust_dir: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+pub struct KeygenArgs {
+    /// Write the self-signed x509 certificate here (PEM).
+    #[arg(long)]
+    pub cert: PathBuf,
+
+    /// Write the PKCS8 ed25519 private key here (PEM).
+    /// The file is created with mode 0600.
+    #[arg(long)]
+    pub key: PathBuf,
+
+    /// Subject common name for the generated cert.
+    #[arg(long, default_value = "hermit-signer")]
+    pub subject: String,
+
+    /// Overwrite `--cert` / `--key` if they already exist.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[cfg(test)]
@@ -228,6 +256,87 @@ mod tests {
     #[test]
     fn no_subcommand_is_error() {
         assert!(Cli::try_parse_from(["hermit"]).is_err());
+    }
+
+    #[test]
+    fn parse_run_allow_unsigned() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--allow-unsigned",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => {
+                assert!(args.allow_unsigned);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_defaults_to_signed() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => assert!(!args.allow_unsigned),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_keygen_required_args() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "keygen",
+            "--cert",
+            "/tmp/c.pem",
+            "--key",
+            "/tmp/k.pem",
+        ]);
+        match cli.command {
+            Command::Keygen(args) => {
+                assert_eq!(args.cert, PathBuf::from("/tmp/c.pem"));
+                assert_eq!(args.key, PathBuf::from("/tmp/k.pem"));
+                assert_eq!(args.subject, "hermit-signer");
+                assert!(!args.force);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_keygen_with_all_flags() {
+        let cli = Cli::parse_from([
+            "hermit", "keygen",
+            "--cert", "/t/c.pem",
+            "--key", "/t/k.pem",
+            "--subject", "ci-bot",
+            "--force",
+        ]);
+        match cli.command {
+            Command::Keygen(args) => {
+                assert_eq!(args.subject, "ci-bot");
+                assert!(args.force);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn keygen_requires_cert_and_key() {
+        assert!(Cli::try_parse_from(["hermit", "keygen"]).is_err());
+        assert!(Cli::try_parse_from(["hermit", "keygen", "--cert", "/x"]).is_err());
+        assert!(Cli::try_parse_from(["hermit", "keygen", "--key", "/x"]).is_err());
     }
 
     #[test]

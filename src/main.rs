@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use hermit::cli::{Cli, Command, RunArgs, SignArgs, VerifyArgs};
+use hermit::cli::{Cli, Command, KeygenArgs, RunArgs, SignArgs, VerifyArgs};
 use hermit::{config::Config, config_loader, sandbox::run_sandboxed, signature};
 
 fn main() {
@@ -24,6 +24,7 @@ fn run() -> Result<i32> {
         Command::Run(args) => run_subcommand(args),
         Command::Sign(args) => sign_subcommand(args),
         Command::Verify(args) => verify_subcommand(args),
+        Command::Keygen(args) => keygen_subcommand(args),
     }
 }
 
@@ -52,10 +53,18 @@ fn run_subcommand(args: RunArgs) -> Result<i32> {
     info!("config URL: {}", args.config);
 
     let bytes = config_loader::fetch(&args.config)?;
-    let trust_dir = default_trust_dir()?;
-    let trusted = signature::verify(&bytes, &trust_dir)
-        .with_context(|| format!("verifying {}", args.config))?;
-    info!("config verified by trusted key: {}", trusted.path.display());
+    if args.allow_unsigned {
+        warn!(
+            "--allow-unsigned: skipping signature verification for {} \
+             (this bypasses the trust anchor in ~/.hermit/keys)",
+            args.config
+        );
+    } else {
+        let trust_dir = default_trust_dir()?;
+        let trusted = signature::verify(&bytes, &trust_dir)
+            .with_context(|| format!("verifying {}", args.config))?;
+        info!("config verified by trusted key: {}", trusted.path.display());
+    }
 
     let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
     let config = Config::parse(text)?;
@@ -96,6 +105,70 @@ fn verify_subcommand(args: VerifyArgs) -> Result<i32> {
 /// Resolve the trust directory. `HERMIT_TRUST_DIR` wins over the
 /// default `~/.hermit/keys` so tests can point hermit at a scoped trust
 /// anchor without relying on a host `~/.hermit`.
+fn keygen_subcommand(args: KeygenArgs) -> Result<i32> {
+    init_logging(0);
+
+    if !args.force {
+        if args.cert.exists() {
+            bail!(
+                "{} already exists (use --force to overwrite)",
+                args.cert.display()
+            );
+        }
+        if args.key.exists() {
+            bail!(
+                "{} already exists (use --force to overwrite)",
+                args.key.display()
+            );
+        }
+    }
+
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .context("generating ed25519 keypair")?;
+    let cert = rcgen::CertificateParams::new(vec![args.subject.clone()])
+        .context("building cert params")?
+        .self_signed(&kp)
+        .context("self-signing certificate")?;
+
+    std::fs::write(&args.cert, cert.pem())
+        .with_context(|| format!("writing cert {}", args.cert.display()))?;
+    write_private_key(&args.key, &kp.serialize_pem())?;
+
+    println!("cert  -> {}", args.cert.display());
+    println!("key   -> {} (mode 0600)", args.key.display());
+    println!(
+        "note: to trust configs signed by this key, copy {} into ~/.hermit/keys/",
+        args.cert.display()
+    );
+    Ok(0)
+}
+
+/// Write a private key file with restrictive permissions (0600 on unix).
+/// Uses `OpenOptions` so the permission bits apply from creation, not as
+/// a follow-up chmod race.
+fn write_private_key(path: &Path, pem: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(pem.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn default_trust_dir() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("HERMIT_TRUST_DIR") {
         let dir = PathBuf::from(p);

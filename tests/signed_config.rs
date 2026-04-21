@@ -233,6 +233,198 @@ fn run_rejects_missing_trust_dir() {
 }
 
 #[test]
+fn allow_unsigned_accepts_config_without_signature() {
+    let h = Harness::new();
+    // Plain TOML, no sign step, no [signature] section.
+    let path = h._home.path().join("plain.toml");
+    std::fs::write(&path, "[sandbox]\nnet = \"host\"\n").unwrap();
+    let url = format!("file://{}", path.display());
+
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        .args([
+            "run",
+            "--config",
+            &url,
+            "--allow-unsigned",
+            "--project-dir",
+            "/tmp",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    // The actual sandbox may fail for privilege reasons, but the config
+    // load/parse step must succeed, so stderr must NOT complain about
+    // signatures or verification.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Any signature-related *failure* would appear as an anyhow error
+    // line prefixed with "hermit:". The warning emitted by --allow-unsigned
+    // starts with "[WARN ]" and is fine.
+    let failure_indicators = [
+        "hermit: verifying",
+        "no [signature] section found",
+        "signature verification failed",
+        "did not match any trusted key",
+    ];
+    for f in failure_indicators {
+        assert!(
+            !stderr.contains(f),
+            "--allow-unsigned should skip signature checks, but stderr contained {f:?}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn allow_unsigned_logs_warning() {
+    let h = Harness::new();
+    let path = h._home.path().join("p.toml");
+    std::fs::write(&path, "[sandbox]\nnet = \"host\"\n").unwrap();
+    let url = format!("file://{}", path.display());
+
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        // -v to see warn-level logs on stderr.
+        .args([
+            "run",
+            "--config",
+            &url,
+            "--allow-unsigned",
+            "-v",
+            "--project-dir",
+            "/tmp",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-unsigned") || stderr.contains("skipping signature"),
+        "expected allow-unsigned warning in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn keygen_produces_usable_signer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cert = tmp.path().join("c.pem");
+    let key = tmp.path().join("k.pem");
+
+    let out = hermit_bin()
+        .args([
+            "keygen",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--subject",
+            "unit-test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cert.exists());
+    assert!(key.exists());
+
+    // Key file must be 0600 on unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key file mode was {mode:o}");
+    }
+
+    // Round-trip: put generated cert into a fresh trust dir, sign a
+    // config with the generated key, verify it.
+    let trust_dir = tmp.path().join("trust");
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    std::fs::copy(&cert, trust_dir.join("signer.pem")).unwrap();
+
+    let unsigned = tmp.path().join("u.toml");
+    let signed = tmp.path().join("s.toml");
+    std::fs::write(&unsigned, "[sandbox]\nnet = \"host\"\n").unwrap();
+
+    let o = hermit_bin()
+        .args([
+            "sign",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--output",
+            signed.to_str().unwrap(),
+            unsigned.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "sign: {}", String::from_utf8_lossy(&o.stderr));
+
+    let url = format!("file://{}", signed.display());
+    let v = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &trust_dir)
+        .args(["verify", &url])
+        .output()
+        .unwrap();
+    assert!(v.status.success(), "verify: {}", String::from_utf8_lossy(&v.stderr));
+}
+
+#[test]
+fn keygen_refuses_to_overwrite_without_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cert = tmp.path().join("c.pem");
+    let key = tmp.path().join("k.pem");
+    std::fs::write(&cert, "existing\n").unwrap();
+
+    let out = hermit_bin()
+        .args([
+            "keygen",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists"));
+    // Existing file untouched.
+    assert_eq!(std::fs::read_to_string(&cert).unwrap(), "existing\n");
+}
+
+#[test]
+fn keygen_force_overwrites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cert = tmp.path().join("c.pem");
+    let key = tmp.path().join("k.pem");
+    std::fs::write(&cert, "old\n").unwrap();
+    std::fs::write(&key, "old\n").unwrap();
+
+    let out = hermit_bin()
+        .args([
+            "keygen",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "keygen --force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cert_content = std::fs::read_to_string(&cert).unwrap();
+    assert!(cert_content.contains("BEGIN CERTIFICATE"));
+}
+
+#[test]
 fn run_rejects_http_url() {
     let h = Harness::new();
     let out = hermit_bin()
