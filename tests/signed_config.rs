@@ -43,13 +43,21 @@ impl Harness {
     }
 
     fn sign_config(&self, toml_body: &str) -> PathBuf {
+        self.sign_config_as(toml_body, "signed.toml")
+    }
+
+    /// Like `sign_config`, but writes the output to a specific filename
+    /// so a single test can produce multiple signed files (e.g. a root
+    /// plus an include target).
+    fn sign_config_as(&self, toml_body: &str, filename: &str) -> PathBuf {
         let cert_path = self._home.path().join("cert.pem");
         let key_path = self._home.path().join("key.pem");
         std::fs::write(&cert_path, &self.cert_pem).unwrap();
         std::fs::write(&key_path, &self.key_pem).unwrap();
 
-        let unsigned_path = self._home.path().join("unsigned.toml");
-        let signed_path = self._home.path().join("signed.toml");
+        let unsigned_name = format!("{}.unsigned", filename);
+        let unsigned_path = self._home.path().join(&unsigned_name);
+        let signed_path = self._home.path().join(filename);
         std::fs::write(&unsigned_path, toml_body).unwrap();
 
         let out = hermit_bin()
@@ -422,6 +430,122 @@ fn keygen_force_overwrites() {
     );
     let cert_content = std::fs::read_to_string(&cert).unwrap();
     assert!(cert_content.contains("BEGIN CERTIFICATE"));
+}
+
+#[test]
+fn verify_transitively_checks_signed_include_chain() {
+    // Signed include chain: root.toml -> shared.toml, both signed by the
+    // same trusted key. `verify` must accept the chain end-to-end.
+    let h = Harness::new();
+    let shared = h.sign_config_as(
+        "[[access_rule]]\nhost = \"shared.example\"\n",
+        "shared.toml",
+    );
+    let shared_url = format!("file://{}", shared.display());
+    let root = h.sign_config_as(
+        &format!(
+            "include = [\"{shared_url}\"]\n[[access_rule]]\nhost = \"root.example\"\n",
+        ),
+        "root.toml",
+    );
+    let root_url = format!("file://{}", root.display());
+
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        .args(["verify", &root_url])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "verify chain failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn verify_rejects_unsigned_include_even_when_root_is_signed() {
+    // A trusted root that pulls in an unsigned include must fail verify
+    // — otherwise a signature is just a decoy and an attacker could
+    // smuggle rules via the include URL.
+    let h = Harness::new();
+    let include_path = h._home.path().join("unsigned-include.toml");
+    std::fs::write(
+        &include_path,
+        "[[access_rule]]\nhost = \"evil.example\"\n",
+    )
+    .unwrap();
+    let include_url = format!("file://{}", include_path.display());
+    let root = h.sign_config_as(
+        &format!("include = [\"{include_url}\"]\n"),
+        "root.toml",
+    );
+    let root_url = format!("file://{}", root.display());
+
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        .args(["verify", &root_url])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "verify should reject unsigned include; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("signature") || stderr.contains("verifying"),
+        "expected signature error, got: {stderr}"
+    );
+}
+
+#[test]
+fn allow_unsigned_merges_includes_end_to_end() {
+    // With --allow-unsigned we can bypass signing entirely and still
+    // exercise the full include → merge pipeline.
+    let h = Harness::new();
+    let shared = h._home.path().join("shared.toml");
+    std::fs::write(
+        &shared,
+        "[sandbox]\nnet = \"isolate\"\n\n[[access_rule]]\nhost = \"shared.example\"\n",
+    )
+    .unwrap();
+    let shared_url = format!("file://{}", shared.display());
+    let root = h._home.path().join("root.toml");
+    std::fs::write(
+        &root,
+        format!(
+            "include = [\"{shared_url}\"]\n\n[[access_rule]]\nhost = \"root.example\"\n",
+        ),
+    )
+    .unwrap();
+    let root_url = format!("file://{}", root.display());
+
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        .args([
+            "run",
+            "--config",
+            &root_url,
+            "--allow-unsigned",
+            "--project-dir",
+            "/tmp",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    // Don't assert status — the sandbox may fail for privilege reasons in
+    // CI. We only care that the config pipeline did not complain about
+    // the include or merge.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("loading config"),
+        "include merge failed; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("cycle"),
+        "unexpected cycle error; stderr={stderr}"
+    );
 }
 
 #[test]

@@ -111,10 +111,11 @@ pub fn run_sandboxed(
         debug!("  home-file: {:?}", d);
     }
 
-    let passthrough: Vec<PathBuf> = drop_missing_passthrough(config.sandbox.passthrough.clone());
+    let sandbox_cfg = config.sandbox();
+    let passthrough: Vec<PathBuf> = drop_missing_passthrough(sandbox_cfg.passthrough.clone());
     let rw_paths = build_rw_paths(home_path, project_dir, &passthrough, &home_files);
 
-    let net = config.sandbox.net.to_cli();
+    let net = sandbox_cfg.net.to_cli();
     let access_rules = config.access_rules()?;
 
     match net {

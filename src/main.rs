@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use hermit::cli::{Cli, Command, KeygenArgs, RunArgs, SignArgs, VerifyArgs};
-use hermit::{config::Config, config_loader, landlock, sandbox::run_sandboxed, signature};
+use hermit::config_loader::TrustPolicy;
+use hermit::{config_loader, landlock, sandbox::run_sandboxed, signature};
 
 fn main() {
     let exit_code = match run() {
@@ -78,22 +79,26 @@ fn run_subcommand(args: RunArgs) -> Result<i32> {
     info!("project dir: {}", project_dir.display());
     info!("config URL: {}", args.config);
 
-    let bytes = config_loader::fetch(&args.config)?;
-    if args.allow_unsigned {
+    // `trust_dir_buf` owns the PathBuf; `trust` borrows it. Both must
+    // outlive the `assemble` call, which is why we bind the owner first.
+    let trust_dir_buf = if args.allow_unsigned {
         warn!(
             "--allow-unsigned: skipping signature verification for {} \
+             and any included files \
              (this bypasses the trust anchor in ~/.hermit/keys)",
             args.config
         );
+        None
     } else {
-        let trust_dir = default_trust_dir()?;
-        let trusted = signature::verify(&bytes, &trust_dir)
-            .with_context(|| format!("verifying {}", args.config))?;
-        info!("config verified by trusted key: {}", trusted.path.display());
-    }
+        Some(default_trust_dir()?)
+    };
+    let trust = match &trust_dir_buf {
+        Some(dir) => TrustPolicy::RequireSigned { trust_dir: dir },
+        None => TrustPolicy::AllowUnsigned,
+    };
 
-    let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
-    let config = Config::parse(text)?;
+    let config = config_loader::assemble(&args.config, &trust)
+        .with_context(|| format!("loading config from {}", args.config))?;
 
     info!("command: {}", args.command.join(" "));
     run_sandboxed(&project_dir, &args.command, &config)
@@ -121,9 +126,17 @@ fn verify_subcommand(args: VerifyArgs) -> Result<i32> {
         Some(p) => p,
         None => default_trust_dir()?,
     };
+    // Verify the root directly so we can report which trusted key signed
+    // it. Then walk any includes via `assemble` so we don't green-light a
+    // config whose transitively-included files are unsigned.
     let bytes = config_loader::fetch(&args.config)?;
     let trusted = signature::verify(&bytes, &trust_dir)
         .with_context(|| format!("verifying {}", args.config))?;
+    config_loader::assemble(
+        &args.config,
+        &TrustPolicy::RequireSigned { trust_dir: &trust_dir },
+    )
+    .with_context(|| format!("verifying {} and its includes", args.config))?;
     println!("OK: verified by {}", trusted.path.display());
     Ok(0)
 }

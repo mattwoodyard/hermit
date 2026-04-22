@@ -127,6 +127,74 @@ hermit --net isolate --project-dir /tmp -- sh -c 'ls /sys/class/net/'
 # Expected: only "lo"
 ```
 
+## Config format
+
+Hermit loads a TOML file referenced by `--config <URL>` (schemes:
+`file://` or `https://`). Every config must either carry a `[signature]`
+section produced by `hermit sign` and verified against a cert in
+`~/.hermit/keys/` (overridable via `HERMIT_TRUST_DIR`), or be loaded
+under `hermit run --allow-unsigned` for local development.
+
+Top-level sections:
+
+| Section | Purpose |
+|---|---|
+| `include = ["<url>", ...]` | Other configs to merge into this one (see below) |
+| `[sandbox]` | Network mode + `passthrough` dirs |
+| `[[home_file]]` | `copy` / `pass` / `read` actions applied to a `$HOME` path |
+| `[[access_rule]]` | Allow a host / path prefix / HTTP methods through the proxy |
+| `[[port_forward]]` | Extra TCP ports to intercept (`https` → MITM, `http` → HTTP proxy) |
+| `[[rule]]` + `[credential.<name>]` | Credential-injection matcher + credential source |
+| `[signature]` | Detached ed25519 signature over the preceding content |
+
+### `include` — composing configs
+
+`include` lets a config share rules with others by pulling their content
+in at load time. A typical layout:
+
+```toml
+# /etc/hermit/shared-rules.toml  (signed, owned by an admin)
+[[access_rule]]
+host = "api.github.com"
+
+[[access_rule]]
+host = "registry.npmjs.org"
+```
+
+```toml
+# project.toml  (signed, owned by the developer)
+include = ["file:///etc/hermit/shared-rules.toml"]
+
+[sandbox]
+net = "isolate"
+
+[[access_rule]]                # extends the shared set
+host = "my-private-registry.example"
+```
+
+Rules:
+
+- **URLs**: each entry is `file://` or `https://` (same schemes hermit
+  accepts for `--config`). Relative URLs resolve against the including
+  file's URL.
+- **Signatures**: every fetched file is verified independently against
+  the trust dir. `--allow-unsigned` skips verification for the whole
+  chain. `verify <url>` walks the chain and fails if any link is
+  unsigned or tampered.
+- **Cycles**: `A → B → A` is rejected at load time. Include depth is
+  capped at 16 to catch pathological chains.
+- **Merge order**: depth-first in declaration order. Each include is
+  fully merged *before* the including file's own entries.
+- **Arrays** (`home_file`, `access_rule`, `port_forward`, `rule`):
+  concatenated in merge order — `include_1 ++ include_2 ++ ... ++ own`.
+  For consumers where order matters (e.g. first-match injection rules),
+  includes take precedence over the including file's own entries.
+- **Scalars and tables** (`sandbox`, `credential.<name>`): last writer
+  wins. The including file is merged last, so it overrides any value an
+  include provided.
+- **Signatures don't merge**: `[signature]` applies only to its own
+  file during verification, and is dropped during merge.
+
 ## Running the test suite
 
 ```sh
