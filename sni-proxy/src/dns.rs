@@ -209,7 +209,7 @@ pub struct DnsServer<P> {
     ipv6: Ipv6Addr,
 }
 
-impl<P: ConnectionPolicy + 'static> DnsServer<P> {
+impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
     pub fn new(policy: Arc<P>) -> Self {
         Self {
             policy,
@@ -231,16 +231,27 @@ impl<P: ConnectionPolicy + 'static> DnsServer<P> {
     }
 
     /// Run the DNS server on the given socket until cancelled.
-    pub async fn run(&self, socket: UdpSocket) -> std::io::Result<()> {
+    ///
+    /// Takes `self: Arc<Self>` so response sends can be spawned off the
+    /// recv loop — a stalled `send_to` must not stall packet reception.
+    pub async fn run(self: Arc<Self>, socket: UdpSocket) -> std::io::Result<()> {
         let local_addr = socket.local_addr()?;
         info!(%local_addr, "dns server listening");
 
+        let socket = Arc::new(socket);
         let mut buf = [0u8; 512];
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
-            let response = self.handle_packet(&buf[..len], src);
-            if let Some(resp) = response {
-                let _ = socket.send_to(&resp, src).await;
+            // `handle_packet` is cheap and synchronous — do it on the
+            // recv task. Only the send is spawned so a slow client can't
+            // back up reception.
+            if let Some(resp) = self.handle_packet(&buf[..len], src) {
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    if let Err(e) = socket.send_to(&resp, src).await {
+                        warn!(%src, error = %e, "dns: send_to failed");
+                    }
+                });
             }
         }
     }

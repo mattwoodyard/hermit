@@ -7,14 +7,27 @@
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+use tracing::{debug, warn};
 
 use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::policy::{RequestPolicy, Verdict};
-use crate::proxy::get_original_dst;
+use crate::proxy::{get_original_dst, MAX_CONCURRENT_CONNECTIONS};
+
+/// Max time to wait for a full HTTP request head on an idle keep-alive
+/// connection. Keeps slow clients from parking tokio tasks forever.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max time for the upstream TCP connect.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard cap on response body bytes when upstream omits both Content-Length
+/// and Transfer-Encoding. Without this a trickling upstream could drain
+/// the task forever.
+const MAX_CLOSE_DELIMITED_RESPONSE: u64 = 512 * 1024 * 1024;
 
 /// Configuration for the HTTP proxy.
 pub struct HttpProxyConfig<P, C> {
@@ -29,12 +42,29 @@ where
     P: RequestPolicy + 'static,
     C: UpstreamConnector + 'static,
 {
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                // EMFILE / ECONNABORTED / etc. must not kill the listener —
+                // back off briefly and retry.
+                warn!(error = %e, "http: accept failed; continuing");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        // Acquire a slot before spawning — bounds concurrent in-flight
+        // connections to avoid unbounded task accumulation under load.
+        let permit = Arc::clone(&conn_limit)
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
         let config = Arc::clone(&config);
 
         tokio::spawn(async move {
-            info!(%addr, "http: accepted connection");
+            let _permit = permit; // released on task end
+            debug!(%addr, "http: accepted connection");
             if let Err(e) = handle_connection(stream, addr, &config).await {
                 debug!(%addr, error = %e, "http: connection ended");
             }
@@ -57,27 +87,33 @@ where
     // `config.upstream_port` so additional port_forward entries work.
     let original_dst = get_original_dst(&client);
     loop {
-        let request = match http::read_request(&mut client).await {
-            Ok(Some(req)) => req,
-            Ok(None) => return Ok(()),
-            Err(e) => {
+        let (request, leftover) = match timeout(
+            HEADER_READ_TIMEOUT,
+            http::read_request(&mut client),
+        )
+        .await
+        {
+            Ok(Ok(Some(pair))) => pair,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => {
                 debug!(%client_addr, error = %e, "http: error reading request");
+                return Ok(());
+            }
+            Err(_) => {
+                debug!(%client_addr, "http: header read timed out");
                 return Ok(());
             }
         };
 
         let hostname = match &request.host {
-            Some(h) => {
-                // Strip port from Host header if present
-                h.split(':').next().unwrap_or(h).to_string()
-            }
+            Some(h) => http::host_without_port(h).to_string(),
             None => {
                 warn!(%client_addr, "hermit blocked: HTTP request without Host header");
                 return Ok(());
             }
         };
 
-        info!(
+        debug!(
             %client_addr, %hostname,
             method = %request.method, path = %request.path,
             "http: request"
@@ -94,13 +130,21 @@ where
             return Ok(());
         }
 
-        // Connect upstream — original_dst gives the connector the pre-DNAT
-        // port so extra port_forward entries land on the right upstream.
-        let mut upstream = config
-            .connector
-            .connect(&hostname, config.upstream_port, original_dst)
-            .await
-            .context("connecting upstream")?;
+        let mut upstream = match timeout(
+            UPSTREAM_CONNECT_TIMEOUT,
+            config
+                .connector
+                .connect(&hostname, config.upstream_port, original_dst),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(e).context("connecting upstream"),
+            Err(_) => {
+                warn!(%hostname, "http: upstream connect timed out");
+                return Ok(());
+            }
+        };
 
         // Forward request headers
         upstream
@@ -108,47 +152,58 @@ where
             .await
             .context("forwarding request headers")?;
 
-        // Forward request body
+        // Forward request body (leftover bytes from the header read come first)
         if let Some(len) = request.content_length {
-            http::forward_body_content_length(&mut client, &mut upstream, len, &[])
+            http::forward_body_content_length(&mut client, &mut upstream, len, &leftover)
                 .await
                 .context("forwarding request body")?;
+        } else if request.chunked {
+            http::forward_chunked_body(&mut client, &mut upstream, &leftover)
+                .await
+                .context("forwarding chunked request body")?;
+        } else if !leftover.is_empty() {
+            // Non-standard: no length, no chunked, but extra bytes buffered.
+            // Safest is to forward what we've got.
+            upstream.write_all(&leftover).await?;
         }
         upstream.flush().await?;
 
         // Read and forward response
-        let (response, leftover) = http::read_response(&mut upstream).await?;
+        let (response, resp_leftover) = http::read_response(&mut upstream).await?;
         client
             .write_all(&response.head_bytes)
             .await
             .context("forwarding response headers")?;
 
         if let Some(len) = response.content_length {
-            http::forward_body_content_length(&mut upstream, &mut client, len, &leftover)
+            http::forward_body_content_length(&mut upstream, &mut client, len, &resp_leftover)
                 .await
                 .context("forwarding response body")?;
         } else if response.chunked {
-            if !leftover.is_empty() {
-                client.write_all(&leftover).await?;
-            }
-            copy_bidirectional(&mut upstream, &mut client).await?;
-            return Ok(());
+            http::forward_chunked_body(&mut upstream, &mut client, &resp_leftover)
+                .await
+                .context("forwarding chunked response body")?;
         } else {
-            if !leftover.is_empty() {
-                client.write_all(&leftover).await?;
-            }
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = upstream.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                client.write_all(&buf[..n]).await?;
-            }
+            // No content-length, no chunked — body ends at connection close.
+            // That is inherently incompatible with keep-alive, so drain
+            // (bounded) and return.
+            http::forward_until_eof(
+                &mut upstream,
+                &mut client,
+                &resp_leftover,
+                MAX_CLOSE_DELIMITED_RESPONSE,
+            )
+            .await
+            .context("forwarding close-delimited response")?;
             return Ok(());
         }
 
         client.flush().await?;
+
+        if request.connection_close {
+            return Ok(());
+        }
+        // Otherwise loop back and read the next request on this connection.
     }
 }
 

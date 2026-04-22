@@ -442,8 +442,9 @@ fn parent_main_proxied(
         upstream_port: HTTP_PORT,
     });
 
-    // DNS server
-    let dns_server = sni_proxy::dns::DnsServer::new(Arc::clone(&policy));
+    // DNS server — wrapped in Arc so `run` can spawn per-response tasks
+    // that share the socket.
+    let dns_server = Arc::new(sni_proxy::dns::DnsServer::new(Arc::clone(&policy)));
 
     // Spawn all services
     rt.spawn(async move {

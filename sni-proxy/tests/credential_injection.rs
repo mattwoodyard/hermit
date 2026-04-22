@@ -34,6 +34,7 @@ fn parsed_request(head: &[u8]) -> Request {
         content_length: None,
         chunked: false,
         host,
+        connection_close: false,
     }
 }
 

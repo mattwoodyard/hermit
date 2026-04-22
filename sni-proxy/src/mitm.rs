@@ -13,8 +13,11 @@ use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
@@ -23,7 +26,19 @@ use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::network_policy::{render_inject_value, NetworkPolicy};
 use crate::policy::{RequestPolicy, Verdict};
-use crate::proxy::{get_original_dst, read_sni_with_buffer};
+use crate::proxy::{get_original_dst, read_sni_with_buffer, MAX_CONCURRENT_CONNECTIONS};
+
+/// Max time to wait for the TLS ClientHello from the client.
+const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max time to wait for a full HTTP request head on an idle keep-alive
+/// connection.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max time for the upstream TCP connect (not the TLS handshake).
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max time for the upstream TLS handshake.
+const UPSTREAM_TLS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard cap on close-delimited response body size. See http_proxy.rs.
+const MAX_CLOSE_DELIMITED_RESPONSE: u64 = 512 * 1024 * 1024;
 
 /// Configuration for the MITM proxy.
 pub struct MitmConfig<P, C> {
@@ -43,12 +58,26 @@ where
     P: RequestPolicy + 'static,
     C: UpstreamConnector + 'static,
 {
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                // EMFILE / ECONNABORTED etc. must not kill the listener.
+                warn!(error = %e, "mitm: accept failed; continuing");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        let permit = Arc::clone(&conn_limit)
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
         let config = Arc::clone(&config);
 
         tokio::spawn(async move {
-            info!(%addr, "mitm: accepted connection");
+            let _permit = permit;
+            debug!(%addr, "mitm: accepted connection");
             if let Err(e) = handle_connection(stream, addr, &config).await {
                 // Connection resets and clean closes are noisy at error level
                 debug!(%addr, error = %e, "mitm: connection ended");
@@ -69,8 +98,20 @@ where
 {
     let original_dst = get_original_dst(&client_tcp);
 
-    // Step 1: Read ClientHello, extract SNI
-    let (hostname, client_hello_buf) = read_sni_with_buffer(&mut client_tcp).await?;
+    // Step 1: Read ClientHello, extract SNI (with a timeout — a client that
+    // opens a socket and never sends must not park a tokio task forever).
+    let (hostname, client_hello_buf) = match timeout(
+        CLIENT_HELLO_TIMEOUT,
+        read_sni_with_buffer(&mut client_tcp),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            debug!(%client_addr, "mitm: ClientHello read timed out");
+            return Ok(());
+        }
+    };
 
     let hostname = match hostname {
         Some(h) => h,
@@ -104,24 +145,33 @@ where
         .await
         .context("TLS handshake with client")?;
 
-    info!(%client_addr, %hostname, "mitm: TLS established with client");
+    debug!(%client_addr, %hostname, "mitm: TLS established with client");
 
     // Step 4-7: HTTP request/response loop (keep-alive)
     loop {
-        // Read HTTP request from the decrypted client stream
-        let mut request = match http::read_request(&mut client_tls).await {
-            Ok(Some(req)) => req,
-            Ok(None) => {
+        // Read HTTP request from the decrypted client stream (with timeout).
+        let (mut request, leftover) = match timeout(
+            HEADER_READ_TIMEOUT,
+            http::read_request(&mut client_tls),
+        )
+        .await
+        {
+            Ok(Ok(Some(pair))) => pair,
+            Ok(Ok(None)) => {
                 debug!(%client_addr, "mitm: client closed connection");
                 return Ok(());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!(%client_addr, error = %e, "mitm: error reading request");
+                return Ok(());
+            }
+            Err(_) => {
+                debug!(%client_addr, "mitm: request header read timed out");
                 return Ok(());
             }
         };
 
-        info!(
+        debug!(
             %client_addr, %hostname,
             method = %request.method, path = %request.path,
             "mitm: request"
@@ -143,14 +193,35 @@ where
             apply_injection(np, &hostname, &mut request).await;
         }
 
-        // Connect upstream with real TLS
-        let upstream_tcp = config
-            .connector
-            .connect(&hostname, config.upstream_port, original_dst)
-            .await
-            .context("connecting upstream")?;
+        // Connect upstream TCP (with timeout) then run real TLS handshake.
+        let upstream_tcp = match timeout(
+            UPSTREAM_CONNECT_TIMEOUT,
+            config
+                .connector
+                .connect(&hostname, config.upstream_port, original_dst),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(e).context("connecting upstream"),
+            Err(_) => {
+                warn!(%hostname, "mitm: upstream connect timed out");
+                return Ok(());
+            }
+        };
 
-        let mut upstream_tls = connect_upstream_tls(upstream_tcp, &hostname).await?;
+        let mut upstream_tls = match timeout(
+            UPSTREAM_TLS_TIMEOUT,
+            connect_upstream_tls(upstream_tcp, &hostname),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                warn!(%hostname, "mitm: upstream TLS handshake timed out");
+                return Ok(());
+            }
+        };
 
         // Forward request headers to upstream
         upstream_tls
@@ -158,19 +229,24 @@ where
             .await
             .context("forwarding request headers")?;
 
-        // Forward request body if present
+        // Forward request body. `leftover` contains any body bytes that
+        // arrived in the same read as the headers — they MUST go first.
         if let Some(len) = request.content_length {
-            // The head_bytes parsing may have consumed some body bytes.
-            // For simplicity, we stream them from the client directly.
-            http::forward_body_content_length(&mut client_tls, &mut upstream_tls, len, &[])
+            http::forward_body_content_length(&mut client_tls, &mut upstream_tls, len, &leftover)
                 .await
                 .context("forwarding request body")?;
+        } else if request.chunked {
+            http::forward_chunked_body(&mut client_tls, &mut upstream_tls, &leftover)
+                .await
+                .context("forwarding chunked request body")?;
+        } else if !leftover.is_empty() {
+            upstream_tls.write_all(&leftover).await?;
         }
 
         upstream_tls.flush().await?;
 
         // Read upstream response
-        let (response, leftover) = http::read_response(&mut upstream_tls).await?;
+        let (response, resp_leftover) = http::read_response(&mut upstream_tls).await?;
 
         // Forward response headers to client
         client_tls
@@ -178,39 +254,40 @@ where
             .await
             .context("forwarding response headers")?;
 
-        // Forward response body
         if let Some(len) = response.content_length {
-            http::forward_body_content_length(&mut upstream_tls, &mut client_tls, len, &leftover)
-                .await
-                .context("forwarding response body")?;
+            http::forward_body_content_length(
+                &mut upstream_tls,
+                &mut client_tls,
+                len,
+                &resp_leftover,
+            )
+            .await
+            .context("forwarding response body")?;
         } else if response.chunked {
-            // For chunked, just splice the remaining streams
-            copy_bidirectional(&mut upstream_tls, &mut client_tls)
+            http::forward_chunked_body(&mut upstream_tls, &mut client_tls, &resp_leftover)
                 .await
-                .context("chunked body relay")?;
-            return Ok(());
+                .context("forwarding chunked response body")?;
         } else {
-            // No content-length, no chunked — read until close
-            // Write leftover first
-            if !leftover.is_empty() {
-                client_tls.write_all(&leftover).await?;
-            }
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = upstream_tls.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                client_tls.write_all(&buf[..n]).await?;
-            }
+            // No content-length, no chunked — body ends at connection close.
+            // That is inherently incompatible with keep-alive: drain (bounded)
+            // and return.
+            http::forward_until_eof(
+                &mut upstream_tls,
+                &mut client_tls,
+                &resp_leftover,
+                MAX_CLOSE_DELIMITED_RESPONSE,
+            )
+            .await
+            .context("forwarding close-delimited response")?;
             return Ok(());
         }
 
         client_tls.flush().await?;
 
-        // For keep-alive, loop back to read the next request.
-        // (If the response indicated Connection: close, the client
-        // will close and read_request will return None next iteration.)
+        if request.connection_close {
+            return Ok(());
+        }
+        // Otherwise loop back and read the next request on this connection.
     }
 }
 
@@ -392,7 +469,7 @@ fn build_match_request(
     fallback_host: &str,
 ) -> Option<::http::Request<()>> {
     let host_raw = request.host.as_deref().unwrap_or(fallback_host);
-    let host = host_raw.split(':').next().unwrap_or(host_raw);
+    let host = http::host_without_port(host_raw);
     let uri = format!("https://{host}{}", request.path);
 
     let mut builder = ::http::Request::builder()
@@ -411,6 +488,7 @@ fn build_match_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn static_cert_resolver_returns_cert() {

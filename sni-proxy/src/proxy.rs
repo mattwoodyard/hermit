@@ -1,13 +1,29 @@
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use std::time::Duration;
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info, warn};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+use tracing::{debug, error, warn};
 
 use crate::connector::UpstreamConnector;
 use crate::policy::{ConnectionPolicy, Verdict};
 use crate::sni::{self, SniResult};
+
+/// Hard cap on ClientHello buffer growth. A real ClientHello fits in one
+/// TLS record (<16KB); anything larger is either garbage or an attempt to
+/// OOM us by streaming junk.
+const MAX_CLIENT_HELLO_BYTES: usize = 16 * 1024;
+/// Max time to wait for the TLS ClientHello.
+const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max time for the upstream TCP connect.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max concurrent in-flight connections per listener. Bounds task/fd
+/// accumulation under load so a burst of accepts can't exhaust resources.
+/// Shared across the three proxy flavors.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Configuration for the proxy accept loop.
 pub struct ProxyConfig<P, C> {
@@ -26,12 +42,25 @@ where
     P: ConnectionPolicy + 'static,
     C: UpstreamConnector + 'static,
 {
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "accept failed; continuing");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        let permit = Arc::clone(&conn_limit)
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
         let config = Arc::clone(&config);
 
         tokio::spawn(async move {
-            info!(%addr, "accepted connection");
+            let _permit = permit;
+            debug!(%addr, "accepted connection");
             if let Err(e) = handle_connection_full(stream, addr, &config).await {
                 error!(%addr, error = %e, "connection handler failed");
             }
@@ -59,6 +88,15 @@ pub async fn read_sni_with_buffer(client: &mut TcpStream) -> Result<(Option<Stri
         }
         buf.extend_from_slice(&tmp[..n]);
 
+        // Hard cap: a real ClientHello is well under this. Anything bigger
+        // is junk and we'd rather drop than keep growing the buffer.
+        if buf.len() > MAX_CLIENT_HELLO_BYTES {
+            anyhow::bail!(
+                "ClientHello exceeded {} bytes without completing",
+                MAX_CLIENT_HELLO_BYTES
+            );
+        }
+
         match sni::extract_sni(&buf)? {
             SniResult::Hostname(name) => break Some(name),
             SniResult::NoSni => break None,
@@ -82,7 +120,18 @@ where
 {
     let original_dst = get_original_dst(&client);
 
-    let (hostname, client_hello_buf) = read_sni_with_buffer(&mut client).await?;
+    let (hostname, client_hello_buf) = match timeout(
+        CLIENT_HELLO_TIMEOUT,
+        read_sni_with_buffer(&mut client),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            warn!(%client_addr, "ClientHello read timed out");
+            return Ok(());
+        }
+    };
 
     let hostname = match hostname {
         Some(h) => h,
@@ -100,11 +149,22 @@ where
         }
     }
 
-    info!(%client_addr, hostname, "forwarding");
-    let mut upstream = config
-        .connector
-        .connect(&hostname, config.upstream_port, original_dst)
-        .await?;
+    debug!(%client_addr, hostname, "forwarding");
+    let mut upstream = match timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        config
+            .connector
+            .connect(&hostname, config.upstream_port, original_dst),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            warn!(%hostname, "upstream connect timed out");
+            return Ok(());
+        }
+    };
 
     upstream
         .write_all(&client_hello_buf)
