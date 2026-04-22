@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use hermit::cli::{Cli, Command, KeygenArgs, RunArgs, SignArgs, VerifyArgs};
-use hermit::{config::Config, config_loader, sandbox::run_sandboxed, signature};
+use hermit::{config::Config, config_loader, landlock, sandbox::run_sandboxed, signature};
 
 fn main() {
     let exit_code = match run() {
@@ -40,10 +40,36 @@ fn init_logging(verbose: u8) {
         .format_target(false)
         .format_timestamp(None)
         .init();
+
+    // sni-proxy uses the `tracing` facade (not `log`), so env_logger alone
+    // would drop proxy events — including the `warn!` lines emitted when the
+    // MITM, HTTP proxy, or DNS layer blocks a request. Install a tracing
+    // subscriber at the same verbosity so those block events reach stderr.
+    let tracing_level = match verbose {
+        0 => tracing::Level::WARN,
+        1 => tracing::Level::INFO,
+        2 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(tracing_level.to_string()));
+    // `try_init` returns Err if a subscriber is already installed (e.g. from
+    // a test harness reusing the process) — we silently swallow that because
+    // a duplicate-install error isn't actionable at runtime.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn run_subcommand(args: RunArgs) -> Result<i32> {
     init_logging(args.verbose);
+
+    // Refuse to start if the kernel can't enforce Landlock — the whole
+    // filesystem-isolation story depends on it.
+    landlock::ensure_available()?;
 
     let project_dir = args
         .project_dir

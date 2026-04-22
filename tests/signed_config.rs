@@ -425,6 +425,77 @@ fn keygen_force_overwrites() {
 }
 
 #[test]
+fn verify_accepts_config_with_port_forwards() {
+    // End-to-end check that a signed config with [[port_forward]] entries
+    // parses through the full `verify` pipeline.
+    let h = Harness::new();
+    let body = r#"
+[sandbox]
+net = "isolate"
+
+[[access_rule]]
+host = "example.com"
+
+[[port_forward]]
+port = 8443
+
+[[port_forward]]
+port = 8080
+protocol = "http"
+"#;
+    let signed = h.sign_config(body);
+    let url = format!("file://{}", signed.display());
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        .args(["verify", &url])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "verify failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn verify_rejects_port_forward_on_reserved_port() {
+    // Parsing happens inside `verify` for signature-checked configs too;
+    // a reserved listener port must surface as an error at that stage.
+    //
+    // Note: `verify` only reads the signed text bytes and checks the
+    // signature — it doesn't call Config::parse. So we exercise this via
+    // `run --allow-unsigned` which does parse the config.
+    let h = Harness::new();
+    let bad = h._home.path().join("bad.toml");
+    std::fs::write(
+        &bad,
+        "[sandbox]\nnet = \"host\"\n[[port_forward]]\nport = 1443\n",
+    )
+    .unwrap();
+    let url = format!("file://{}", bad.display());
+    let out = hermit_bin()
+        .env("HERMIT_TRUST_DIR", &h.trust_dir)
+        .args([
+            "run",
+            "--config",
+            &url,
+            "--allow-unsigned",
+            "--project-dir",
+            "/tmp",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("reserved"),
+        "expected reserved-port error in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn run_rejects_http_url() {
     let h = Harness::new();
     let out = hermit_bin()

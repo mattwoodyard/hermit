@@ -281,7 +281,8 @@ impl<P: ConnectionPolicy + 'static> DnsServer<P> {
                 Some(resp)
             }
             Verdict::Deny => {
-                warn!(%src, name = %query.name, "dns: denied by policy");
+                warn!(%src, name = %query.name,
+                    "hermit blocked: DNS query for {} (not in allowlist)", query.name);
                 Some(build_refused(&query))
             }
         }

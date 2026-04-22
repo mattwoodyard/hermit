@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 use crate::cli::NetMode;
+use crate::config::{PortForwardSpec, PortProtocol};
 use crate::fdpass;
 use crate::home_files::HomeFileDirective;
 use crate::landlock::apply_landlock;
@@ -249,6 +250,7 @@ pub fn run_forked_proxied(
     command: &[String],
     policy: Arc<RuleSet>,
     network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
+    port_forwards: &[PortForwardSpec],
 ) -> Result<i32> {
     // Generate the ephemeral CA before fork so both parent and child can use it.
     let ca = Arc::new(
@@ -274,6 +276,7 @@ pub fn run_forked_proxied(
                 home_files,
                 rw_paths,
                 command,
+                port_forwards,
             );
         }
         ForkResult::Parent { child } => {
@@ -298,11 +301,13 @@ fn child_main_proxied(
     home_files: &[HomeFileDirective],
     rw_paths: &[&Path],
     command: &[String],
+    port_forwards: &[PortForwardSpec],
 ) -> ! {
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
     if let Err(e) = child_proxied_setup(
         sock_fd, ca_pem, home_path, project_dir, passthrough, home_files, rw_paths,
+        port_forwards,
     ) {
         eprintln!("hermit: proxied namespace setup failed: {:#}", e);
         std::process::exit(126);
@@ -325,6 +330,7 @@ fn child_proxied_setup(
     passthrough: &[PathBuf],
     home_files: &[HomeFileDirective],
     rw_paths: &[&Path],
+    port_forwards: &[PortForwardSpec],
 ) -> Result<()> {
     // Set up namespace isolation (user + mount + net)
     setup_namespace(home_path, project_dir, passthrough, home_files, true)?;
@@ -334,6 +340,17 @@ fn child_proxied_setup(
     netns::ensure_nft_nat_table()?;
     netns::add_nft_redirect(HTTPS_PORT, PROXY_LISTEN_PORT)?;
     netns::add_nft_redirect(HTTP_PORT, HTTP_PROXY_LISTEN_PORT)?;
+    for pf in port_forwards {
+        let dest = match pf.protocol {
+            PortProtocol::Https => PROXY_LISTEN_PORT,
+            PortProtocol::Http => HTTP_PROXY_LISTEN_PORT,
+        };
+        info!(
+            "netns: extra port_forward {} ({:?}) -> 127.0.0.1:{}",
+            pf.port, pf.protocol, dest
+        );
+        netns::add_nft_redirect(pf.port, dest)?;
+    }
 
     // Create listener sockets inside the new network namespace.
     // These will be transferred to the parent via SCM_RIGHTS.

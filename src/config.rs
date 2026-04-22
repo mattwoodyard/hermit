@@ -57,6 +57,12 @@ pub struct Config {
     #[serde(default, rename = "access_rule")]
     pub access_rules: Vec<AccessRuleSpec>,
 
+    /// Additional TCP ports (beyond the built-in 80/443) that the
+    /// sandbox redirects into the proxy. Each entry picks which proxy
+    /// handles it (plain HTTP vs. TLS/SNI).
+    #[serde(default, rename = "port_forward")]
+    pub port_forwards: Vec<PortForwardSpec>,
+
     #[serde(default, rename = "rule")]
     pub injection_rules: Vec<MatchRuleSpec>,
 
@@ -125,6 +131,30 @@ pub struct AccessRuleSpec {
     pub methods: Option<Vec<String>>,
 }
 
+/// `[[port_forward]]` entry — an extra sandboxed TCP port that the
+/// proxy should intercept.
+///
+/// `protocol = "https"` routes traffic through the MITM/SNI proxy
+/// (same listener as :443), `protocol = "http"` routes it through the
+/// plain HTTP proxy (same listener as :80). The upstream connection
+/// keeps the original port, so intercepting :8443 → reaches the real
+/// upstream on :8443, not :443.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortForwardSpec {
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: PortProtocol,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    #[default]
+    Https,
+    Http,
+}
+
 /// `[signature]` section — x509 cert (DER, base64) plus signature bytes.
 /// Only ed25519 is accepted for now; the `algorithm` field is explicit to
 /// make future rollover obvious.
@@ -149,7 +179,35 @@ impl Config {
     /// handled separately by [`crate::signature`] against the raw bytes —
     /// this function only concerns itself with schema.
     pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).context("parsing hermit config TOML")
+        let config: Self = toml::from_str(text).context("parsing hermit config TOML")?;
+        config.validate_port_forwards()?;
+        Ok(config)
+    }
+
+    /// Reject port_forward entries that would shadow hermit's own
+    /// loopback listeners or a reserved-for-redirect port (0).
+    fn validate_port_forwards(&self) -> Result<()> {
+        use std::collections::HashSet;
+        // Ports hermit binds the internal proxy listeners on — see
+        // `process::PROXY_LISTEN_PORT` / `HTTP_PROXY_LISTEN_PORT`.
+        // Redirecting those would either short-circuit or loop.
+        const RESERVED: &[u16] = &[1443, 1080];
+        let mut seen = HashSet::new();
+        for (i, pf) in self.port_forwards.iter().enumerate() {
+            if pf.port == 0 {
+                bail!("port_forward #{i}: port 0 is not valid");
+            }
+            if RESERVED.contains(&pf.port) {
+                bail!(
+                    "port_forward #{i}: port {} is reserved for hermit's internal proxy listeners",
+                    pf.port
+                );
+            }
+            if !seen.insert(pf.port) {
+                bail!("port_forward #{i}: port {} listed twice", pf.port);
+            }
+        }
+        Ok(())
     }
 
     /// Adapt `[[home_file]]` entries into the existing `HomeFileDirective`
@@ -410,5 +468,70 @@ rogue_field = 1
     fn net_mode_conversion() {
         assert_eq!(NetMode::Host.to_cli(), crate::cli::NetMode::Host);
         assert_eq!(NetMode::Isolate.to_cli(), crate::cli::NetMode::Isolate);
+    }
+
+    #[test]
+    fn port_forward_parses_defaults_to_https() {
+        let toml = r#"
+[[port_forward]]
+port = 8443
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.port_forwards.len(), 1);
+        assert_eq!(c.port_forwards[0].port, 8443);
+        assert_eq!(c.port_forwards[0].protocol, PortProtocol::Https);
+    }
+
+    #[test]
+    fn port_forward_parses_http() {
+        let toml = r#"
+[[port_forward]]
+port = 8080
+protocol = "http"
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.port_forwards[0].protocol, PortProtocol::Http);
+    }
+
+    #[test]
+    fn port_forward_rejects_reserved() {
+        for p in [1443, 1080] {
+            let toml = format!("[[port_forward]]\nport = {}\n", p);
+            let err = Config::parse(&toml).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn port_forward_rejects_duplicate() {
+        let toml = r#"
+[[port_forward]]
+port = 8443
+[[port_forward]]
+port = 8443
+protocol = "http"
+"#;
+        let err = Config::parse(toml).unwrap_err().to_string();
+        assert!(err.contains("listed twice"), "got: {err}");
+    }
+
+    #[test]
+    fn port_forward_rejects_zero() {
+        let toml = r#"
+[[port_forward]]
+port = 0
+"#;
+        let err = Config::parse(toml).unwrap_err().to_string();
+        assert!(err.contains("not valid"), "got: {err}");
+    }
+
+    #[test]
+    fn port_forward_rejects_unknown_protocol() {
+        let toml = r#"
+[[port_forward]]
+port = 9000
+protocol = "quic"
+"#;
+        assert!(Config::parse(toml).is_err());
     }
 }

@@ -75,14 +75,14 @@ where
     let hostname = match hostname {
         Some(h) => h,
         None => {
-            warn!(%client_addr, "mitm: no SNI in ClientHello, dropping");
+            warn!(%client_addr, "hermit blocked: TLS connection without SNI");
             return Ok(());
         }
     };
 
     // Step 2: Hostname-level policy check
     if config.policy.check(&hostname) == Verdict::Deny {
-        warn!(%client_addr, %hostname, "mitm: hostname denied by policy");
+        warn!(%client_addr, %hostname, "hermit blocked: TLS hostname not in allowlist");
         return Ok(());
     }
 
@@ -132,7 +132,7 @@ where
             warn!(
                 %client_addr, %hostname,
                 method = %request.method, path = %request.path,
-                "mitm: request denied by policy"
+                "hermit blocked: HTTPS request {} https://{}{}", request.method, hostname, request.path
             );
             http::write_403(&mut client_tls, "blocked by hermit policy").await?;
             return Ok(());

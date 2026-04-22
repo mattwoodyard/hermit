@@ -1,9 +1,50 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
 };
 use log::{debug, info};
 use std::path::Path;
+
+/// Probe whether the running kernel supports Landlock.
+///
+/// The `landlock` crate hides its own status probe behind a private helper,
+/// so we issue the same syscall directly: `landlock_create_ruleset(NULL, 0,
+/// LANDLOCK_CREATE_RULESET_VERSION)` returns the supported ABI version (>0)
+/// when Landlock is available, or `-1` with errno `ENOSYS`/`EOPNOTSUPP` when
+/// it isn't (kernel lacks the LSM, or it's disabled at boot).
+///
+/// Hermit's whole safety story hinges on Landlock, so callers should abort
+/// at startup when this returns an error rather than silently running a
+/// less-isolated sandbox.
+pub fn ensure_available() -> Result<()> {
+    // Flag 1 = LANDLOCK_CREATE_RULESET_VERSION (query-only mode).
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if ret > 0 {
+        debug!("landlock: kernel reports ABI v{}", ret);
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOSYS) => bail!(
+            "Landlock is not built into this kernel (ENOSYS). Hermit cannot enforce its filesystem sandbox without Landlock; refusing to start."
+        ),
+        Some(libc::EOPNOTSUPP) => bail!(
+            "Landlock is disabled at boot (EOPNOTSUPP). Enable lsm=...,landlock on the kernel command line; refusing to start."
+        ),
+        _ => bail!(
+            "Landlock availability check failed: {}. Refusing to start without a working filesystem sandbox.",
+            err
+        ),
+    }
+}
 
 /// Apply Landlock restrictions: read-only filesystem with read-write exceptions
 /// for the given paths. After this call, the current thread (and any children)
@@ -58,5 +99,21 @@ mod tests {
         // We can't call apply_landlock in unit tests because it's irreversible,
         // but we can verify the function signature compiles and paths are accepted.
         let _ = &paths;
+    }
+
+    #[test]
+    fn ensure_available_agrees_with_landlock_crate() {
+        // The probe must match what the landlock crate itself reports via a
+        // trial ruleset. We can't directly observe the crate's internal
+        // status, but constructing a ruleset should succeed iff our probe
+        // succeeds on the same kernel.
+        let probe = ensure_available();
+        let crate_reports_ok = Ruleset::default()
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|r| r.create())
+            .is_ok();
+        assert_eq!(probe.is_ok(), crate_reports_ok,
+            "ensure_available() disagrees with landlock crate: probe={:?}, crate_ok={}",
+            probe, crate_reports_ok);
     }
 }

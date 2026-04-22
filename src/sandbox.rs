@@ -1,16 +1,62 @@
 use anyhow::{bail, Context, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use sni_proxy::policy::RuleSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use crate::cli::NetMode;
-use crate::config::Config;
+use crate::config::{Config, PortForwardSpec};
 use crate::home_files::HomeFileDirective;
 use crate::landlock::apply_landlock;
 use crate::namespace::setup_namespace;
 use crate::process;
+
+/// Drop `home_file` entries whose source path doesn't exist on the host.
+///
+/// A common failure mode before this filter: a shared config lists
+/// `~/.cargo`, `~/.rustup`, `~/.ssh`, etc., but the user has never
+/// installed some of those tools. Previously hermit would refuse to start;
+/// now we log a warning per missing entry and continue with what exists.
+fn drop_missing_home_files(home_files: Vec<HomeFileDirective>) -> Vec<HomeFileDirective> {
+    home_files
+        .into_iter()
+        .filter(|d| {
+            let path = match d {
+                HomeFileDirective::Copy(p)
+                | HomeFileDirective::Pass(p)
+                | HomeFileDirective::Read(p) => p,
+            };
+            if path.symlink_metadata().is_ok() {
+                true
+            } else {
+                warn!(
+                    "home_file source {} does not exist on host; skipping",
+                    path.display()
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+/// Drop `[sandbox].passthrough` entries whose source path doesn't exist.
+///
+/// Same spirit as [`drop_missing_home_files`] — paths that mean nothing on
+/// this host get logged and ignored rather than blocking startup.
+fn drop_missing_passthrough(passthrough: Vec<PathBuf>) -> Vec<PathBuf> {
+    passthrough
+        .into_iter()
+        .filter(|p| {
+            if p.symlink_metadata().is_ok() {
+                true
+            } else {
+                warn!("passthrough {} does not exist on host; skipping", p.display());
+                false
+            }
+        })
+        .collect()
+}
 
 /// Build the read-write path list for landlock from the sandbox parameters.
 fn build_rw_paths<'a>(
@@ -59,12 +105,13 @@ pub fn run_sandboxed(
     let home_path = Path::new(&home);
 
     let home_files = config.home_file_directives(home_path)?;
+    let home_files = drop_missing_home_files(home_files);
     debug!("home-files entries: {}", home_files.len());
     for d in &home_files {
         debug!("  home-file: {:?}", d);
     }
 
-    let passthrough: Vec<PathBuf> = config.sandbox.passthrough.clone();
+    let passthrough: Vec<PathBuf> = drop_missing_passthrough(config.sandbox.passthrough.clone());
     let rw_paths = build_rw_paths(home_path, project_dir, &passthrough, &home_files);
 
     let net = config.sandbox.net.to_cli();
@@ -82,11 +129,13 @@ pub fn run_sandboxed(
         }
         NetMode::Isolate if !access_rules.is_empty() => {
             info!(
-                "using proxied sandbox with network isolation ({} rules)",
-                access_rules.len()
+                "using proxied sandbox with network isolation ({} rules, {} extra port_forwards)",
+                access_rules.len(),
+                config.port_forwards.len()
             );
             let policy = Arc::new(RuleSet::new(access_rules));
             let network_policy = config.network_policy()?.map(Arc::new);
+            let port_forwards: Vec<PortForwardSpec> = config.port_forwards.clone();
             process::run_forked_proxied(
                 home_path,
                 project_dir,
@@ -96,6 +145,7 @@ pub fn run_sandboxed(
                 command,
                 policy,
                 network_policy,
+                &port_forwards,
             )
         }
         NetMode::Isolate => {
@@ -174,6 +224,45 @@ mod tests {
         let extra = vec![PathBuf::from("/opt/extra")];
         let paths = build_rw_paths(home, project, &extra, &[]);
         assert!(paths.contains(&extra[0].as_path()));
+    }
+
+    #[test]
+    fn drop_missing_home_files_keeps_existing_drops_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("exists.txt");
+        std::fs::write(&existing, "").unwrap();
+        let absent = dir.path().join("nope.txt");
+
+        let input = vec![
+            HomeFileDirective::Copy(existing.clone()),
+            HomeFileDirective::Pass(absent.clone()),
+            HomeFileDirective::Read(existing.clone()),
+        ];
+        let kept = drop_missing_home_files(input);
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(kept[0], HomeFileDirective::Copy(_)));
+        assert!(matches!(kept[1], HomeFileDirective::Read(_)));
+    }
+
+    #[test]
+    fn drop_missing_home_files_keeps_broken_symlink() {
+        // A dangling symlink still "exists" at the directive level — the
+        // user asked for that path and the sandbox layer will handle it.
+        // We only filter when there's no entry at all.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("dangling");
+        std::os::unix::fs::symlink("/nonexistent-target-for-hermit-test", &link).unwrap();
+        let kept = drop_missing_home_files(vec![HomeFileDirective::Pass(link.clone())]);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn drop_missing_passthrough_keeps_existing_drops_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().to_path_buf();
+        let absent = dir.path().join("nope");
+        let kept = drop_missing_passthrough(vec![existing.clone(), absent]);
+        assert_eq!(kept, vec![existing]);
     }
 
     #[test]

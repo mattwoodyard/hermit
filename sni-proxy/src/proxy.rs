@@ -87,7 +87,7 @@ where
     let hostname = match hostname {
         Some(h) => h,
         None => {
-            warn!(%client_addr, "no SNI in ClientHello, dropping");
+            warn!(%client_addr, "hermit blocked: TLS connection without SNI");
             return Ok(());
         }
     };
@@ -95,7 +95,7 @@ where
     match config.policy.check(&hostname) {
         Verdict::Allow => {}
         Verdict::Deny => {
-            warn!(%client_addr, hostname, "denied by policy, dropping");
+            warn!(%client_addr, hostname, "hermit blocked: TLS hostname not in allowlist");
             return Ok(());
         }
     }

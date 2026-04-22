@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::policy::{RequestPolicy, Verdict};
+use crate::proxy::get_original_dst;
 
 /// Configuration for the HTTP proxy.
 pub struct HttpProxyConfig<P, C> {
@@ -51,6 +52,10 @@ where
     P: RequestPolicy,
     C: UpstreamConnector,
 {
+    // The pre-DNAT destination tells us which port the client was really
+    // aiming at (e.g. 8080). The connector uses this in preference to
+    // `config.upstream_port` so additional port_forward entries work.
+    let original_dst = get_original_dst(&client);
     loop {
         let request = match http::read_request(&mut client).await {
             Ok(Some(req)) => req,
@@ -67,7 +72,7 @@ where
                 h.split(':').next().unwrap_or(h).to_string()
             }
             None => {
-                warn!(%client_addr, "http: no Host header, dropping");
+                warn!(%client_addr, "hermit blocked: HTTP request without Host header");
                 return Ok(());
             }
         };
@@ -83,16 +88,17 @@ where
             warn!(
                 %client_addr, %hostname,
                 method = %request.method, path = %request.path,
-                "http: request denied by policy"
+                "hermit blocked: HTTP request {} http://{}{}", request.method, hostname, request.path
             );
             http::write_403(&mut client, "blocked by hermit policy").await?;
             return Ok(());
         }
 
-        // Connect upstream
+        // Connect upstream — original_dst gives the connector the pre-DNAT
+        // port so extra port_forward entries land on the right upstream.
         let mut upstream = config
             .connector
-            .connect(&hostname, config.upstream_port, None)
+            .connect(&hostname, config.upstream_port, original_dst)
             .await
             .context("connecting upstream")?;
 
