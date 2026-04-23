@@ -59,6 +59,7 @@ async fn allowed_host_is_forwarded() {
         policy: Arc::new(AllowList::new(["localhost".into()].into())),
         connector: Arc::new(DirectConnector),
         upstream_port,
+        block_log: sni_proxy::block_log::BlockLogger::disabled(),
     });
 
     let proxy_handle = tokio::spawn(async move {
@@ -91,6 +92,7 @@ async fn denied_host_is_dropped() {
         policy: Arc::new(AllowList::new(["allowed.example.com".into()].into())),
         connector: Arc::new(DirectConnector),
         upstream_port: 443,
+        block_log: sni_proxy::block_log::BlockLogger::disabled(),
     });
 
     let proxy_handle = tokio::spawn(async move {
@@ -118,6 +120,7 @@ async fn garbage_input_returns_error() {
         policy: Arc::new(AllowAll),
         connector: Arc::new(DirectConnector),
         upstream_port: 443,
+        block_log: sni_proxy::block_log::BlockLogger::disabled(),
     });
 
     let proxy_handle = tokio::spawn(async move {

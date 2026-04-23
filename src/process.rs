@@ -251,6 +251,7 @@ pub fn run_forked_proxied(
     policy: Arc<RuleSet>,
     network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
     port_forwards: &[PortForwardSpec],
+    block_log_path: Option<&Path>,
 ) -> Result<i32> {
     // Generate the ephemeral CA before fork so both parent and child can use it.
     let ca = Arc::new(
@@ -282,7 +283,15 @@ pub fn run_forked_proxied(
         ForkResult::Parent { child } => {
             drop(ns_writer);
             fdpass::close_fd(child_sock);
-            parent_main_proxied(ns_reader, child, parent_sock, policy, ca, network_policy)
+            parent_main_proxied(
+                ns_reader,
+                child,
+                parent_sock,
+                policy,
+                ca,
+                network_policy,
+                block_log_path.map(|p| p.to_path_buf()),
+            )
         }
     }
 }
@@ -398,6 +407,7 @@ fn parent_main_proxied(
     policy: Arc<RuleSet>,
     ca: Arc<sni_proxy::ca::CertificateAuthority>,
     network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
+    block_log_path: Option<PathBuf>,
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
@@ -426,6 +436,15 @@ fn parent_main_proxied(
     let udp_socket = fd_to_tokio_udp(udp_raw_fd, &rt)
         .context("DNS socket setup")?;
 
+    // Block logger must be constructed on the runtime because it opens
+    // an async file and spawns a writer task.
+    let block_log = match block_log_path {
+        Some(p) => rt
+            .block_on(async { sni_proxy::block_log::BlockLogger::to_file(&p).await })
+            .context("opening block log")?,
+        None => sni_proxy::block_log::BlockLogger::disabled(),
+    };
+
     // MITM proxy for HTTPS (port 443 -> 1443)
     let mitm_config = Arc::new(sni_proxy::mitm::MitmConfig {
         policy: Arc::clone(&policy),
@@ -433,6 +452,7 @@ fn parent_main_proxied(
         ca,
         upstream_port: HTTPS_PORT,
         network_policy: network_policy.clone(),
+        block_log: block_log.clone(),
     });
 
     // HTTP proxy for port 80 -> 1080
@@ -440,35 +460,76 @@ fn parent_main_proxied(
         policy: Arc::clone(&policy),
         connector: Arc::new(sni_proxy::connector::DirectConnector),
         upstream_port: HTTP_PORT,
+        block_log: block_log.clone(),
     });
 
     // DNS server — wrapped in Arc so `run` can spawn per-response tasks
     // that share the socket.
-    let dns_server = Arc::new(sni_proxy::dns::DnsServer::new(Arc::clone(&policy)));
+    let dns_server = Arc::new(
+        sni_proxy::dns::DnsServer::new(Arc::clone(&policy)).with_block_log(block_log.clone()),
+    );
 
-    // Spawn all services
-    rt.spawn(async move {
+    // Spawn all services. Keep the JoinHandles so the supervisor can
+    // observe an early exit and escalate — without this, a panicking
+    // proxy task would silently disable egress filtering while the child
+    // kept running against the dead proxy.
+    let mitm_handle = rt.spawn(async move {
         if let Err(e) = sni_proxy::mitm::run(https_listener, mitm_config).await {
             error!("mitm proxy error: {}", e);
         }
     });
 
-    rt.spawn(async move {
+    let http_handle = rt.spawn(async move {
         if let Err(e) = sni_proxy::http_proxy::run(http_listener, http_config).await {
             error!("http proxy error: {}", e);
         }
     });
 
-    rt.spawn(async move {
+    let dns_handle = rt.spawn(async move {
         if let Err(e) = dns_server.run(udp_socket).await {
             error!("dns server error: {}", e);
         }
     });
 
+    // Supervisor: if any proxy task exits (clean return, error, or
+    // panic) before the child does, SIGTERM the child. The child
+    // running with a dead proxy means egress policy isn't being
+    // enforced, which is worse than tearing the whole sandbox down.
+    let child_pid_raw = child.as_raw();
+    rt.spawn(async move {
+        let which = tokio::select! {
+            r = mitm_handle => ("mitm", r),
+            r = http_handle => ("http", r),
+            r = dns_handle => ("dns", r),
+        };
+        let (name, result) = which;
+        match result {
+            Ok(()) => error!(
+                "proxy task {} exited unexpectedly (no error); tearing down sandbox child",
+                name
+            ),
+            Err(e) if e.is_panic() => error!(
+                "proxy task {} panicked; tearing down sandbox child: {}",
+                name, e
+            ),
+            Err(e) => error!(
+                "proxy task {} ended abnormally; tearing down sandbox child: {}",
+                name, e
+            ),
+        }
+        // SIGTERM is forwarded by `forward_signal` only when installed
+        // for the parent's handled signals — here we signal the child
+        // directly to ensure it exits even if the user isn't pressing
+        // Ctrl-C. `wait_for_child` in the main thread then returns.
+        unsafe { libc::kill(child_pid_raw, libc::SIGTERM) };
+    });
+
     info!("parent: proxy services running, waiting for child exit");
     let exit_code = wait_for_child(child)?;
 
-    // Child exited — shut down the proxy services
+    // Child exited — shut down the proxy services. The block-log
+    // writer task flushes on each event, so a 1-second window is
+    // enough for in-flight events to land.
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
     info!("parent: proxy services stopped");
 

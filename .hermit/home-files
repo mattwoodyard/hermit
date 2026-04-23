@@ -5,3 +5,7 @@ pass /home/matt/.claude
 pass /home/matt/.claude.json
 read /home/matt/.rustup
 read /home/matt/.cargo
+read /data
+read /home/matt/project/megarepo/
+read /home/matt/project/monorepo3/
+pass /data/cargo

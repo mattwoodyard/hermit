@@ -1,3 +1,4 @@
+pub mod block_log;
 pub mod ca;
 pub mod connector;
 pub mod credential;

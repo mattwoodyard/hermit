@@ -6,8 +6,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use crate::block_log::{BlockEvent, BlockKind, BlockLogger, now_unix_ms};
 use crate::policy::{ConnectionPolicy, Verdict};
 
 // ---------------------------------------------------------------------------
@@ -25,6 +27,11 @@ const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
 const TTL: u32 = 1;
+
+/// Max concurrent DNS send-to tasks. Bounds task-heap growth if UDP
+/// send_to starts returning Pending under kernel buffer pressure.
+/// Beyond this, we skip the send rather than queue further.
+const MAX_CONCURRENT_DNS_SENDS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Query parsing
@@ -207,6 +214,7 @@ pub struct DnsServer<P> {
     policy: Arc<P>,
     ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
+    block_log: BlockLogger,
 }
 
 impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
@@ -215,6 +223,7 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
             policy,
             ipv4: Ipv4Addr::LOCALHOST,
             ipv6: Ipv6Addr::LOCALHOST,
+            block_log: BlockLogger::disabled(),
         }
     }
 
@@ -230,15 +239,25 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
         self
     }
 
+    /// Attach a block logger. Denied queries will be emitted to it in
+    /// addition to the `warn!` line.
+    pub fn with_block_log(mut self, block_log: BlockLogger) -> Self {
+        self.block_log = block_log;
+        self
+    }
+
     /// Run the DNS server on the given socket until cancelled.
     ///
     /// Takes `self: Arc<Self>` so response sends can be spawned off the
     /// recv loop — a stalled `send_to` must not stall packet reception.
+    /// A semaphore caps outstanding send tasks so a clogged UDP send
+    /// buffer can't grow the task heap without bound.
     pub async fn run(self: Arc<Self>, socket: UdpSocket) -> std::io::Result<()> {
         let local_addr = socket.local_addr()?;
         info!(%local_addr, "dns server listening");
 
         let socket = Arc::new(socket);
+        let send_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_DNS_SENDS));
         let mut buf = [0u8; 512];
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
@@ -246,8 +265,16 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
             // recv task. Only the send is spawned so a slow client can't
             // back up reception.
             if let Some(resp) = self.handle_packet(&buf[..len], src) {
+                // Try to acquire a send-slot without waiting. If all
+                // slots are held, drop the response rather than grow
+                // the queue further.
+                let Ok(permit) = Arc::clone(&send_limit).try_acquire_owned() else {
+                    debug!(%src, "dns: send limit reached, dropping response");
+                    continue;
+                };
                 let socket = Arc::clone(&socket);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = socket.send_to(&resp, src).await {
                         warn!(%src, error = %e, "dns: send_to failed");
                     }
@@ -292,8 +319,17 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
                 Some(resp)
             }
             Verdict::Deny => {
-                warn!(%src, name = %query.name,
+                debug!(%src, name = %query.name,
                     "hermit blocked: DNS query for {} (not in allowlist)", query.name);
+                self.block_log.log(BlockEvent {
+                    time_unix_ms: now_unix_ms(),
+                    kind: BlockKind::Dns,
+                    client: Some(src.to_string()),
+                    hostname: Some(query.name.clone()),
+                    method: None,
+                    path: None,
+                    reason: Some("name not in allowlist".to_string()),
+                });
                 Some(build_refused(&query))
             }
         }

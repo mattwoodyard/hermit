@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         policy: Arc::new(AllowList::new(allowed)),
         connector: Arc::new(DirectConnector),
         upstream_port: args.upstream_port,
+        block_log: sni_proxy::block_log::BlockLogger::disabled(),
     });
 
     proxy::run(listener, config).await

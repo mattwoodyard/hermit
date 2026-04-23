@@ -96,6 +96,7 @@ pub fn run_sandboxed(
     project_dir: &Path,
     command: &[String],
     config: &Config,
+    block_log_path: Option<&Path>,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
@@ -126,6 +127,9 @@ pub fn run_sandboxed(
                     access_rules.len()
                 );
             }
+            if block_log_path.is_some() {
+                info!("net=host: --block-log has no effect (no proxy is running)");
+            }
             run_sandboxed_direct(home_path, project_dir, &passthrough, &home_files, &rw_paths, command)
         }
         NetMode::Isolate if !access_rules.is_empty() => {
@@ -147,9 +151,15 @@ pub fn run_sandboxed(
                 policy,
                 network_policy,
                 &port_forwards,
+                block_log_path,
             )
         }
         NetMode::Isolate => {
+            if block_log_path.is_some() {
+                info!(
+                    "net=isolate with no access_rules: --block-log has no effect (zero-connectivity mode)"
+                );
+            }
             info!("using forked sandbox with full network isolation");
             process::run_forked(
                 home_path, project_dir, &passthrough, &home_files, &rw_paths, command, &net,
@@ -194,7 +204,7 @@ mod tests {
     #[test]
     fn test_empty_command_fails() {
         let config = Config::default();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
@@ -202,7 +212,7 @@ mod tests {
     #[test]
     fn test_empty_command_fails_net_isolate() {
         let config = Config::parse("[sandbox]\nnet = \"isolate\"\n").unwrap();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }

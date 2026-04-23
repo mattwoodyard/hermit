@@ -122,7 +122,11 @@ impl CredentialResolver {
     }
 
     fn cache_lookup(&self, name: &str) -> Option<String> {
-        let cache = self.cache.lock().unwrap();
+        // Recover from a poisoned lock: cache ops are atomic (plain
+        // HashMap insert/get) so no invariant carries across panics.
+        // Panicking here would take down every concurrent credential
+        // resolver call.
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let entry = cache.get(name)?;
         match entry.expires_at {
             None => Some(entry.value.clone()),
@@ -132,7 +136,7 @@ impl CredentialResolver {
     }
 
     fn cache_store(&self, name: &str, value: &str, expires_at: Option<Instant>) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(
             name.to_string(),
             CachedValue {

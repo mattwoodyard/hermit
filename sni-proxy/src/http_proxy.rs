@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use crate::block_log::{now_unix_ms, BlockEvent, BlockKind, BlockLogger};
 use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::policy::{RequestPolicy, Verdict};
@@ -34,6 +35,8 @@ pub struct HttpProxyConfig<P, C> {
     pub policy: Arc<P>,
     pub connector: Arc<C>,
     pub upstream_port: u16,
+    /// Where to record block events. `BlockLogger::disabled()` by default.
+    pub block_log: BlockLogger,
 }
 
 /// Run the HTTP proxy accept loop on port 80 traffic.
@@ -56,10 +59,12 @@ where
         };
         // Acquire a slot before spawning — bounds concurrent in-flight
         // connections to avoid unbounded task accumulation under load.
-        let permit = Arc::clone(&conn_limit)
-            .acquire_owned()
-            .await
-            .expect("semaphore never closed");
+        // Closed semaphore means accept a connection-drop rather than
+        // taking out the whole listener.
+        let Ok(permit) = Arc::clone(&conn_limit).acquire_owned().await else {
+            warn!(%addr, "http: connection semaphore closed; dropping connection");
+            continue;
+        };
         let config = Arc::clone(&config);
 
         tokio::spawn(async move {
@@ -108,7 +113,16 @@ where
         let hostname = match &request.host {
             Some(h) => http::host_without_port(h).to_string(),
             None => {
-                warn!(%client_addr, "hermit blocked: HTTP request without Host header");
+                debug!(%client_addr, "hermit blocked: HTTP request without Host header");
+                config.block_log.log(BlockEvent {
+                    time_unix_ms: now_unix_ms(),
+                    kind: BlockKind::HttpNoHost,
+                    client: Some(client_addr.to_string()),
+                    hostname: None,
+                    method: Some(request.method.clone()),
+                    path: Some(request.path.clone()),
+                    reason: Some("HTTP request without Host header".to_string()),
+                });
                 return Ok(());
             }
         };
@@ -121,11 +135,20 @@ where
 
         // Check request-level policy
         if config.policy.check_request(&hostname, &request.path, &request.method) == Verdict::Deny {
-            warn!(
+            debug!(
                 %client_addr, %hostname,
                 method = %request.method, path = %request.path,
                 "hermit blocked: HTTP request {} http://{}{}", request.method, hostname, request.path
             );
+            config.block_log.log(BlockEvent {
+                time_unix_ms: now_unix_ms(),
+                kind: BlockKind::Http,
+                client: Some(client_addr.to_string()),
+                hostname: Some(hostname.clone()),
+                method: Some(request.method.clone()),
+                path: Some(request.path.clone()),
+                reason: Some("blocked by access rules".to_string()),
+            });
             http::write_403(&mut client, "blocked by hermit policy").await?;
             return Ok(());
         }
@@ -218,6 +241,7 @@ mod tests {
             policy: Arc::new(AllowAll),
             connector: Arc::new(crate::connector::DirectConnector),
             upstream_port: 80,
+            block_log: crate::block_log::BlockLogger::disabled(),
         };
         assert_eq!(config.upstream_port, 80);
     }
@@ -229,6 +253,7 @@ mod tests {
             policy: Arc::new(RuleSet::new(rules)),
             connector: Arc::new(crate::connector::DirectConnector),
             upstream_port: 80,
+            block_log: crate::block_log::BlockLogger::disabled(),
         };
         assert_eq!(config.upstream_port, 80);
     }

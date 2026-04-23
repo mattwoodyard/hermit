@@ -65,6 +65,22 @@ pub struct RunArgs {
     #[arg(long, default_value = ".")]
     pub project_dir: PathBuf,
 
+    /// Append JSON-lines block events (blocked DNS queries, blocked
+    /// TLS/HTTP requests) to this file. When omitted, blocks are
+    /// dropped silently — they are not emitted to stderr. Raise
+    /// verbosity to `-vv` to see per-block debug lines alongside the
+    /// usual hermit output.
+    #[arg(long)]
+    pub block_log: Option<PathBuf>,
+
+    /// Write hermit's own info/warn/debug output to this file instead of
+    /// stderr. Useful when running an interactive command inside the
+    /// sandbox where interleaved warnings (stalled connects, retries,
+    /// ...) would otherwise distract from the command's own output. The
+    /// sandboxed command's stdout/stderr are unaffected.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
+
     /// Command and arguments to run inside the sandbox.
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -273,6 +289,101 @@ mod tests {
             Command::Run(args) => {
                 assert!(args.allow_unsigned);
             }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_with_block_log() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--block-log",
+            "/tmp/hermit-blocks.jsonl",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.block_log, Some(PathBuf::from("/tmp/hermit-blocks.jsonl")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_with_log_file() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--log-file",
+            "/tmp/hermit.log",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.log_file, Some(PathBuf::from("/tmp/hermit.log")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_log_file_defaults_to_none() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => assert!(args.log_file.is_none()),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_log_file_and_block_log_independent() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--block-log",
+            "/tmp/blocks.jsonl",
+            "--log-file",
+            "/tmp/hermit.log",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.log_file, Some(PathBuf::from("/tmp/hermit.log")));
+                assert_eq!(args.block_log, Some(PathBuf::from("/tmp/blocks.jsonl")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_block_log_defaults_to_none() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => assert!(args.block_log.is_none()),
             _ => panic!("wrong subcommand"),
         }
     }

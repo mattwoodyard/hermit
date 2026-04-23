@@ -3,6 +3,7 @@ use clap::Parser;
 use log::{info, warn};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Mutex;
 
 use hermit::cli::{Cli, Command, KeygenArgs, RunArgs, SignArgs, VerifyArgs};
 use hermit::config_loader::TrustPolicy;
@@ -29,23 +30,46 @@ fn run() -> Result<i32> {
     }
 }
 
-fn init_logging(verbose: u8) {
+fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
     let level = match verbose {
         0 => log::LevelFilter::Warn,
         1 => log::LevelFilter::Info,
         2 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
+
+    // Open the log file up front (once) so both logging frameworks write
+    // into the same sink. POSIX O_APPEND writes are atomic for the small
+    // records emitted here, so two handles on the same file don't tear
+    // each other's lines.
+    let file_handle = match log_file {
+        Some(p) => Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .with_context(|| format!("opening log file {}", p.display()))?,
+        ),
+        None => None,
+    };
+
+    let env_target = match &file_handle {
+        Some(f) => env_logger::Target::Pipe(Box::new(
+            f.try_clone().context("cloning log file handle for env_logger")?,
+        )),
+        None => env_logger::Target::Stderr,
+    };
     env_logger::Builder::new()
         .filter_level(level)
         .format_target(false)
         .format_timestamp(None)
+        .target(env_target)
         .init();
 
     // sni-proxy uses the `tracing` facade (not `log`), so env_logger alone
     // would drop proxy events — including the `warn!` lines emitted when the
     // MITM, HTTP proxy, or DNS layer blocks a request. Install a tracing
-    // subscriber at the same verbosity so those block events reach stderr.
+    // subscriber at the same verbosity so those events reach the same sink.
     let tracing_level = match verbose {
         0 => tracing::Level::WARN,
         1 => tracing::Level::INFO,
@@ -57,16 +81,34 @@ fn init_logging(verbose: u8) {
     // `try_init` returns Err if a subscriber is already installed (e.g. from
     // a test harness reusing the process) — we silently swallow that because
     // a duplicate-install error isn't actionable at runtime.
-    let _ = tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .without_time()
-        .with_writer(std::io::stderr)
-        .try_init();
+        .without_time();
+    match file_handle {
+        Some(f) => {
+            // `Mutex<File>` directly satisfies tracing-subscriber's
+            // `MakeWriter` via its specialised impl, and the subscriber
+            // takes ownership — no Arc needed (and in fact `Arc<Mutex<F>>`
+            // does NOT satisfy MakeWriter: the blanket impl for Arc
+            // requires `&W: io::Write`, which `&Mutex<File>` doesn't
+            // provide).
+            let writer = Mutex::new(f);
+            let _ = builder.with_writer(writer).try_init();
+        }
+        None => {
+            let _ = builder.with_writer(std::io::stderr).try_init();
+        }
+    }
+
+    Ok(())
 }
 
 fn run_subcommand(args: RunArgs) -> Result<i32> {
-    init_logging(args.verbose);
+    init_logging(args.verbose, args.log_file.as_deref())?;
+    if let Some(p) = &args.log_file {
+        info!("log file: {}", p.display());
+    }
 
     // Refuse to start if the kernel can't enforce Landlock — the whole
     // filesystem-isolation story depends on it.
@@ -101,11 +143,14 @@ fn run_subcommand(args: RunArgs) -> Result<i32> {
         .with_context(|| format!("loading config from {}", args.config))?;
 
     info!("command: {}", args.command.join(" "));
-    run_sandboxed(&project_dir, &args.command, &config)
+    if let Some(p) = &args.block_log {
+        info!("block log: {}", p.display());
+    }
+    run_sandboxed(&project_dir, &args.command, &config, args.block_log.as_deref())
 }
 
 fn sign_subcommand(args: SignArgs) -> Result<i32> {
-    init_logging(0);
+    init_logging(0, None)?;
     let cert_pem = std::fs::read_to_string(&args.cert)
         .with_context(|| format!("reading cert {}", args.cert.display()))?;
     let key_pem = std::fs::read_to_string(&args.key)
@@ -121,7 +166,7 @@ fn sign_subcommand(args: SignArgs) -> Result<i32> {
 }
 
 fn verify_subcommand(args: VerifyArgs) -> Result<i32> {
-    init_logging(0);
+    init_logging(0, None)?;
     let trust_dir = match args.trust_dir {
         Some(p) => p,
         None => default_trust_dir()?,
@@ -145,7 +190,7 @@ fn verify_subcommand(args: VerifyArgs) -> Result<i32> {
 /// default `~/.hermit/keys` so tests can point hermit at a scoped trust
 /// anchor without relying on a host `~/.hermit`.
 fn keygen_subcommand(args: KeygenArgs) -> Result<i32> {
-    init_logging(0);
+    init_logging(0, None)?;
 
     if !args.force {
         if args.cert.exists() {

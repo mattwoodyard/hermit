@@ -21,6 +21,7 @@ use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
+use crate::block_log::{now_unix_ms, BlockEvent, BlockKind, BlockLogger};
 use crate::ca::CertificateAuthority;
 use crate::connector::UpstreamConnector;
 use crate::http;
@@ -50,6 +51,8 @@ pub struct MitmConfig<P, C> {
     /// matched against its rules and the first matching rule's credential
     /// is acquired and injected as configured headers.
     pub network_policy: Option<Arc<NetworkPolicy>>,
+    /// Where to record block events. `BlockLogger::disabled()` by default.
+    pub block_log: BlockLogger,
 }
 
 /// Run the MITM proxy accept loop.
@@ -69,10 +72,10 @@ where
                 continue;
             }
         };
-        let permit = Arc::clone(&conn_limit)
-            .acquire_owned()
-            .await
-            .expect("semaphore never closed");
+        let Ok(permit) = Arc::clone(&conn_limit).acquire_owned().await else {
+            warn!(%addr, "mitm: connection semaphore closed; dropping connection");
+            continue;
+        };
         let config = Arc::clone(&config);
 
         tokio::spawn(async move {
@@ -116,14 +119,32 @@ where
     let hostname = match hostname {
         Some(h) => h,
         None => {
-            warn!(%client_addr, "hermit blocked: TLS connection without SNI");
+            debug!(%client_addr, "hermit blocked: TLS connection without SNI");
+            config.block_log.log(BlockEvent {
+                time_unix_ms: now_unix_ms(),
+                kind: BlockKind::TlsNoSni,
+                client: Some(client_addr.to_string()),
+                hostname: None,
+                method: None,
+                path: None,
+                reason: Some("TLS connection without SNI".to_string()),
+            });
             return Ok(());
         }
     };
 
     // Step 2: Hostname-level policy check
     if config.policy.check(&hostname) == Verdict::Deny {
-        warn!(%client_addr, %hostname, "hermit blocked: TLS hostname not in allowlist");
+        debug!(%client_addr, %hostname, "hermit blocked: TLS hostname not in allowlist");
+        config.block_log.log(BlockEvent {
+            time_unix_ms: now_unix_ms(),
+            kind: BlockKind::TlsHostname,
+            client: Some(client_addr.to_string()),
+            hostname: Some(hostname.clone()),
+            method: None,
+            path: None,
+            reason: Some("hostname not in allowlist".to_string()),
+        });
         return Ok(());
     }
 
@@ -179,11 +200,20 @@ where
 
         // Check request-level policy
         if config.policy.check_request(&hostname, &request.path, &request.method) == Verdict::Deny {
-            warn!(
+            debug!(
                 %client_addr, %hostname,
                 method = %request.method, path = %request.path,
                 "hermit blocked: HTTPS request {} https://{}{}", request.method, hostname, request.path
             );
+            config.block_log.log(BlockEvent {
+                time_unix_ms: now_unix_ms(),
+                kind: BlockKind::Https,
+                client: Some(client_addr.to_string()),
+                hostname: Some(hostname.clone()),
+                method: Some(request.method.clone()),
+                path: Some(request.path.clone()),
+                reason: Some("blocked by access rules".to_string()),
+            });
             http::write_403(&mut client_tls, "blocked by hermit policy").await?;
             return Ok(());
         }
@@ -245,8 +275,21 @@ where
 
         upstream_tls.flush().await?;
 
-        // Read upstream response
-        let (response, resp_leftover) = http::read_response(&mut upstream_tls).await?;
+        // Read upstream response. A slow upstream that completes TLS but
+        // dribbles response bytes must not park the task — bound this the
+        // same way the request header read is bounded.
+        let (response, resp_leftover) = match timeout(
+            HEADER_READ_TIMEOUT,
+            http::read_response(&mut upstream_tls),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                warn!(%hostname, "mitm: upstream response header read timed out");
+                return Ok(());
+            }
+        };
 
         // Forward response headers to client
         client_tls

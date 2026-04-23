@@ -72,9 +72,15 @@ impl CertificateAuthority {
     pub fn cert_for_host(&self, hostname: &str) -> Result<Arc<CertifiedKey>> {
         let key = hostname.to_ascii_lowercase();
 
-        // Fast path: cached
+        // Fast path: cached.
+        //
+        // Recover from a poisoned lock (`into_inner()` on the poison
+        // error) — a panic in a previous holder has no cross-entry
+        // invariants to violate for this cache, so the worst case is a
+        // stale entry we'd have regenerated anyway. Panicking here would
+        // take down every concurrent MITM handler.
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ck) = cache.get(&key) {
                 return Ok(Arc::clone(ck));
             }
@@ -84,7 +90,7 @@ impl CertificateAuthority {
         let certified_key = self.generate_leaf(hostname)?;
         let certified_key = Arc::new(certified_key);
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(key, Arc::clone(&certified_key));
         Ok(certified_key)
     }
@@ -155,6 +161,34 @@ mod tests {
         let ck1 = ca.cert_for_host("a.com").unwrap();
         let ck2 = ca.cert_for_host("b.com").unwrap();
         assert!(!Arc::ptr_eq(&ck1, &ck2));
+    }
+
+    #[test]
+    fn poisoned_cache_mutex_does_not_block_cert_issuance() {
+        // A previous panic holder on the cert cache must not prevent new
+        // cert issuance. Without the `unwrap_or_else(into_inner)` recovery
+        // in `cert_for_host`, a single panicking request would take down
+        // every concurrent MITM handler.
+        let ca = Arc::new(CertificateAuthority::new().unwrap());
+
+        // Panic inside a thread while holding the cache lock, so the
+        // std::sync::Mutex gets marked poisoned.
+        let ca_for_panic = Arc::clone(&ca);
+        let _ = std::thread::spawn(move || {
+            let _guard = ca_for_panic.cache.lock().unwrap();
+            panic!("simulated panic while holding cache lock");
+        })
+        .join();
+
+        // Lock is now poisoned. The recovery path must still return a cert.
+        let ck = ca.cert_for_host("example.com").expect(
+            "poisoned mutex must not fail cert_for_host — recovery is via into_inner()",
+        );
+        assert_eq!(ck.cert.len(), 2);
+
+        // Second call must hit the cache and return the same Arc.
+        let ck2 = ca.cert_for_host("example.com").unwrap();
+        assert!(Arc::ptr_eq(&ck, &ck2));
     }
 
     #[test]
