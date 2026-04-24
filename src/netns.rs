@@ -115,11 +115,20 @@ fn set_interface_up(sock: i32, ifname: &str) -> Result<()> {
 /// Single name (one place to change) and scoped so it can't collide with
 /// host rules even if the netns ever leaked.
 const TABLE_NAME: &str = "hermit_nat";
+const TABLE_NAME_V6: &str = "hermit_nat_v6";
 
-/// Build the `Table` descriptor used across this module. Not a real kernel
-/// resource — just the rustables handle that batch operations target.
+/// Build the IPv4 `Table` descriptor. Not a real kernel resource —
+/// just the rustables handle that batch operations target.
 fn hermit_table() -> Table {
     Table::new(ProtocolFamily::Ipv4).with_name(TABLE_NAME)
+}
+
+/// IPv6 counterpart. Lives in the `ip6` family because nftables
+/// keeps v4 and v6 tables in disjoint namespaces; a rule that
+/// matches v6 traffic must live in an `ip6` table or an `inet`
+/// table, and we chose the former for clean separation.
+fn hermit_table_v6() -> Table {
+    Table::new(ProtocolFamily::Ipv6).with_name(TABLE_NAME_V6)
 }
 
 /// Send a rustables `Batch` to the kernel via netlink.
@@ -245,7 +254,7 @@ fn output_chain(table: &Table) -> Chain {
         .with_type(ChainType::Nat)
 }
 
-/// Create the nftables nat table and output chain.
+/// Create the IPv4 nftables nat table and output chain.
 ///
 /// Must be called before `add_nft_redirect`. Safe to call multiple times:
 /// `MsgType::Add` without `NLM_F_EXCL` is a no-op when the object already
@@ -262,8 +271,73 @@ pub fn ensure_nft_nat_table() -> Result<()> {
     Ok(())
 }
 
-/// Add a nat rule: TCP traffic to `from_port` is DNAT'd to
-/// `127.0.0.1:to_port` where the hermit proxy listens.
+/// IPv6 counterpart. Called lazily (only when an IPv6 DNAT rule is
+/// about to be inserted) so configs that don't use IPv6 bypass
+/// don't pay for an empty table.
+pub fn ensure_nft_nat_table_v6() -> Result<()> {
+    info!("netns: ensuring nftables nat table (ip6) exists (via netlink)");
+    let table = hermit_table_v6();
+    let chain = output_chain(&table);
+
+    let mut batch = Batch::new();
+    batch.add(&table, MsgType::Add);
+    batch.add(&chain, MsgType::Add);
+    send_batch(batch).context("creating ip6 nat table/chain")?;
+    Ok(())
+}
+
+/// Add a TCP nat rule: `tcp dport <from_port>` → `127.0.0.1:<to_port>`.
+/// See [`add_nft_redirect_proto`] for the shared implementation; this
+/// preserves the original TCP-only signature that call sites expect.
+pub fn add_nft_redirect(from_port: u16, to_port: u16) -> Result<()> {
+    add_nft_redirect_proto(Protocol::TCP, from_port, to_port)
+}
+
+/// Add a UDP nat rule: `udp dport <from_port>` → `127.0.0.1:<to_port>`.
+pub fn add_nft_redirect_udp(from_port: u16, to_port: u16) -> Result<()> {
+    add_nft_redirect_proto(Protocol::UDP, from_port, to_port)
+}
+
+/// IPv6 UDP DNAT: `udp dport <from_port>` → `[::1]:<to_port>`. The
+/// table family is `ip6`, so call [`ensure_nft_nat_table_v6`] first.
+///
+/// This is the UDP-v6 sibling of [`add_nft_redirect_proto`]. It
+/// mirrors that function's structure but targets the `ip6` table and
+/// installs an IPv6 loopback address in the NAT registers.
+pub fn add_nft_redirect_udp_v6(from_port: u16, to_port: u16) -> Result<()> {
+    info!(
+        "netns: adding nat rule (ip6) udp dport {} -> [::1]:{} (via netlink)",
+        from_port, to_port
+    );
+    let table = hermit_table_v6();
+    let chain = output_chain(&table);
+
+    // ::1 as 16 bytes in network byte order.
+    let mut dst_ip = [0u8; 16];
+    dst_ip[15] = 1;
+    let dst_port: [u8; 2] = to_port.to_be_bytes();
+
+    let rule = Rule::new(&chain)
+        .context("constructing nat rule")?
+        .dport(from_port, Protocol::UDP)
+        .with_expr(Immediate::new_data(dst_ip.to_vec(), Register::Reg1))
+        .with_expr(Immediate::new_data(dst_port.to_vec(), Register::Reg2))
+        .with_expr(
+            Nat::default()
+                .with_nat_type(NatType::DNat)
+                .with_family(ProtocolFamily::Ipv6)
+                .with_ip_register(Register::Reg1)
+                .with_port_register(Register::Reg2),
+        );
+
+    let mut batch = Batch::new();
+    batch.add(&rule, MsgType::Add);
+    send_batch(batch)
+        .with_context(|| format!("adding rule udp6:{from_port} -> :{to_port}"))?;
+    Ok(())
+}
+
+/// Shared implementation of [`add_nft_redirect`] + its UDP sibling.
 ///
 /// Note: this is DNAT-to-loopback, not `REDIRECT`. For output-hook NAT
 /// the two behave equivalently (REDIRECT is shorthand for DNAT to the
@@ -272,10 +346,18 @@ pub fn ensure_nft_nat_table() -> Result<()> {
 /// supported path.
 ///
 /// Call `ensure_nft_nat_table` first.
-pub fn add_nft_redirect(from_port: u16, to_port: u16) -> Result<()> {
+pub fn add_nft_redirect_proto(
+    protocol: Protocol,
+    from_port: u16,
+    to_port: u16,
+) -> Result<()> {
+    let proto_name = match protocol {
+        Protocol::TCP => "tcp",
+        Protocol::UDP => "udp",
+    };
     info!(
-        "netns: adding nat rule tcp dport {} -> 127.0.0.1:{} (via netlink)",
-        from_port, to_port
+        "netns: adding nat rule {} dport {} -> 127.0.0.1:{} (via netlink)",
+        proto_name, from_port, to_port
     );
     let table = hermit_table();
     let chain = output_chain(&table);
@@ -288,7 +370,7 @@ pub fn add_nft_redirect(from_port: u16, to_port: u16) -> Result<()> {
 
     let rule = Rule::new(&chain)
         .context("constructing nat rule")?
-        .dport(from_port, Protocol::TCP)
+        .dport(from_port, protocol)
         .with_expr(Immediate::new_data(dst_ip.to_vec(), Register::Reg1))
         .with_expr(Immediate::new_data(dst_port.to_vec(), Register::Reg2))
         .with_expr(
@@ -301,23 +383,31 @@ pub fn add_nft_redirect(from_port: u16, to_port: u16) -> Result<()> {
 
     let mut batch = Batch::new();
     batch.add(&rule, MsgType::Add);
-    send_batch(batch)
-        .with_context(|| format!("adding rule tcp:{from_port} -> :{to_port}"))?;
+    send_batch(batch).with_context(|| {
+        format!("adding rule {proto_name}:{from_port} -> :{to_port}")
+    })?;
     Ok(())
 }
 
-/// Remove the hermit nftables table (and everything in it).
+/// Remove the hermit nftables tables (v4 + v6) and everything in
+/// them.
 ///
-/// Uses the Add+Del idempotency pattern so this succeeds whether or not
-/// the table already exists. Matches the shell-out semantics where
-/// `nft delete table` on a missing table would error.
+/// Uses the Add+Del idempotency pattern so this succeeds whether or
+/// not the tables already exist, matching `nft delete table` which
+/// errors on a missing table.
 pub fn cleanup_nft() -> Result<()> {
-    info!("netns: removing nftables {} table (via netlink)", TABLE_NAME);
-    let table = hermit_table();
+    info!(
+        "netns: removing nftables {} / {} tables (via netlink)",
+        TABLE_NAME, TABLE_NAME_V6
+    );
+    let t4 = hermit_table();
+    let t6 = hermit_table_v6();
     let mut batch = Batch::new();
-    batch.add(&table, MsgType::Add); // make Del succeed if table is absent
-    batch.add(&table, MsgType::Del);
-    send_batch(batch).context("deleting nat table")?;
+    batch.add(&t4, MsgType::Add); // make Del succeed if table absent
+    batch.add(&t4, MsgType::Del);
+    batch.add(&t6, MsgType::Add);
+    batch.add(&t6, MsgType::Del);
+    send_batch(batch).context("deleting nat tables")?;
     Ok(())
 }
 

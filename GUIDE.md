@@ -29,15 +29,25 @@ hermit --passthrough /opt/toolchain -- cargo build
 ## CLI reference
 
 ```
-hermit [OPTIONS] -- <COMMAND>...
+hermit run    [OPTIONS] -- <COMMAND>...
+hermit sign   --cert <PEM> --key <PEM> <CONFIG> [--output <PATH>]
+hermit verify [--trust-dir <DIR>] <CONFIG_URL>
+hermit keygen --cert <PEM> --key <PEM> [--subject <CN>] [--force]
 ```
+
+`hermit run` flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config <URL>` | _(required)_ | `file://` or `https://` URL of the signed hermit config TOML |
+| `--allow-unsigned` | off | Accept a config without a `[signature]` section (local development) |
 | `--project-dir <DIR>` | `.` | Directory with read-write access inside the sandbox |
-| `--passthrough <DIR>` | _(none)_ | Extra read-write directory (repeatable) |
-| `--net <MODE>` | `host` | Network mode: `host` or `isolate` |
+| `--block-log <PATH>` | `$XDG_STATE_HOME/hermit/blocks.jsonl` | JSON-lines log of blocked DNS / TLS / HTTP events |
+| `--no-block-log` | off | Disable block-event logging entirely |
+| `--log-file <PATH>` | stderr | Where hermit's own info/debug output goes (sandboxed command's output is unaffected) |
 | `-v` / `--verbose` | off | Verbosity: `-v` info, `-vv` debug, `-vvv` trace |
+
+Everything after `--` is the command (and arguments) to run inside the sandbox.
 
 ## Filesystem isolation
 
@@ -69,14 +79,51 @@ Set `HERMIT_HOME_FILES` to override with a single config file.
 
 ## Network modes
 
-### `--net host` (default)
+Network mode is set in `[sandbox]` of the config, not via CLI flag.
+
+### `net = "host"` (default)
 
 Shares the host network. No isolation.
 
-### `--net isolate`
+### `net = "isolate"` with no access rules
 
 Empty network namespace. Only the loopback interface exists. All outbound
 connections fail. Good for hermetic builds.
+
+### `net = "isolate"` with `[[access_rule]]` entries
+
+Empty network namespace plus hermit-managed proxies for:
+
+- **DNS** on 127.0.0.1:53 inside the sandbox. Allowed queries are
+  forwarded to a real resolver (configurable via `[dns]`, default
+  `1.1.1.1:53`) and the answers are cached so downstream relays can
+  map a destination IP back to the hostname it was resolved from.
+- **HTTPS / TLS** on port 443, handled by an SNI-reading MITM proxy
+  on `127.0.0.1:1443` (DNAT redirected). Every rule with
+  `mechanism = "mitm"` terminates TLS with an ephemeral CA and
+  enforces `path_prefix` / `methods`. `mechanism = "sni"` rules
+  splice bytes after the ClientHello with no interception.
+- **HTTP** on port 80, handled on `127.0.0.1:1080`. The proxy
+  understands origin-form requests, absolute-form requests (what
+  `HTTP_PROXY`-aware clients send), and `CONNECT` tunnels (what
+  `HTTPS_PROXY`-aware clients send).
+- **Bypass** TCP / UDP relays for non-HTTP protocols — see the
+  `mechanism = "bypass"` section below.
+
+The child process receives these environment variables automatically
+so proxy-aware clients route through hermit explicitly:
+
+```
+HTTP_PROXY=http://127.0.0.1:1080
+HTTPS_PROXY=http://127.0.0.1:1080
+NO_PROXY=localhost,127.0.0.1,::1
+```
+
+(and the lowercase `http_proxy` / `https_proxy` / `no_proxy` forms,
+because ecosystems disagree on casing.)
+
+Blocked DNS / TLS / HTTP / bypass events are recorded to
+`$XDG_STATE_HOME/hermit/blocks.jsonl` by default; see `--block-log`.
 
 ## Smoke tests
 
@@ -141,11 +188,81 @@ Top-level sections:
 |---|---|
 | `include = ["<url>", ...]` | Other configs to merge into this one (see below) |
 | `[sandbox]` | Network mode + `passthrough` dirs |
+| `[dns]` | Upstream DNS resolver for allowed queries |
 | `[[home_file]]` | `copy` / `pass` / `read` actions applied to a `$HOME` path |
-| `[[access_rule]]` | Allow a host / path prefix / HTTP methods through the proxy |
+| `[[access_rule]]` | Allow a host (or literal IP) through the proxy; choose `mitm`, `sni`, or `bypass` |
 | `[[port_forward]]` | Extra TCP ports to intercept (`https` → MITM, `http` → HTTP proxy) |
 | `[[rule]]` + `[credential.<name>]` | Credential-injection matcher + credential source |
 | `[signature]` | Detached ed25519 signature over the preceding content |
+
+### `[dns]` — upstream resolver
+
+```toml
+[dns]
+upstream = "1.1.1.1:53"   # default; override with any ip:port resolver
+```
+
+Allowed DNS queries (those whose hostname matches an `[[access_rule]]`)
+are forwarded to this resolver. The real answer is relayed to the
+child and A/AAAA records are tapped into an in-memory cache that the
+bypass relays consult to map a destination IP back to a hostname.
+Denied queries return REFUSED; upstream failures return SERVFAIL.
+
+### `[[access_rule]]` — the allowlist
+
+Each rule either keys off a **hostname** (`host = "…"`) or a literal
+**IP** (`ip = "…"`) — set exactly one. Hostname rules cover the
+common DNS-driven case; IP rules cover services reached without a
+DNS query hermit sees.
+
+The `mechanism` field picks the enforcement strategy:
+
+| Mechanism | Listener | What it does | Compatible fields |
+|---|---|---|---|
+| `"mitm"` (default) | HTTPS/HTTP proxy | Terminates TLS with an ephemeral CA, parses HTTP, can inject credentials, enforces `path_prefix` / `methods` | `host`, `path_prefix`, `methods` |
+| `"sni"` | HTTPS proxy | Reads the TLS ClientHello and splices bytes — no termination, no payload visibility. Use for cert-pinning clients | `host` only |
+| `"bypass"` | Dedicated TCP or UDP relay on `(protocol, port)` | SO_ORIGINAL_DST / IP_RECVORIGDSTADDR yields the real destination, the DNS cache (or IP rule) authorizes, then bytes splice | `host` or `ip`; `protocol` and `port` required |
+
+Validation happens at config-load time:
+
+- `path_prefix` / `methods` on `"sni"` or `"bypass"` → rejected
+  (those fields require plaintext visibility).
+- `"bypass"` requires `protocol = "tcp"|"udp"` and `port = <number>`.
+- Bypass `port` 80 or 443 → rejected (those are claimed by the
+  MITM/HTTP proxies; for certificate-pinned HTTPS use `"sni"`).
+- `ip = "…"` with `"mitm"` or `"sni"` → rejected (both strategies
+  fundamentally key on hostnames).
+
+Examples:
+
+```toml
+# Plain MITM — the default when `mechanism` is omitted.
+[[access_rule]]
+host = "api.github.com"
+path_prefix = "/repos/"
+methods = ["GET", "POST"]
+
+# SNI cut-through for a certificate-pinning client.
+[[access_rule]]
+host = "pinned.example"
+mechanism = "sni"
+
+# Bypass UDP 88 for Kerberos. A single entry covers both IPv4 and
+# IPv6 — hermit installs parallel nft rules and relay listeners in
+# each family.
+[[access_rule]]
+host = "kdc.example"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+
+# Literal-IP bypass (the KDC is reached by address, not via DNS).
+[[access_rule]]
+ip = "10.0.0.5"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+```
 
 ### `include` — composing configs
 

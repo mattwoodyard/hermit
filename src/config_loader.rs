@@ -221,7 +221,7 @@ host = "rel.example"
 "#).unwrap();
 
         let cfg = assemble(&file_url(&root), &TrustPolicy::AllowUnsigned).unwrap();
-        assert_eq!(cfg.access_rules[0].host, "rel.example");
+        assert_eq!(cfg.access_rules[0].host.as_deref(), Some("rel.example"));
     }
 
     #[test]

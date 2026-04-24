@@ -31,6 +31,63 @@ const HTTP_PROXY_LISTEN_PORT: u16 = 1080;
 const HTTPS_PORT: u16 = 443;
 /// Port to redirect (HTTP) to the HTTP proxy.
 const HTTP_PORT: u16 = 80;
+/// First loopback port used for TCP-bypass relay listeners. Each
+/// distinct bypass `(tcp, port)` rule gets one consecutive port
+/// starting here. Room for up to 256 endpoints before we'd collide
+/// with anything interesting — more than enough for real-world
+/// configs, and the allocation is deterministic so parent + child
+/// agree without side-channel coordination.
+const BYPASS_TCP_BASE_PORT: u16 = 1090;
+/// First loopback port used for UDP-bypass relay listeners. Kept
+/// disjoint from the TCP range so an operator reading `ss -tulnp`
+/// can tell which listener is which at a glance, and we don't care
+/// about UDP-TCP clashes (they don't share port space) but the
+/// alignment is handy for logs.
+const BYPASS_UDP_BASE_PORT: u16 = 1400;
+
+/// One TCP-bypass endpoint plus the loopback port where the relay
+/// listens for it. Both sides of the fork compute the same
+/// allocation from the shared `RuleSet` so we don't need to send
+/// metadata alongside the SCM_RIGHTS fds.
+#[derive(Debug, Clone, Copy)]
+struct BypassTcpAllocation {
+    /// The real port the child thinks it's connecting to (e.g. 389).
+    real_port: u16,
+    /// Loopback port where the relay listens (e.g. 1090).
+    relay_port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BypassUdpAllocation {
+    real_port: u16,
+    relay_port: u16,
+}
+
+fn compute_bypass_tcp_allocations(rules: &RuleSet) -> Vec<BypassTcpAllocation> {
+    rules
+        .bypass_endpoints()
+        .into_iter()
+        .filter(|(p, _)| *p == sni_proxy::policy::BypassProtocol::Tcp)
+        .enumerate()
+        .map(|(i, (_, port))| BypassTcpAllocation {
+            real_port: port,
+            relay_port: BYPASS_TCP_BASE_PORT + i as u16,
+        })
+        .collect()
+}
+
+fn compute_bypass_udp_allocations(rules: &RuleSet) -> Vec<BypassUdpAllocation> {
+    rules
+        .bypass_endpoints()
+        .into_iter()
+        .filter(|(p, _)| *p == sni_proxy::policy::BypassProtocol::Udp)
+        .enumerate()
+        .map(|(i, (_, port))| BypassUdpAllocation {
+            real_port: port,
+            relay_port: BYPASS_UDP_BASE_PORT + i as u16,
+        })
+        .collect()
+}
 
 // --- Readiness pipe ---
 
@@ -252,6 +309,7 @@ pub fn run_forked_proxied(
     network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
     port_forwards: &[PortForwardSpec],
     block_log_path: Option<&Path>,
+    dns_upstream: std::net::SocketAddr,
 ) -> Result<i32> {
     // Generate the ephemeral CA before fork so both parent and child can use it.
     let ca = Arc::new(
@@ -262,6 +320,12 @@ pub fn run_forked_proxied(
 
     let (ns_reader, ns_writer) = readiness_pipe()?;
     let (parent_sock, child_sock) = fdpass::socketpair()?;
+
+    // Computed before the fork so parent + child agree on the
+    // relay-port layout without having to pass it through the
+    // SCM_RIGHTS channel.
+    let bypass_tcp = compute_bypass_tcp_allocations(&policy);
+    let bypass_udp = compute_bypass_udp_allocations(&policy);
 
     match unsafe { fork() }.context("fork failed")? {
         ForkResult::Child => {
@@ -278,6 +342,8 @@ pub fn run_forked_proxied(
                 rw_paths,
                 command,
                 port_forwards,
+                &bypass_tcp,
+                &bypass_udp,
             );
         }
         ForkResult::Parent { child } => {
@@ -291,6 +357,9 @@ pub fn run_forked_proxied(
                 ca,
                 network_policy,
                 block_log_path.map(|p| p.to_path_buf()),
+                dns_upstream,
+                bypass_tcp,
+                bypass_udp,
             )
         }
     }
@@ -311,12 +380,14 @@ fn child_main_proxied(
     rw_paths: &[&Path],
     command: &[String],
     port_forwards: &[PortForwardSpec],
+    bypass_tcp: &[BypassTcpAllocation],
+    bypass_udp: &[BypassUdpAllocation],
 ) -> ! {
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
     if let Err(e) = child_proxied_setup(
         sock_fd, ca_pem, home_path, project_dir, passthrough, home_files, rw_paths,
-        port_forwards,
+        port_forwards, bypass_tcp, bypass_udp,
     ) {
         eprintln!("hermit: proxied namespace setup failed: {:#}", e);
         std::process::exit(126);
@@ -325,9 +396,40 @@ fn child_main_proxied(
     ns_ready.signal();
 
     info!("child: exec {:?}", command);
-    let err = Command::new(&command[0]).args(&command[1..]).exec();
+    let err = Command::new(&command[0])
+        .args(&command[1..])
+        .envs(proxy_env_vars())
+        .exec();
     eprintln!("hermit: exec failed: {}", err);
     std::process::exit(126);
+}
+
+/// Environment variables set on the sandboxed command so that
+/// proxy-aware clients (curl, python-requests, cargo, npm, go, ...)
+/// route HTTP and HTTPS through the hermit proxies explicitly rather
+/// than relying only on the transparent nftables DNAT redirect.
+///
+/// Both casings are set because ecosystems disagree on which one is
+/// canonical — curl reads lowercase, most others accept both. The
+/// HTTP proxy on [`HTTP_PROXY_LISTEN_PORT`] handles origin-form
+/// requests, absolute-form requests (what `HTTP_PROXY` clients send),
+/// and `CONNECT` tunnels (what `HTTPS_PROXY` clients send); that's
+/// why the same URL is used for all four.
+///
+/// `NO_PROXY` excludes loopback so tools hitting a local service
+/// inside the sandbox don't tunnel through the proxy back to
+/// themselves.
+fn proxy_env_vars() -> Vec<(&'static str, String)> {
+    let url = format!("http://127.0.0.1:{}", HTTP_PROXY_LISTEN_PORT);
+    let no_proxy = "localhost,127.0.0.1,::1".to_string();
+    vec![
+        ("HTTP_PROXY", url.clone()),
+        ("http_proxy", url.clone()),
+        ("HTTPS_PROXY", url.clone()),
+        ("https_proxy", url),
+        ("NO_PROXY", no_proxy.clone()),
+        ("no_proxy", no_proxy),
+    ]
 }
 
 /// All fallible setup for the proxied child, collected so errors propagate cleanly.
@@ -340,6 +442,8 @@ fn child_proxied_setup(
     home_files: &[HomeFileDirective],
     rw_paths: &[&Path],
     port_forwards: &[PortForwardSpec],
+    bypass_tcp: &[BypassTcpAllocation],
+    bypass_udp: &[BypassUdpAllocation],
 ) -> Result<()> {
     // Set up namespace isolation (user + mount + net)
     setup_namespace(home_path, project_dir, passthrough, home_files, true)?;
@@ -360,6 +464,29 @@ fn child_proxied_setup(
         );
         netns::add_nft_redirect(pf.port, dest)?;
     }
+    for alloc in bypass_tcp {
+        info!(
+            "netns: bypass-tcp port_forward {} -> 127.0.0.1:{}",
+            alloc.real_port, alloc.relay_port
+        );
+        netns::add_nft_redirect(alloc.real_port, alloc.relay_port)?;
+    }
+    // UDP bypass: install both v4 and v6 DNAT rules. Each rule
+    // retargets the real port onto our loopback relay port in the
+    // matching family (127.0.0.1 / ::1). The v6 table is created
+    // lazily so configs without IPv6 bypass don't pay for an empty
+    // `ip6 hermit_nat_v6`.
+    if !bypass_udp.is_empty() {
+        netns::ensure_nft_nat_table_v6()?;
+    }
+    for alloc in bypass_udp {
+        info!(
+            "netns: bypass-udp port_forward {} -> 127.0.0.1:{} + [::1]:{}",
+            alloc.real_port, alloc.relay_port, alloc.relay_port
+        );
+        netns::add_nft_redirect_udp(alloc.real_port, alloc.relay_port)?;
+        netns::add_nft_redirect_udp_v6(alloc.real_port, alloc.relay_port)?;
+    }
 
     // Create listener sockets inside the new network namespace.
     // These will be transferred to the parent via SCM_RIGHTS.
@@ -370,17 +497,77 @@ fn child_proxied_setup(
     let udp_socket = std::net::UdpSocket::bind("127.0.0.1:53")
         .context("failed to bind DNS socket")?;
 
+    // Bind one listener per bypass-tcp allocation. Order matches the
+    // allocation order (which is deterministic), so the parent can
+    // pair each received fd with its config entry by index.
+    let mut bypass_tcp_listeners: Vec<std::net::TcpListener> =
+        Vec::with_capacity(bypass_tcp.len());
+    for alloc in bypass_tcp {
+        let l = std::net::TcpListener::bind(format!("127.0.0.1:{}", alloc.relay_port))
+            .with_context(|| {
+                format!(
+                    "failed to bind bypass-tcp relay listener on 127.0.0.1:{}",
+                    alloc.relay_port
+                )
+            })?;
+        bypass_tcp_listeners.push(l);
+    }
+
+    // UDP bypass: bind *two* sockets per allocation — one v4, one
+    // v6 — matching the two DNAT rules installed above. Each
+    // relay instance (spawned on the parent side) consumes one
+    // fd, so the v4 + v6 sockets for the same `real_port`
+    // become sibling relays that authorize independently.
+    let mut bypass_udp_v4: Vec<std::net::UdpSocket> = Vec::with_capacity(bypass_udp.len());
+    let mut bypass_udp_v6: Vec<std::net::UdpSocket> = Vec::with_capacity(bypass_udp.len());
+    for alloc in bypass_udp {
+        let s4 = std::net::UdpSocket::bind(format!("127.0.0.1:{}", alloc.relay_port))
+            .with_context(|| {
+                format!(
+                    "failed to bind bypass-udp v4 relay socket on 127.0.0.1:{}",
+                    alloc.relay_port
+                )
+            })?;
+        let s6 = std::net::UdpSocket::bind(format!("[::1]:{}", alloc.relay_port))
+            .with_context(|| {
+                format!(
+                    "failed to bind bypass-udp v6 relay socket on [::1]:{}",
+                    alloc.relay_port
+                )
+            })?;
+        bypass_udp_v4.push(s4);
+        bypass_udp_v6.push(s6);
+    }
+
     info!(
-        "child: created HTTPS proxy on :{}, HTTP proxy on :{}, DNS on :53",
-        PROXY_LISTEN_PORT, HTTP_PROXY_LISTEN_PORT
+        "child: created HTTPS proxy on :{}, HTTP proxy on :{}, DNS on :53, \
+         {} bypass-tcp listener(s), {} bypass-udp listener(s) (v4+v6 each)",
+        PROXY_LISTEN_PORT,
+        HTTP_PROXY_LISTEN_PORT,
+        bypass_tcp_listeners.len(),
+        bypass_udp_v4.len(),
     );
 
-    // Send the fds to the parent (HTTPS, HTTP, DNS)
-    fdpass::send_fds(
-        sock_fd,
-        &[https_listener.as_raw_fd(), http_listener.as_raw_fd(), udp_socket.as_raw_fd()],
-    )
-    .context("failed to send listener fds to parent")?;
+    // Send the fds to the parent. Order: HTTPS, HTTP, DNS, then
+    // bypass-tcp fds (in allocation order), then bypass-udp-v4
+    // fds, then bypass-udp-v6 fds. The parent recomputes the same
+    // allocation order and splits the received vector by index.
+    let mut fds: Vec<i32> = vec![
+        https_listener.as_raw_fd(),
+        http_listener.as_raw_fd(),
+        udp_socket.as_raw_fd(),
+    ];
+    for l in &bypass_tcp_listeners {
+        fds.push(l.as_raw_fd());
+    }
+    for s in &bypass_udp_v4 {
+        fds.push(s.as_raw_fd());
+    }
+    for s in &bypass_udp_v6 {
+        fds.push(s.as_raw_fd());
+    }
+    fdpass::send_fds(sock_fd, &fds)
+        .context("failed to send listener fds to parent")?;
     fdpass::close_fd(sock_fd);
 
     // Override /etc/resolv.conf to point at our fake DNS server
@@ -408,17 +595,37 @@ fn parent_main_proxied(
     ca: Arc<sni_proxy::ca::CertificateAuthority>,
     network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
     block_log_path: Option<PathBuf>,
+    dns_upstream: std::net::SocketAddr,
+    bypass_tcp: Vec<BypassTcpAllocation>,
+    bypass_udp: Vec<BypassUdpAllocation>,
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
-    // Receive the listener fds from the child (HTTPS, HTTP, DNS)
-    info!("parent: waiting for listener fds from child");
-    let fds = fdpass::recv_fds(sock_fd, 3)
+    // Receive the listener fds from the child. Layout (must match
+    // `child_proxied_setup`'s send order): HTTPS, HTTP, DNS, then
+    // TCP-bypass fds, then UDP-bypass v4 fds, then UDP-bypass v6
+    // fds. Each UDP allocation contributes two fds (one per
+    // family) so the split is `2 × bypass_udp.len()`.
+    let fixed_count = 3usize;
+    let tcp_count = bypass_tcp.len();
+    let udp_count = bypass_udp.len();
+    let total = fixed_count + tcp_count + 2 * udp_count;
+    info!(
+        "parent: waiting for {} listener fds from child ({} bypass-tcp, {} bypass-udp × v4+v6)",
+        total, tcp_count, udp_count
+    );
+    let fds = fdpass::recv_fds(sock_fd, total)
         .context("failed to receive listener fds from child")?;
     fdpass::close_fd(sock_fd);
     let https_raw_fd = fds[0];
     let http_raw_fd = fds[1];
     let udp_raw_fd = fds[2];
+    let tcp_start = fixed_count;
+    let udp_v4_start = fixed_count + tcp_count;
+    let udp_v6_start = udp_v4_start + udp_count;
+    let bypass_tcp_raw_fds: Vec<i32> = fds[tcp_start..udp_v4_start].to_vec();
+    let bypass_udp_v4_raw_fds: Vec<i32> = fds[udp_v4_start..udp_v6_start].to_vec();
+    let bypass_udp_v6_raw_fds: Vec<i32> = fds[udp_v6_start..].to_vec();
 
     // Wait for child to complete all setup (namespace, nftables, landlock)
     ns_reader.wait()?;
@@ -435,6 +642,14 @@ fn parent_main_proxied(
         .context("HTTP listener setup")?;
     let udp_socket = fd_to_tokio_udp(udp_raw_fd, &rt)
         .context("DNS socket setup")?;
+    let bypass_tcp_listeners: Vec<_> = bypass_tcp_raw_fds
+        .into_iter()
+        .enumerate()
+        .map(|(i, fd)| {
+            fd_to_tokio_listener(fd, &rt)
+                .with_context(|| format!("bypass-tcp listener {i} setup"))
+        })
+        .collect::<Result<_>>()?;
 
     // Block logger must be constructed on the runtime because it opens
     // an async file and spawns a writer task.
@@ -463,10 +678,20 @@ fn parent_main_proxied(
         block_log: block_log.clone(),
     });
 
-    // DNS server — wrapped in Arc so `run` can spawn per-response tasks
-    // that share the socket.
+    // DNS server — wrapped in Arc so `run` can spawn per-response
+    // tasks that share the socket. A real upstream resolver is
+    // plumbed in here so allowed queries get real answers; the
+    // shared DnsCache lets future relays reverse-map a dst IP
+    // (from SO_ORIGINAL_DST) back to the hostname that was
+    // originally asked for.
+    let dns_cache = Arc::new(sni_proxy::dns_cache::DnsCache::new());
+    let dns_forwarder = Arc::new(sni_proxy::dns_forwarder::DnsForwarder::new(dns_upstream));
+    info!("dns: forwarding allowed queries to {}", dns_upstream);
     let dns_server = Arc::new(
-        sni_proxy::dns::DnsServer::new(Arc::clone(&policy)).with_block_log(block_log.clone()),
+        sni_proxy::dns::DnsServer::new(Arc::clone(&policy))
+            .with_block_log(block_log.clone())
+            .with_upstream(dns_forwarder)
+            .with_cache(Arc::clone(&dns_cache)),
     );
 
     // Spawn all services. Keep the JoinHandles so the supervisor can
@@ -491,18 +716,110 @@ fn parent_main_proxied(
         }
     });
 
+    // Spawn one TCP-bypass relay per allocation. Each gets its own
+    // BypassTcpConfig (port is load-bearing for rule matching).
+    // We collect the handles so a relay death triggers the same
+    // supervisor teardown as any other proxy task — the child
+    // running against a dead relay would experience a hard-to-
+    // diagnose hang rather than a clean deny.
+    let mut bypass_tcp_handles = Vec::with_capacity(bypass_tcp_listeners.len());
+    for (alloc, listener) in bypass_tcp.iter().zip(bypass_tcp_listeners.into_iter()) {
+        let cfg = Arc::new(sni_proxy::bypass_tcp::BypassTcpConfig {
+            port: alloc.real_port,
+            rules: Arc::clone(&policy),
+            cache: Arc::clone(&dns_cache),
+            connector: Arc::new(sni_proxy::connector::DirectConnector),
+            block_log: block_log.clone(),
+        });
+        let real_port = alloc.real_port;
+        let handle = rt.spawn(async move {
+            if let Err(e) = sni_proxy::bypass_tcp::run(listener, cfg).await {
+                error!("bypass-tcp relay (port {}) error: {}", real_port, e);
+            }
+        });
+        bypass_tcp_handles.push((real_port, handle));
+    }
+
+    // Spawn one UDP-bypass relay per (allocation, family). The UDP
+    // module takes a raw fd because it does its own
+    // `IP[V6]_RECVORIGDSTADDR` setup and cmsg-aware `recvmsg` —
+    // plain tokio `UdpSocket` can't give us the pre-DNAT dst.
+    let mut bypass_udp_handles = Vec::with_capacity(2 * bypass_udp.len());
+    let udp_families = [
+        (bypass_udp_v4_raw_fds, sni_proxy::bypass_udp::IpFamily::V4, "v4"),
+        (bypass_udp_v6_raw_fds, sni_proxy::bypass_udp::IpFamily::V6, "v6"),
+    ];
+    for (fds, family, label) in udp_families {
+        for (alloc, raw_fd) in bypass_udp.iter().zip(fds.into_iter()) {
+            let cfg = Arc::new(sni_proxy::bypass_udp::BypassUdpConfig {
+                port: alloc.real_port,
+                family,
+                rules: Arc::clone(&policy),
+                cache: Arc::clone(&dns_cache),
+                block_log: block_log.clone(),
+            });
+            let real_port = alloc.real_port;
+            let label = label.to_string();
+            let label_for_task = label.clone();
+            let handle = rt.spawn(async move {
+                if let Err(e) = sni_proxy::bypass_udp::run(raw_fd, cfg).await {
+                    error!("bypass-udp relay ({} port {}) error: {}", label_for_task, real_port, e);
+                }
+            });
+            bypass_udp_handles.push((alloc.real_port, label, handle));
+        }
+    }
+
     // Supervisor: if any proxy task exits (clean return, error, or
     // panic) before the child does, SIGTERM the child. The child
     // running with a dead proxy means egress policy isn't being
     // enforced, which is worse than tearing the whole sandbox down.
     let child_pid_raw = child.as_raw();
     rt.spawn(async move {
-        let which = tokio::select! {
-            r = mitm_handle => ("mitm", r),
-            r = http_handle => ("http", r),
-            r = dns_handle => ("dns", r),
+        // `select` over the fixed proxies + every bypass relay.
+        // `futures::select_all` would be cleaner but adds a dep;
+        // spawn a watcher per handle instead.
+        let (name_tx, mut name_rx) = tokio::sync::mpsc::channel::<(String, _)>(16);
+        {
+            let tx = name_tx.clone();
+            tokio::spawn(async move {
+                let r = mitm_handle.await;
+                let _ = tx.send(("mitm".to_string(), r)).await;
+            });
+        }
+        {
+            let tx = name_tx.clone();
+            tokio::spawn(async move {
+                let r = http_handle.await;
+                let _ = tx.send(("http".to_string(), r)).await;
+            });
+        }
+        {
+            let tx = name_tx.clone();
+            tokio::spawn(async move {
+                let r = dns_handle.await;
+                let _ = tx.send(("dns".to_string(), r)).await;
+            });
+        }
+        for (real_port, handle) in bypass_tcp_handles {
+            let tx = name_tx.clone();
+            tokio::spawn(async move {
+                let r = handle.await;
+                let _ = tx.send((format!("bypass-tcp:{real_port}"), r)).await;
+            });
+        }
+        for (real_port, label, handle) in bypass_udp_handles {
+            let tx = name_tx.clone();
+            tokio::spawn(async move {
+                let r = handle.await;
+                let _ = tx.send((format!("bypass-udp/{label}:{real_port}"), r)).await;
+            });
+        }
+        drop(name_tx);
+
+        let Some((name, result)) = name_rx.recv().await else {
+            return; // all senders dropped without a message — nothing to do
         };
-        let (name, result) = which;
         match result {
             Ok(()) => error!(
                 "proxy task {} exited unexpectedly (no error); tearing down sandbox child",
@@ -592,5 +909,112 @@ mod tests {
     fn test_child_pid_atomic_default() {
         // CHILD_PID starts at 0
         assert_eq!(CHILD_PID.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bypass_tcp_allocations_give_distinct_relay_ports() {
+        use sni_proxy::policy::{AccessRule, BypassProtocol, Mechanism};
+        let rules = RuleSet::new(vec![
+            AccessRule {
+                hostname: "a.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 389 },
+            },
+            AccessRule {
+                hostname: "b.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 22 },
+            },
+            // UDP rule must not appear in the TCP allocation list.
+            AccessRule {
+                hostname: "c.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
+            },
+        ]);
+        let allocs = compute_bypass_tcp_allocations(&rules);
+        assert_eq!(allocs.len(), 2);
+        // All relay ports distinct, all at or above the base.
+        let relay_ports: std::collections::HashSet<_> =
+            allocs.iter().map(|a| a.relay_port).collect();
+        assert_eq!(relay_ports.len(), 2);
+        for a in &allocs {
+            assert!(a.relay_port >= BYPASS_TCP_BASE_PORT);
+        }
+    }
+
+    #[test]
+    fn bypass_udp_allocations_coexist_with_tcp_on_same_port() {
+        // Kerberos ships UDP/88 and TCP/88 — both should allocate
+        // listeners independently and land in disjoint loopback
+        // port ranges so neither steps on the other.
+        use sni_proxy::policy::{AccessRule, BypassProtocol, Mechanism};
+        let rules = RuleSet::new(vec![
+            AccessRule {
+                hostname: "kdc.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
+            },
+            AccessRule {
+                hostname: "kdc.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 88 },
+            },
+        ]);
+        let tcp_allocs = compute_bypass_tcp_allocations(&rules);
+        let udp_allocs = compute_bypass_udp_allocations(&rules);
+        assert_eq!(tcp_allocs.len(), 1);
+        assert_eq!(udp_allocs.len(), 1);
+        // They're in separate port ranges so we can tell TCP vs UDP
+        // from the loopback port alone.
+        assert!(tcp_allocs[0].relay_port >= BYPASS_TCP_BASE_PORT);
+        assert!(tcp_allocs[0].relay_port < BYPASS_UDP_BASE_PORT);
+        assert!(udp_allocs[0].relay_port >= BYPASS_UDP_BASE_PORT);
+    }
+
+    #[test]
+    fn bypass_tcp_allocations_deduplicate_same_port_different_hosts() {
+        // Two different hosts both bypassing TCP port 22 — the
+        // relay serves both via a single listener on the same
+        // loopback port, and the port 22 DNAT redirects to it.
+        use sni_proxy::policy::{AccessRule, BypassProtocol, Mechanism};
+        let rules = RuleSet::new(vec![
+            AccessRule {
+                hostname: "a.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 22 },
+            },
+            AccessRule {
+                hostname: "b.example".into(),
+                path_prefix: None,
+                methods: None,
+                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 22 },
+            },
+        ]);
+        let allocs = compute_bypass_tcp_allocations(&rules);
+        assert_eq!(allocs.len(), 1, "same port must share one relay listener");
+    }
+
+    #[test]
+    fn proxy_env_vars_cover_both_casings_and_no_proxy() {
+        let vars: std::collections::HashMap<_, _> = proxy_env_vars().into_iter().collect();
+        let expected_url = format!("http://127.0.0.1:{}", HTTP_PROXY_LISTEN_PORT);
+        for k in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+            assert_eq!(vars.get(k).map(|s| s.as_str()), Some(expected_url.as_str()),
+                "missing or wrong value for {k}");
+        }
+        for k in ["NO_PROXY", "no_proxy"] {
+            let v = vars.get(k).expect("missing NO_PROXY casing");
+            // Loopback must be excluded — otherwise local services
+            // tunnel back through the proxy to themselves.
+            assert!(v.contains("127.0.0.1"), "NO_PROXY missing 127.0.0.1: {v}");
+            assert!(v.contains("localhost"), "NO_PROXY missing localhost: {v}");
+        }
     }
 }

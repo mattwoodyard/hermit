@@ -143,10 +143,13 @@ fn run_subcommand(args: RunArgs) -> Result<i32> {
         .with_context(|| format!("loading config from {}", args.config))?;
 
     info!("command: {}", args.command.join(" "));
-    if let Some(p) = &args.block_log {
-        info!("block log: {}", p.display());
-    }
-    run_sandboxed(&project_dir, &args.command, &config, args.block_log.as_deref())
+    run_sandboxed(
+        &project_dir,
+        &args.command,
+        &config,
+        args.block_log.as_deref(),
+        args.no_block_log,
+    )
 }
 
 fn sign_subcommand(args: SignArgs) -> Result<i32> {

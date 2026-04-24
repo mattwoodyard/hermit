@@ -66,12 +66,19 @@ pub struct RunArgs {
     pub project_dir: PathBuf,
 
     /// Append JSON-lines block events (blocked DNS queries, blocked
-    /// TLS/HTTP requests) to this file. When omitted, blocks are
-    /// dropped silently — they are not emitted to stderr. Raise
-    /// verbosity to `-vv` to see per-block debug lines alongside the
-    /// usual hermit output.
-    #[arg(long)]
+    /// TLS/HTTP requests) to this file. Defaults to
+    /// `$XDG_STATE_HOME/hermit/blocks.jsonl` (fallback
+    /// `~/.local/state/hermit/blocks.jsonl`) when omitted — the parent
+    /// directory is created if it doesn't already exist. Pass
+    /// `--no-block-log` to disable entirely.
+    #[arg(long, conflicts_with = "no_block_log")]
     pub block_log: Option<PathBuf>,
+
+    /// Disable block-event logging entirely. By default hermit records
+    /// blocked DNS/TLS/HTTP events to
+    /// `$XDG_STATE_HOME/hermit/blocks.jsonl`.
+    #[arg(long)]
+    pub no_block_log: bool,
 
     /// Write hermit's own info/warn/debug output to this file instead of
     /// stderr. Useful when running an interactive command inside the
@@ -374,6 +381,10 @@ mod tests {
 
     #[test]
     fn parse_run_block_log_defaults_to_none() {
+        // `block_log` holds only the user's explicit override — when the
+        // flag is omitted it is None, and the sandbox layer substitutes
+        // `$XDG_STATE_HOME/hermit/blocks.jsonl`. `no_block_log` defaults
+        // to false, i.e. logging is on by default.
         let cli = Cli::parse_from([
             "hermit",
             "run",
@@ -383,9 +394,56 @@ mod tests {
             "true",
         ]);
         match cli.command {
-            Command::Run(args) => assert!(args.block_log.is_none()),
+            Command::Run(args) => {
+                assert!(args.block_log.is_none());
+                assert!(!args.no_block_log);
+            }
             _ => panic!("wrong subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_run_no_block_log_sets_flag() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--no-block-log",
+            "--",
+            "true",
+        ]);
+        match cli.command {
+            Command::Run(args) => {
+                assert!(args.no_block_log);
+                assert!(args.block_log.is_none());
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_run_block_log_and_no_block_log_conflict() {
+        // Passing both is ambiguous — clap should reject it. Without
+        // this guard, the opt-out flag would silently win over the
+        // explicit path (or vice versa) depending on ordering.
+        let err = Cli::try_parse_from([
+            "hermit",
+            "run",
+            "--config",
+            "file:///x.toml",
+            "--block-log",
+            "/tmp/b.jsonl",
+            "--no-block-log",
+            "--",
+            "true",
+        ])
+        .expect_err("clap must reject --block-log with --no-block-log");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflict"),
+            "expected a conflict error, got: {msg}"
+        );
     }
 
     #[test]

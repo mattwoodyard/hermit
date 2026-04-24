@@ -96,11 +96,18 @@ pub fn run_sandboxed(
     project_dir: &Path,
     command: &[String],
     config: &Config,
-    block_log_path: Option<&Path>,
+    block_log_override: Option<&Path>,
+    block_log_disabled: bool,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
     }
+
+    // Distinguish "user explicitly requested a path" from "took the default".
+    // The former is load-bearing: if a user passes --block-log in a mode
+    // where no proxy runs, we surface that as an info line so they know
+    // the flag had no effect. Taking the default is silent.
+    let block_log_user_explicit = block_log_override.is_some();
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let home_path = Path::new(&home);
@@ -127,7 +134,7 @@ pub fn run_sandboxed(
                     access_rules.len()
                 );
             }
-            if block_log_path.is_some() {
+            if block_log_user_explicit {
                 info!("net=host: --block-log has no effect (no proxy is running)");
             }
             run_sandboxed_direct(home_path, project_dir, &passthrough, &home_files, &rw_paths, command)
@@ -138,9 +145,30 @@ pub fn run_sandboxed(
                 access_rules.len(),
                 config.port_forwards.len()
             );
-            let policy = Arc::new(RuleSet::new(access_rules));
+            let block_log_path =
+                resolve_block_log(block_log_override, block_log_disabled)?;
+            if let Some(ref p) = block_log_path {
+                info!("block log: {}", p.display());
+            }
+            let ip_rules = config.ip_rules()?;
+            // Log the effective ruleset at debug level so the user
+            // can verify every rule landed in the expected bucket
+            // by running hermit with `-vv`. This is also the best
+            // place to notice a misordered merge through `include`.
+            debug!("effective access rules ({}):", access_rules.len());
+            for (i, r) in access_rules.iter().enumerate() {
+                debug!("  [{i}] host={:?} mechanism={} path_prefix={:?} methods={:?}",
+                    r.hostname, r.mechanism, r.path_prefix,
+                    r.methods.as_ref().map(|m| m.len()));
+            }
+            debug!("effective ip rules ({}):", ip_rules.len());
+            for (i, r) in ip_rules.iter().enumerate() {
+                debug!("  [{i}] ip={} mechanism={}", r.ip, r.mechanism);
+            }
+            let policy = Arc::new(RuleSet::new(access_rules).with_ip_rules(ip_rules));
             let network_policy = config.network_policy()?.map(Arc::new);
             let port_forwards: Vec<PortForwardSpec> = config.port_forwards.clone();
+            let dns_upstream = config.dns.upstream_addr()?;
             process::run_forked_proxied(
                 home_path,
                 project_dir,
@@ -151,11 +179,12 @@ pub fn run_sandboxed(
                 policy,
                 network_policy,
                 &port_forwards,
-                block_log_path,
+                block_log_path.as_deref(),
+                dns_upstream,
             )
         }
         NetMode::Isolate => {
-            if block_log_path.is_some() {
+            if block_log_user_explicit {
                 info!(
                     "net=isolate with no access_rules: --block-log has no effect (zero-connectivity mode)"
                 );
@@ -166,6 +195,63 @@ pub fn run_sandboxed(
             )
         }
     }
+}
+
+/// Resolve the final block-log path and ensure its parent directory
+/// exists. Returns `None` when block logging was disabled by the user.
+///
+/// When `override_path` is `None` and logging isn't disabled, the path
+/// defaults to `$XDG_STATE_HOME/hermit/blocks.jsonl` (falling back to
+/// `$HOME/.local/state/hermit/blocks.jsonl`). The parent is created
+/// with `create_dir_all` so a first-time run "just works".
+fn resolve_block_log(
+    override_path: Option<&Path>,
+    disabled: bool,
+) -> Result<Option<PathBuf>> {
+    if disabled {
+        return Ok(None);
+    }
+    let path = override_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_block_log_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating block-log directory {}", parent.display()))?;
+    }
+    Ok(Some(path))
+}
+
+/// XDG state directory for hermit's own default logs. Per the XDG
+/// spec, `XDG_STATE_HOME` is the right bucket for "state data that
+/// should persist between application restarts, but ... not important
+/// or portable enough to store in $XDG_DATA_HOME"; logs are listed
+/// explicitly as an example.
+fn default_block_log_path() -> PathBuf {
+    xdg_state_home_from(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .join("hermit")
+    .join("blocks.jsonl")
+}
+
+/// Pure resolver for `$XDG_STATE_HOME` given the two env vars it
+/// depends on. Relative `XDG_STATE_HOME` values are ignored per spec;
+/// missing `HOME` falls back to `/root`, matching the rest of hermit.
+fn xdg_state_home_from(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(v) = xdg_state_home {
+        let p = PathBuf::from(v);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    let home = home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".local").join("state")
 }
 
 /// Direct (non-forked) sandbox path: namespace + landlock + exec.
@@ -204,7 +290,7 @@ mod tests {
     #[test]
     fn test_empty_command_fails() {
         let config = Config::default();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
@@ -212,9 +298,68 @@ mod tests {
     #[test]
     fn test_empty_command_fails_net_isolate() {
         let config = Config::parse("[sandbox]\nnet = \"isolate\"\n").unwrap();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
+    }
+
+    #[test]
+    fn resolve_block_log_honors_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let want = dir.path().join("sub").join("custom.jsonl");
+        let got = resolve_block_log(Some(&want), false).unwrap();
+        assert_eq!(got, Some(want.clone()));
+        assert!(want.parent().unwrap().is_dir(),
+            "override path's parent must be created if missing");
+    }
+
+    #[test]
+    fn resolve_block_log_disabled_returns_none() {
+        // --no-block-log must short-circuit before any filesystem side
+        // effect. We can't easily assert "no XDG dir was created"
+        // without mutating env vars (racy across tests), so the
+        // side-effect-free guarantee is tested at the pure layer
+        // (default_block_log_path resolution) below.
+        let got = resolve_block_log(None, true).unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn xdg_state_home_respects_absolute_override() {
+        use std::ffi::OsStr;
+        let got = xdg_state_home_from(
+            Some(OsStr::new("/var/lib/state")),
+            Some(OsStr::new("/home/someone")),
+        );
+        assert_eq!(got, PathBuf::from("/var/lib/state"));
+    }
+
+    #[test]
+    fn xdg_state_home_ignores_relative_override() {
+        use std::ffi::OsStr;
+        // The XDG spec says relative XDG_STATE_HOME values must be
+        // ignored — otherwise a malicious or confused env would land
+        // the block log in CWD.
+        let got = xdg_state_home_from(
+            Some(OsStr::new("relative/path")),
+            Some(OsStr::new("/home/someone")),
+        );
+        assert_eq!(got, PathBuf::from("/home/someone/.local/state"));
+    }
+
+    #[test]
+    fn xdg_state_home_falls_back_to_home() {
+        use std::ffi::OsStr;
+        let got = xdg_state_home_from(None, Some(OsStr::new("/home/someone")));
+        assert_eq!(got, PathBuf::from("/home/someone/.local/state"));
+    }
+
+    #[test]
+    fn xdg_state_home_missing_home_uses_root_default() {
+        // Matches the `HOME` fallback used elsewhere in hermit
+        // (see run_sandboxed's `unwrap_or_else(|| "/root")`).
+        let got = xdg_state_home_from(None, None);
+        assert_eq!(got, PathBuf::from("/root/.local/state"));
     }
 
     #[test]

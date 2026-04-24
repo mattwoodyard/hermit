@@ -26,7 +26,7 @@ use crate::ca::CertificateAuthority;
 use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::network_policy::{render_inject_value, NetworkPolicy};
-use crate::policy::{RequestPolicy, Verdict};
+use crate::policy::{Mechanism, RequestPolicy, Verdict};
 use crate::proxy::{get_original_dst, read_sni_with_buffer, MAX_CONCURRENT_CONNECTIONS};
 
 /// Max time to wait for the TLS ClientHello from the client.
@@ -146,6 +146,20 @@ where
             reason: Some("hostname not in allowlist".to_string()),
         });
         return Ok(());
+    }
+
+    // Step 2b: Mechanism dispatch. If the rule for this host is
+    // `sni`, skip MITM entirely and splice raw bytes — certificate
+    // pinning clients require this. `mitm` continues below.
+    if config.policy.mechanism(&hostname) == Mechanism::Sni {
+        return splice_sni_cut_through(
+            client_tcp,
+            &client_hello_buf,
+            &hostname,
+            original_dst,
+            config,
+        )
+        .await;
     }
 
     // Step 3: TLS-accept with per-host cert
@@ -332,6 +346,60 @@ where
         }
         // Otherwise loop back and read the next request on this connection.
     }
+}
+
+/// SNI cut-through: the ClientHello has already been buffered in
+/// `client_hello`. We dial the real upstream, forward the buffered
+/// bytes, and then splice bidirectionally. No TLS termination and no
+/// HTTP inspection happens here — by design, since the whole point of
+/// this mechanism is preserving the client↔origin wire for cert-pinned
+/// clients.
+///
+/// Note: this runs on the MITM listener (the one `HTTPS_PORT` DNAT's
+/// to). We intentionally reuse that listener rather than standing up
+/// a separate port so the SNI/MITM choice is per-rule-per-connection
+/// and requires no additional nft rules.
+async fn splice_sni_cut_through<P, C>(
+    mut client_tcp: TcpStream,
+    client_hello: &[u8],
+    hostname: &str,
+    original_dst: Option<SocketAddr>,
+    config: &MitmConfig<P, C>,
+) -> Result<()>
+where
+    P: RequestPolicy,
+    C: UpstreamConnector,
+{
+    debug!(%hostname, "mitm: sni cut-through");
+    let mut upstream = match timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        config
+            .connector
+            .connect(hostname, config.upstream_port, original_dst),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            warn!(%hostname, error = %e, "mitm: sni cut-through upstream failed");
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(%hostname, "mitm: sni cut-through upstream timed out");
+            return Ok(());
+        }
+    };
+
+    // Forward the buffered ClientHello verbatim so the client's TLS
+    // handshake lands on the real upstream. If this write fails the
+    // upstream already dropped us and there's nothing to salvage.
+    upstream
+        .write_all(client_hello)
+        .await
+        .context("forwarding buffered ClientHello to sni cut-through upstream")?;
+
+    let _ = tokio::io::copy_bidirectional(&mut client_tcp, &mut upstream).await;
+    Ok(())
 }
 
 /// Build a rustls ServerConfig for the MITM handshake with the client.
@@ -566,5 +634,82 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"just inner");
+    }
+
+    #[tokio::test]
+    async fn splice_sni_cut_through_forwards_hello_and_bytes() {
+        // The whole point of the Sni mechanism is that the ClientHello
+        // (which the MITM layer already consumed) must reach the real
+        // upstream verbatim — otherwise TLS would have nothing to work
+        // with. This test stands up a mock "upstream" TCP server,
+        // hands splice_sni_cut_through an already-buffered ClientHello,
+        // and asserts the upstream receives those bytes and its reply
+        // flows back to the (fake) client.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            let mut got = vec![0u8; 11];
+            s.read_exact(&mut got).await.unwrap();
+            s.write_all(b"UP").await.unwrap();
+            s.shutdown().await.unwrap();
+            got
+        });
+
+        // Build a TcpStream pair to stand in for the post-ClientHello
+        // client socket. We bind a second listener, connect to it,
+        // and use the accepted half as the stream splice operates on.
+        let pair_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pair_addr = pair_listener.local_addr().unwrap();
+        let (accept_res, connect_res) = tokio::join!(
+            pair_listener.accept(),
+            tokio::net::TcpStream::connect(pair_addr),
+        );
+        let (server_side, _) = accept_res.unwrap();
+        let mut client_side = connect_res.unwrap();
+
+        let ca = Arc::new(CertificateAuthority::new().unwrap());
+        let config = MitmConfig {
+            policy: Arc::new(crate::policy::AllowAll),
+            connector: Arc::new(crate::connector::DirectConnector),
+            ca,
+            upstream_port,
+            network_policy: None,
+            block_log: crate::block_log::BlockLogger::disabled(),
+        };
+
+        let hello = b"CLIENTHELLO".to_vec();
+
+        // Drive splice and the client side concurrently: splice writes
+        // hello to upstream, upstream writes "UP", splice relays "UP"
+        // to client_side, upstream closes, splice tears down. Dropping
+        // our client handle then unblocks the other half of the copy.
+        let splice_done = tokio::spawn(async move {
+            let _ = splice_sni_cut_through(
+                server_side,
+                &hello,
+                "127.0.0.1",
+                None,
+                &config,
+            )
+            .await;
+        });
+
+        let mut resp = [0u8; 2];
+        client_side.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"UP");
+
+        // Close our side so copy_bidirectional can finish.
+        drop(client_side);
+
+        tokio::time::timeout(Duration::from_secs(2), splice_done)
+            .await
+            .expect("splice timed out")
+            .unwrap();
+
+        let received = upstream_task.await.unwrap();
+        assert_eq!(&received, b"CLIENTHELLO");
     }
 }

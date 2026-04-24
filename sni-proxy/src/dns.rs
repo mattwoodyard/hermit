@@ -10,6 +10,8 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::block_log::{BlockEvent, BlockKind, BlockLogger, now_unix_ms};
+use crate::dns_cache::DnsCache;
+use crate::dns_forwarder::{parse_answers, DnsForwarder};
 use crate::policy::{ConnectionPolicy, Verdict};
 
 // ---------------------------------------------------------------------------
@@ -20,6 +22,7 @@ const HEADER_LEN: usize = 12;
 const FLAG_QR: u16 = 0x8000; // Response
 const FLAG_AA: u16 = 0x0400; // Authoritative
 const FLAG_RD: u16 = 0x0100; // Recursion Desired (echo back)
+const RCODE_SERVFAIL: u16 = 2;
 const RCODE_REFUSED: u16 = 5;
 
 const TYPE_A: u16 = 1;
@@ -141,9 +144,20 @@ pub fn build_aaaa_response(query: &DnsQuery, ipv6: Ipv6Addr) -> Vec<u8> {
     build_response_with_rdata(query, TYPE_AAAA, &ipv6.octets())
 }
 
+/// Build a SERVFAIL response. Used when upstream forwarding fails —
+/// the client sees the same signal they'd get from a broken resolver
+/// rather than a lie.
+pub fn build_servfail(query: &DnsQuery) -> Vec<u8> {
+    build_rcode_response(query, RCODE_SERVFAIL)
+}
+
 /// Build a REFUSED response.
 pub fn build_refused(query: &DnsQuery) -> Vec<u8> {
-    let flags = FLAG_QR | FLAG_AA | (query.flags & FLAG_RD) | RCODE_REFUSED;
+    build_rcode_response(query, RCODE_REFUSED)
+}
+
+fn build_rcode_response(query: &DnsQuery, rcode: u16) -> Vec<u8> {
+    let flags = FLAG_QR | FLAG_AA | (query.flags & FLAG_RD) | rcode;
     let mut resp = Vec::with_capacity(HEADER_LEN + query.name_wire.len() + 4);
     // Header: id, flags, qdcount=1, ancount=0, nscount=0, arcount=0
     resp.extend_from_slice(&query.id.to_be_bytes());
@@ -209,12 +223,20 @@ fn build_response_with_rdata(query: &DnsQuery, rtype: u16, rdata: &[u8]) -> Vec<
 // Server
 // ---------------------------------------------------------------------------
 
-/// Configuration for the fake DNS server.
+/// Configuration for the hermit DNS server.
+///
+/// Two modes: with an [`DnsForwarder`] attached (the production mode)
+/// allowed queries are forwarded to a real resolver and the real
+/// answer is relayed back to the child; without a forwarder the
+/// server falls back to answering with fixed loopback IPs, which is
+/// what the unit tests use and matches legacy behavior.
 pub struct DnsServer<P> {
     policy: Arc<P>,
     ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
     block_log: BlockLogger,
+    upstream: Option<Arc<DnsForwarder>>,
+    cache: Option<Arc<DnsCache>>,
 }
 
 impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
@@ -224,16 +246,20 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
             ipv4: Ipv4Addr::LOCALHOST,
             ipv6: Ipv6Addr::LOCALHOST,
             block_log: BlockLogger::disabled(),
+            upstream: None,
+            cache: None,
         }
     }
 
-    /// Override the IPv4 address returned in A responses.
+    /// Override the IPv4 address returned in A responses. Only
+    /// meaningful in fallback mode (no forwarder).
     pub fn with_ipv4(mut self, ipv4: Ipv4Addr) -> Self {
         self.ipv4 = ipv4;
         self
     }
 
-    /// Override the IPv6 address returned in AAAA responses.
+    /// Override the IPv6 address returned in AAAA responses. Only
+    /// meaningful in fallback mode.
     pub fn with_ipv6(mut self, ipv6: Ipv6Addr) -> Self {
         self.ipv6 = ipv6;
         self
@@ -246,12 +272,28 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
         self
     }
 
+    /// Attach a real upstream resolver. When set, allowed queries are
+    /// forwarded to the upstream instead of being answered locally.
+    pub fn with_upstream(mut self, upstream: Arc<DnsForwarder>) -> Self {
+        self.upstream = Some(upstream);
+        self
+    }
+
+    /// Attach a shared [`DnsCache`] that will be populated with
+    /// A/AAAA answers forwarded through this server. Relays consult
+    /// the same cache to reverse-map a dst IP back to a hostname.
+    pub fn with_cache(mut self, cache: Arc<DnsCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
     /// Run the DNS server on the given socket until cancelled.
     ///
-    /// Takes `self: Arc<Self>` so response sends can be spawned off the
-    /// recv loop — a stalled `send_to` must not stall packet reception.
-    /// A semaphore caps outstanding send tasks so a clogged UDP send
-    /// buffer can't grow the task heap without bound.
+    /// Takes `self: Arc<Self>` so each packet's response work can be
+    /// spawned off the recv loop — forwarding to upstream is a
+    /// round-trip, so it must never stall reception. A semaphore
+    /// caps outstanding worker tasks so a clogged kernel buffer
+    /// can't grow the task heap without bound.
     pub async fn run(self: Arc<Self>, socket: UdpSocket) -> std::io::Result<()> {
         let local_addr = socket.local_addr()?;
         info!(%local_addr, "dns server listening");
@@ -261,30 +303,31 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
         let mut buf = [0u8; 512];
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
-            // `handle_packet` is cheap and synchronous — do it on the
-            // recv task. Only the send is spawned so a slow client can't
-            // back up reception.
-            if let Some(resp) = self.handle_packet(&buf[..len], src) {
-                // Try to acquire a send-slot without waiting. If all
-                // slots are held, drop the response rather than grow
-                // the queue further.
-                let Ok(permit) = Arc::clone(&send_limit).try_acquire_owned() else {
-                    debug!(%src, "dns: send limit reached, dropping response");
-                    continue;
-                };
-                let socket = Arc::clone(&socket);
-                tokio::spawn(async move {
-                    let _permit = permit;
+            let packet = buf[..len].to_vec();
+
+            let Ok(permit) = Arc::clone(&send_limit).try_acquire_owned() else {
+                debug!(%src, "dns: send limit reached, dropping packet");
+                continue;
+            };
+            let server = Arc::clone(&self);
+            let socket = Arc::clone(&socket);
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Some(resp) = server.handle_packet(&packet, src).await {
                     if let Err(e) = socket.send_to(&resp, src).await {
                         warn!(%src, error = %e, "dns: send_to failed");
                     }
-                });
-            }
+                }
+            });
         }
     }
 
-    /// Process a single DNS packet, returning the response bytes (or None to drop).
-    fn handle_packet(&self, buf: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
+    /// Process a single DNS packet, returning the response bytes (or
+    /// `None` to drop silently). When a real upstream is configured,
+    /// allowed queries are forwarded verbatim and the upstream's
+    /// answer is relayed back (with A/AAAA records tapped into the
+    /// shared [`DnsCache`]).
+    async fn handle_packet(&self, buf: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
         let query = match parse_query(buf) {
             Ok(q) => q,
             Err(e) => {
@@ -301,23 +344,7 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
         );
 
         match self.policy.check(&query.name) {
-            Verdict::Allow => {
-                let resp = match query.qtype {
-                    TYPE_A => {
-                        info!(%src, name = %query.name, ip = %self.ipv4, "dns: A -> allowed");
-                        build_a_response(&query, self.ipv4)
-                    }
-                    TYPE_AAAA => {
-                        info!(%src, name = %query.name, ip = %self.ipv6, "dns: AAAA -> allowed");
-                        build_aaaa_response(&query, self.ipv6)
-                    }
-                    _ => {
-                        debug!(%src, name = %query.name, qtype = query.qtype, "dns: unsupported qtype, empty response");
-                        build_empty(&query)
-                    }
-                };
-                Some(resp)
-            }
+            Verdict::Allow => self.answer_allowed(&query, buf, src).await,
             Verdict::Deny => {
                 debug!(%src, name = %query.name,
                     "hermit blocked: DNS query for {} (not in allowlist)", query.name);
@@ -332,6 +359,70 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
                 });
                 Some(build_refused(&query))
             }
+        }
+    }
+
+    /// Build an allowed-query response. Either forwards to the
+    /// configured upstream (production path) or, for tests/legacy,
+    /// synthesises a fixed-IP answer.
+    async fn answer_allowed(
+        &self,
+        query: &DnsQuery,
+        raw: &[u8],
+        src: SocketAddr,
+    ) -> Option<Vec<u8>> {
+        if let Some(upstream) = &self.upstream {
+            debug!(%src, name = %query.name, qtype = query.qtype,
+                upstream = %upstream.upstream(), "dns: forwarding allowed query upstream");
+            match upstream.forward(raw).await {
+                Ok(resp) => {
+                    // Populate the shared cache from whatever A/AAAA
+                    // records we can extract. Best-effort — even if
+                    // parsing fails the client still gets the real
+                    // answer and later relay reverse-lookups simply
+                    // deny the (uncached) IP.
+                    if let Some(cache) = &self.cache {
+                        let answers = parse_answers(&resp);
+                        let count = answers.len();
+                        for ans in answers {
+                            debug!(name = %query.name, ip = %ans.ip,
+                                ttl_secs = ans.ttl.as_secs(),
+                                "dns: caching answer");
+                            cache.insert(&query.name, ans.ip, ans.ttl);
+                        }
+                        if count == 0 {
+                            debug!(%src, name = %query.name,
+                                "dns: forwarded response had no A/AAAA records to cache");
+                        }
+                    }
+                    info!(%src, name = %query.name, qtype = query.qtype,
+                        response_bytes = resp.len(),
+                        "dns: forwarded allowed query");
+                    Some(resp)
+                }
+                Err(e) => {
+                    warn!(%src, name = %query.name, error = %e,
+                        "dns: upstream forward failed; answering SERVFAIL");
+                    Some(build_servfail(query))
+                }
+            }
+        } else {
+            let resp = match query.qtype {
+                TYPE_A => {
+                    info!(%src, name = %query.name, ip = %self.ipv4, "dns: A -> allowed (fallback)");
+                    build_a_response(query, self.ipv4)
+                }
+                TYPE_AAAA => {
+                    info!(%src, name = %query.name, ip = %self.ipv6, "dns: AAAA -> allowed (fallback)");
+                    build_aaaa_response(query, self.ipv6)
+                }
+                _ => {
+                    debug!(%src, name = %query.name, qtype = query.qtype,
+                        "dns: unsupported qtype, empty response");
+                    build_empty(query)
+                }
+            };
+            Some(resp)
         }
     }
 }
@@ -363,6 +454,7 @@ mod tests {
     use super::*;
     use crate::policy::{AllowAll, AllowList};
     use std::collections::HashSet;
+    use std::net::IpAddr;
 
     /// Build a minimal DNS query packet for an A record.
     fn make_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
@@ -479,14 +571,14 @@ mod tests {
         assert_eq!(ancount, 0);
     }
 
-    #[test]
-    fn server_allows_matching_host() {
+    #[tokio::test]
+    async fn server_allows_matching_host() {
         let policy = Arc::new(AllowList::new(["good.com".into()].into()));
         let server = DnsServer::new(policy);
         let pkt = make_query(1, "good.com", TYPE_A);
         let src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        let resp = server.handle_packet(&pkt, src).unwrap();
+        let resp = server.handle_packet(&pkt, src).await.unwrap();
         let ancount = u16::from_be_bytes([resp[6], resp[7]]);
         assert_eq!(ancount, 1);
         // Check rdata is 127.0.0.1
@@ -494,24 +586,24 @@ mod tests {
         assert_eq!(&resp[rdata_start..], &[127, 0, 0, 1]);
     }
 
-    #[test]
-    fn server_refuses_denied_host() {
+    #[tokio::test]
+    async fn server_refuses_denied_host() {
         let policy = Arc::new(AllowList::new(["good.com".into()].into()));
         let server = DnsServer::new(policy);
         let pkt = make_query(1, "evil.com", TYPE_A);
         let src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        let resp = server.handle_packet(&pkt, src).unwrap();
+        let resp = server.handle_packet(&pkt, src).await.unwrap();
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!(flags & 0x000F, RCODE_REFUSED);
     }
 
-    #[test]
-    fn server_drops_garbage() {
+    #[tokio::test]
+    async fn server_drops_garbage() {
         let policy = Arc::new(AllowAll);
         let server = DnsServer::new(policy);
         let src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        assert!(server.handle_packet(&[0; 3], src).is_none());
+        assert!(server.handle_packet(&[0; 3], src).await.is_none());
     }
 
     #[tokio::test]
@@ -581,6 +673,140 @@ mod tests {
         let resp = &buf[..len];
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!(flags & 0x000F, RCODE_REFUSED);
+
+        handle.abort();
+    }
+
+    /// Build a canned A-record answer for use as a mock upstream.
+    fn canned_a_response(txn_id_from: &[u8], qname: &str, ip: Ipv4Addr) -> Vec<u8> {
+        // Echo the incoming query's txn id so the client (our DNS
+        // server) accepts it.
+        let mut out = Vec::new();
+        out.extend_from_slice(&txn_id_from[..2]);
+        out.extend_from_slice(&0x8180u16.to_be_bytes()); // QR + RD + RA
+        out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+        out.extend_from_slice(&1u16.to_be_bytes()); // ancount
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        for label in qname.split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        out.extend_from_slice(&1u16.to_be_bytes()); // IN
+        out.extend_from_slice(&0xC00Cu16.to_be_bytes()); // name pointer
+        out.extend_from_slice(&1u16.to_be_bytes()); // type A
+        out.extend_from_slice(&1u16.to_be_bytes()); // IN
+        out.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        out.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+        out.extend_from_slice(&ip.octets());
+        out
+    }
+
+    #[tokio::test]
+    async fn server_forwards_to_upstream_and_populates_cache() {
+        // Spin up a mock upstream resolver that answers any query
+        // with 203.0.113.9.
+        let upstream_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut qbuf = [0u8; 512];
+            loop {
+                let (n, from) = match upstream_sock.recv_from(&mut qbuf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let resp = canned_a_response(
+                    &qbuf[..n],
+                    "svc.example",
+                    Ipv4Addr::new(203, 0, 113, 9),
+                );
+                let _ = upstream_sock.send_to(&resp, from).await;
+            }
+        });
+
+        let cache = Arc::new(crate::dns_cache::DnsCache::new());
+        let forwarder = Arc::new(crate::dns_forwarder::DnsForwarder::new(upstream_addr));
+        let policy = Arc::new(AllowList::new(["svc.example".into()].into()));
+        let server = Arc::new(
+            DnsServer::new(policy)
+                .with_upstream(forwarder)
+                .with_cache(Arc::clone(&cache)),
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let server_clone = Arc::clone(&server);
+        let handle = tokio::spawn(async move {
+            let _ = server_clone.run(socket).await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let query = make_query(0x4242, "svc.example", TYPE_A);
+        client.send_to(&query, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("client never received DNS response")
+        .unwrap();
+
+        // The upstream's real IP made it back to the child — not a
+        // loopback sinkhole.
+        assert_eq!(&buf[len - 4..len], &[203, 0, 113, 9]);
+
+        // And the cache now knows svc.example -> 203.0.113.9 so a
+        // later relay reverse-lookup will succeed.
+        let reversed = cache.reverse(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+        assert_eq!(reversed.as_deref(), Some("svc.example"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn server_returns_servfail_when_upstream_is_down() {
+        // Bind an upstream address, then immediately close it — the
+        // forwarder will hit recv() on a closed socket. The child
+        // must see SERVFAIL rather than hang.
+        let bound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = bound.local_addr().unwrap();
+        drop(bound);
+
+        // Also shrink the timeout path by using a resolver we know
+        // won't answer. Patch-via-ICMP-unreachable is flakey in CI
+        // sandboxes, so we rely on the 5s timeout instead — test is
+        // tagged to tolerate the wait.
+        let forwarder = Arc::new(crate::dns_forwarder::DnsForwarder::new(dead_addr));
+        let policy = Arc::new(AllowList::new(["anything.test".into()].into()));
+        let server = Arc::new(DnsServer::new(policy).with_upstream(forwarder));
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let server_clone = Arc::clone(&server);
+        let handle = tokio::spawn(async move {
+            let _ = server_clone.run(socket).await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let query = make_query(0x7777, "anything.test", TYPE_A);
+        client.send_to(&query, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("SERVFAIL response never arrived")
+        .unwrap();
+
+        let flags = u16::from_be_bytes([buf[2], buf[3]]);
+        assert_eq!(flags & 0x000F, RCODE_SERVFAIL);
+        let _ = len; // quiet the unused warning
 
         handle.abort();
     }

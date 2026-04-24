@@ -65,8 +65,21 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         match req.parse(&buf) {
             Ok(httparse::Status::Complete(head_len)) => {
                 let method = req.method.unwrap_or("").to_string();
-                let path = req.path.unwrap_or("/").to_string();
+                let raw_path = req.path.unwrap_or("/").to_string();
                 let version = req.version.unwrap_or(1);
+
+                // Proxy-aware clients (those honoring HTTP_PROXY) send the
+                // request line in absolute-form: `GET http://host/p HTTP/1.1`.
+                // RFC 7230 §5.3.2. For the rest of hermit — policy lookups,
+                // upstream forwarding — we want the origin-form (`/p`) with
+                // an authoritative Host header. Normalize here so downstream
+                // code never has to care about the two forms. CONNECT uses
+                // authority-form (`host:port`) and is left as-is.
+                let (path, authority_from_uri) = if method.eq_ignore_ascii_case("CONNECT") {
+                    (raw_path.clone(), None)
+                } else {
+                    split_absolute_form(&raw_path)
+                };
 
                 let mut content_length = None;
                 let mut chunked = false;
@@ -118,7 +131,19 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                     _ => has_close,
                 };
 
-                let head_bytes = buf[..head_len].to_vec();
+                // If we normalized an absolute-form request line, rebuild
+                // head_bytes so the bytes we forward upstream use the
+                // origin-form path. Also backfill a missing Host header
+                // from the URI's authority (per RFC 7230 §5.4, origin
+                // servers MUST reject 1.1 requests without Host).
+                let (head_bytes, host) = if let Some(authority) = authority_from_uri {
+                    let host = host.or_else(|| Some(authority.clone()));
+                    let rewritten =
+                        rewrite_absolute_form_head(&buf[..head_len], &raw_path, &path, &host)?;
+                    (rewritten, host)
+                } else {
+                    (buf[..head_len].to_vec(), host)
+                };
                 let leftover = buf[head_len..].to_vec();
 
                 return Ok(Some((
@@ -144,6 +169,95 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             Err(e) => bail!("HTTP parse error: {}", e),
         }
     }
+}
+
+/// If `target` is an absolute-form request-URI (`http://host/path?q`),
+/// return `(origin_path, Some(authority))`. Otherwise return
+/// `(target.to_string(), None)`. Per RFC 7230 §5.3.2 this form is what
+/// clients use when pointed at an HTTP proxy (e.g. `HTTP_PROXY` set).
+///
+/// Only `http://` is recognised — TLS never reaches this code path.
+/// A missing path component becomes `/` so downstream matching against
+/// `path_prefix = "/"` still works.
+fn split_absolute_form(target: &str) -> (String, Option<String>) {
+    let rest = match target.strip_prefix("http://") {
+        Some(r) => r,
+        None => return (target.to_string(), None),
+    };
+    // Authority runs up to the first '/', '?', or '#' — everything after
+    // that is the origin-form path. If none of those appear the whole
+    // remainder is the authority and the path defaults to "/".
+    let end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let authority = rest[..end].to_string();
+    let path = if end == rest.len() {
+        "/".to_string()
+    } else {
+        rest[end..].to_string()
+    };
+    (path, Some(authority))
+}
+
+/// Rebuild the head_bytes so the request line uses `new_path` instead of
+/// the original absolute-form URI. The rest of the headers (including any
+/// caller-provided Host) are preserved verbatim. If `host` is set and the
+/// original request had no Host header, one is inserted.
+///
+/// We do a targeted rewrite rather than serialising the whole request
+/// ourselves — the original header block may include extensions we don't
+/// know about and shouldn't drop (cookies, auth, trace, etc.).
+fn rewrite_absolute_form_head(
+    head: &[u8],
+    old_target: &str,
+    new_path: &str,
+    host: &Option<String>,
+) -> Result<Vec<u8>> {
+    // First line is "METHOD REQUEST-TARGET HTTP/x.y\r\n".
+    let line_end = head
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .context("request has no request-line terminator")?;
+    let request_line = std::str::from_utf8(&head[..line_end])
+        .context("non-utf8 request line")?;
+    let new_request_line = request_line.replacen(old_target, new_path, 1);
+
+    let mut out = Vec::with_capacity(head.len() + 64);
+    out.extend_from_slice(new_request_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    // Scan the remaining header block for an existing Host: header. If
+    // the client sent one it stays; otherwise synthesise from the URI
+    // authority. HTTP/1.1 origins MUST reject a missing Host so this
+    // matters for conformance, not just policy lookup.
+    let header_block = &head[line_end + 2..];
+    let mut has_host = false;
+    let mut i = 0;
+    while i < header_block.len() {
+        let line_end = header_block[i..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| i + p)
+            .unwrap_or(header_block.len());
+        let line = &header_block[i..line_end];
+        if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"host:") {
+            has_host = true;
+        }
+        i = line_end + 2;
+        if line.is_empty() {
+            break;
+        }
+    }
+
+    if !has_host {
+        if let Some(h) = host {
+            out.extend_from_slice(b"Host: ");
+            out.extend_from_slice(h.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(header_block);
+    Ok(out)
 }
 
 /// Extract the host portion of a `Host:`-header value, dropping any `:port`
@@ -589,6 +703,79 @@ mod tests {
         // Bare IPv6 in Host is malformed, but we shouldn't mangle it by
         // splitting at the first colon.
         assert_eq!(host_without_port("::1"), "::1");
+    }
+
+    #[test]
+    fn split_absolute_form_extracts_authority_and_path() {
+        let (path, auth) = split_absolute_form("http://example.com/foo?q=1");
+        assert_eq!(path, "/foo?q=1");
+        assert_eq!(auth.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn split_absolute_form_handles_port_in_authority() {
+        let (path, auth) = split_absolute_form("http://example.com:8080/bar");
+        assert_eq!(path, "/bar");
+        assert_eq!(auth.as_deref(), Some("example.com:8080"));
+    }
+
+    #[test]
+    fn split_absolute_form_defaults_missing_path_to_root() {
+        // `GET http://example.com HTTP/1.1` — no explicit path. The
+        // normalized origin-form must be `/`, not empty, or path_prefix
+        // matching breaks ("" never starts with "/").
+        let (path, auth) = split_absolute_form("http://example.com");
+        assert_eq!(path, "/");
+        assert_eq!(auth.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn split_absolute_form_leaves_origin_form_unchanged() {
+        let (path, auth) = split_absolute_form("/foo");
+        assert_eq!(path, "/foo");
+        assert!(auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_absolute_form_normalizes_to_origin_form() {
+        // Simulates a client with HTTP_PROXY set. The proxy must see
+        // `/foo` when it evaluates path_prefix rules and must forward
+        // `/foo` — not the absolute URI — to the upstream origin.
+        let data = b"GET http://example.com/foo HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut reader = &data[..];
+        let (req, _) = read_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(req.path, "/foo");
+        assert_eq!(req.host.as_deref(), Some("example.com"));
+        let head = std::str::from_utf8(&req.head_bytes).unwrap();
+        assert!(
+            head.starts_with("GET /foo HTTP/1.1\r\n"),
+            "rewritten request line must be origin-form: {head:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_absolute_form_backfills_missing_host_header() {
+        // Origin servers reject HTTP/1.1 requests without Host; if a
+        // proxy-aware client for some reason omits the header, we must
+        // synthesise one from the URI authority.
+        let data = b"GET http://example.com/ HTTP/1.1\r\n\r\n";
+        let mut reader = &data[..];
+        let (req, _) = read_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(req.host.as_deref(), Some("example.com"));
+        let head = std::str::from_utf8(&req.head_bytes).unwrap();
+        assert!(head.contains("\r\nHost: example.com\r\n"),
+            "rewrite must insert Host header: {head:?}");
+    }
+
+    #[tokio::test]
+    async fn parse_connect_keeps_authority_form_path() {
+        // CONNECT targets stay in authority-form — we intentionally do
+        // not apply the absolute-form rewrite here.
+        let data = b"CONNECT example.com:443 HTTP/1.1\r\n\r\n";
+        let mut reader = &data[..];
+        let (req, _) = read_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(req.method, "CONNECT");
+        assert_eq!(req.path, "example.com:443");
     }
 
     #[tokio::test]

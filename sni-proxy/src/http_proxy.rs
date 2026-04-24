@@ -110,6 +110,14 @@ where
             }
         };
 
+        // Proxy-aware clients send CONNECT when HTTPS_PROXY is set. We
+        // terminate the CONNECT here, splice to the named upstream, and
+        // return — the client then speaks TLS straight to the origin
+        // through the tunnel. No HTTP inspection past this point.
+        if request.method.eq_ignore_ascii_case("CONNECT") {
+            return handle_connect(client, client_addr, request, config).await;
+        }
+
         let hostname = match &request.host {
             Some(h) => http::host_without_port(h).to_string(),
             None => {
@@ -230,6 +238,110 @@ where
     }
 }
 
+/// Handle a CONNECT tunnel request. Arrives when a client has
+/// `HTTPS_PROXY=http://127.0.0.1:<our-port>` set — the client opens a
+/// TCP session to us and asks us to splice bytes to `host:port`.
+///
+/// We only inspect the target host against hostname-level policy; once
+/// the tunnel is open the payload is (by design) opaque TLS. Deeper
+/// filtering must route through the MITM proxy instead.
+async fn handle_connect<P, C>(
+    mut client: TcpStream,
+    client_addr: SocketAddr,
+    request: http::Request,
+    config: &HttpProxyConfig<P, C>,
+) -> Result<()>
+where
+    P: RequestPolicy,
+    C: UpstreamConnector,
+{
+    let (host, port) = match parse_connect_target(&request.path) {
+        Some(v) => v,
+        None => {
+            debug!(%client_addr, target = %request.path, "http: malformed CONNECT target");
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return Ok(());
+        }
+    };
+
+    debug!(%client_addr, %host, %port, "http: CONNECT");
+
+    if config.policy.check(&host) == Verdict::Deny {
+        debug!(%client_addr, %host, "hermit blocked: CONNECT to {}:{}", host, port);
+        config.block_log.log(BlockEvent {
+            time_unix_ms: now_unix_ms(),
+            kind: BlockKind::Http,
+            client: Some(client_addr.to_string()),
+            hostname: Some(host.clone()),
+            method: Some("CONNECT".to_string()),
+            path: Some(request.path.clone()),
+            reason: Some("blocked by access rules".to_string()),
+        });
+        // 403 over a CONNECT attempt is what curl/requests expect — the
+        // tunnel is never established and the client surfaces a clear
+        // "proxy rejected" error rather than a confusing TCP reset.
+        let _ = client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .await;
+        return Ok(());
+    }
+
+    let mut upstream = match timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        config.connector.connect(&host, port, None),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            warn!(%host, port, error = %e, "http: CONNECT upstream failed");
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await;
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(%host, port, "http: CONNECT upstream timed out");
+            let _ = client
+                .write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+                .await;
+            return Ok(());
+        }
+    };
+
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .context("writing CONNECT 200")?;
+
+    // Splice bidirectionally. copy_bidirectional returns when either
+    // side closes, which is the expected termination for a tunnel.
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    Ok(())
+}
+
+/// Parse the `host:port` authority-form target from a CONNECT request
+/// line. Accepts bracketed IPv6 (`[::1]:443`) and bare IPv4/hostname.
+/// Returns `None` on any structural issue so the caller can surface a
+/// 400 rather than panicking.
+fn parse_connect_target(target: &str) -> Option<(String, u16)> {
+    // CONNECT must always carry an explicit port (RFC 7230 §5.3.3).
+    // A bracketed IPv6 authority puts the port *after* the ']'.
+    if let Some(rest) = target.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let port_part = rest[end + 1..].strip_prefix(':')?;
+        let port = port_part.parse().ok()?;
+        return Some((host.to_string(), port));
+    }
+    let (host, port) = target.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port = port.parse().ok()?;
+    Some((host.to_string(), port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +368,52 @@ mod tests {
             block_log: crate::block_log::BlockLogger::disabled(),
         };
         assert_eq!(config.upstream_port, 80);
+    }
+
+    #[test]
+    fn connect_target_parses_host_port() {
+        assert_eq!(
+            parse_connect_target("example.com:443"),
+            Some(("example.com".to_string(), 443))
+        );
+    }
+
+    #[test]
+    fn connect_target_parses_ipv4() {
+        assert_eq!(
+            parse_connect_target("10.0.0.1:8443"),
+            Some(("10.0.0.1".to_string(), 8443))
+        );
+    }
+
+    #[test]
+    fn connect_target_parses_ipv6() {
+        assert_eq!(
+            parse_connect_target("[::1]:443"),
+            Some(("::1".to_string(), 443))
+        );
+    }
+
+    #[test]
+    fn connect_target_rejects_missing_port() {
+        // CONNECT authorities must carry a port. Tolerating a bare
+        // hostname here would let a proxy-unaware client tunnel to an
+        // ambiguous destination.
+        assert_eq!(parse_connect_target("example.com"), None);
+    }
+
+    #[test]
+    fn connect_target_rejects_empty_host() {
+        assert_eq!(parse_connect_target(":443"), None);
+    }
+
+    #[test]
+    fn connect_target_rejects_non_numeric_port() {
+        assert_eq!(parse_connect_target("example.com:abc"), None);
+    }
+
+    #[test]
+    fn connect_target_rejects_unterminated_ipv6() {
+        assert_eq!(parse_connect_target("[::1:443"), None);
     }
 }

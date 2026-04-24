@@ -71,6 +71,64 @@ impl std::error::Error for ParseMethodError {}
 // AccessRule — a single allow rule
 // ---------------------------------------------------------------------------
 
+/// How a matched rule is actually enforced on the wire.
+///
+/// - `Mitm`: terminate TLS with the hermit CA, fully parse HTTP, apply
+///   `path_prefix` / `methods`, optionally inject credentials. This is
+///   the default and the only mechanism that supports L7 filtering.
+/// - `Sni`: a "cut-through" splice — we read the TLS ClientHello, look
+///   up the hostname against policy, and from there on shuttle bytes
+///   bidirectionally without inspecting them. Incompatible with
+///   `path_prefix`, `methods`, and credential injection (we never see
+///   the plaintext). Use for hostnames whose transport must remain
+///   unmodified (e.g. certificate-pinning clients).
+/// - `Bypass { protocol, port }`: plain relay for non-HTTP protocols
+///   (Kerberos UDP, LDAP, SSH, ...). The bypass relay listens on a
+///   dedicated port, SO_ORIGINAL_DST / IP_RECVORIGDSTADDR gives us the
+///   real destination, the DNS cache maps that back to a hostname for
+///   the policy check, and we splice bytes. No interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mechanism {
+    /// Full MITM with plaintext inspection.
+    #[default]
+    Mitm,
+    /// SNI-only cut-through proxy; no plaintext inspection.
+    Sni,
+    /// Transparent relay on the given (protocol, port). Decisions
+    /// happen on hostname — the port identifies which listener this
+    /// rule is served from.
+    Bypass {
+        protocol: BypassProtocol,
+        port: u16,
+    },
+}
+
+/// L4 protocol for a `Bypass` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BypassProtocol {
+    Tcp,
+    Udp,
+}
+
+impl fmt::Display for BypassProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BypassProtocol::Tcp => write!(f, "tcp"),
+            BypassProtocol::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+impl fmt::Display for Mechanism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Mechanism::Mitm => write!(f, "mitm"),
+            Mechanism::Sni => write!(f, "sni"),
+            Mechanism::Bypass { protocol, port } => write!(f, "bypass({protocol}/{port})"),
+        }
+    }
+}
+
 /// A single access rule. Hostname is always required.
 /// Path prefix and methods are optional narrowing filters.
 #[derive(Debug, Clone)]
@@ -81,15 +139,18 @@ pub struct AccessRule {
     pub path_prefix: Option<String>,
     /// Optional method restriction. `None` = any method.
     pub methods: Option<HashSet<HttpMethod>>,
+    /// How this rule is enforced at connection time. See [`Mechanism`].
+    pub mechanism: Mechanism,
 }
 
 impl AccessRule {
-    /// Create a hostname-only rule (allows any path and method).
+    /// Create a hostname-only rule (allows any path and method, MITM).
     pub fn host_only(hostname: impl Into<String>) -> Self {
         Self {
             hostname: hostname.into().to_ascii_lowercase(),
             path_prefix: None,
             methods: None,
+            mechanism: Mechanism::Mitm,
         }
     }
 
@@ -196,6 +257,7 @@ impl FromStr for AccessRule {
             hostname: hostname.to_ascii_lowercase(),
             path_prefix,
             methods,
+            mechanism: Mechanism::default(),
         })
     }
 }
@@ -208,6 +270,14 @@ impl FromStr for AccessRule {
 /// Used by DNS and initial TLS accept (where only hostname is known).
 pub trait ConnectionPolicy: Send + Sync {
     fn check(&self, hostname: &str) -> Verdict;
+
+    /// Which enforcement mechanism should be used for this hostname.
+    /// Defaults to [`Mechanism::Mitm`] so existing policies that don't
+    /// know about mechanisms behave as before; [`RuleSet`] overrides
+    /// this to consult its per-rule mechanism field.
+    fn mechanism(&self, _hostname: &str) -> Mechanism {
+        Mechanism::Mitm
+    }
 }
 
 /// Request-level policy: checks hostname, path, and method.
@@ -217,16 +287,44 @@ pub trait RequestPolicy: ConnectionPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// IpRule — allowlist entry keyed by a literal IP instead of a hostname.
+// ---------------------------------------------------------------------------
+
+/// Bypass-only allowlist entry keyed by a literal IP. The MITM and
+/// SNI mechanisms fundamentally operate on hostnames (SNI lookup on
+/// TLS, etc.) so they can't be expressed as IP rules — parsing
+/// rejects the combination.
+///
+/// The motivating case is services the sandbox reaches by IP rather
+/// than via DNS: internal test fixtures, a pinned upstream given as
+/// an address, or a KDC behind a round-robin where hermit's DNS
+/// cache never sees the final IP.
+#[derive(Debug, Clone)]
+pub struct IpRule {
+    pub ip: std::net::IpAddr,
+    /// Always a `Bypass` variant after validation.
+    pub mechanism: Mechanism,
+}
+
+// ---------------------------------------------------------------------------
 // RuleSet — the main policy implementation
 // ---------------------------------------------------------------------------
 
-/// Policy built from a list of [`AccessRule`]s.
+/// Policy built from a list of [`AccessRule`]s (hostname-keyed) and,
+/// optionally, [`IpRule`]s (literal-IP-keyed).
 ///
-/// - `check` (hostname-only): allows if *any* rule matches the hostname.
-/// - `check_request`: allows if *any* rule matches hostname + path + method.
+/// - `check` (hostname-only): allows if *any* host rule matches.
+/// - `check_request`: allows if *any* host rule matches hostname +
+///   path + method.
+/// - `is_bypass_allowed` / `is_bypass_allowed_by_ip`: the bypass
+///   relays' gate, consulted after `SO_ORIGINAL_DST` / the DNS
+///   cache produces either a hostname or a bare IP.
 pub struct RuleSet {
-    /// Rules grouped by lowercase hostname for fast lookup.
+    /// Host rules grouped by lowercase hostname for O(1) lookup.
     by_host: HashMap<String, Vec<AccessRule>>,
+    /// IP rules grouped by literal IP. Only populated when the
+    /// config declares `ip = "…"` rules.
+    by_ip: HashMap<std::net::IpAddr, Vec<IpRule>>,
 }
 
 impl RuleSet {
@@ -238,7 +336,136 @@ impl RuleSet {
                 .or_default()
                 .push(rule);
         }
-        Self { by_host }
+        Self {
+            by_host,
+            by_ip: HashMap::new(),
+        }
+    }
+
+    /// Builder-style extension: attach literal-IP rules. Kept as a
+    /// separate call so the common hostname-only case remains the
+    /// one-liner it was before IP rules existed.
+    pub fn with_ip_rules(mut self, rules: Vec<IpRule>) -> Self {
+        for rule in rules {
+            self.by_ip.entry(rule.ip).or_default().push(rule);
+        }
+        self
+    }
+
+    /// Pick the enforcement mechanism for a TLS connection that
+    /// arrived at the MITM listener.
+    ///
+    /// Bypass rules do not compete for this listener — they get their
+    /// own ports — so they are skipped here. Among Mitm and Sni:
+    ///
+    /// - If *any* matching rule requests [`Mechanism::Mitm`], we MITM.
+    ///   A single Mitm rule beats any number of Sni rules because the
+    ///   Mitm rule's path/method narrowing can only be enforced with
+    ///   plaintext visibility; falling through to Sni would silently
+    ///   widen the allowlist.
+    /// - Otherwise, if any rule matches and is [`Mechanism::Sni`], we
+    ///   splice.
+    /// - If no MITM/SNI rule matches, return `None`; the caller
+    ///   interprets that as "this hostname is not served by the MITM
+    ///   listener" and denies.
+    pub fn mechanism_for(&self, hostname: &str) -> Option<Mechanism> {
+        let key = hostname.to_ascii_lowercase();
+        let rules = self.by_host.get(&key)?;
+        let mut saw_sni = false;
+        for r in rules {
+            if !r.matches_host(hostname) {
+                continue;
+            }
+            match r.mechanism {
+                Mechanism::Mitm => return Some(Mechanism::Mitm),
+                Mechanism::Sni => saw_sni = true,
+                Mechanism::Bypass { .. } => {} // handled by the bypass relays
+            }
+        }
+        if saw_sni {
+            Some(Mechanism::Sni)
+        } else {
+            None
+        }
+    }
+
+    /// Does `hostname` have a bypass rule for this exact
+    /// `(protocol, port)`? Called by the bypass relay once
+    /// `SO_ORIGINAL_DST` + the DNS cache reverse-map have
+    /// produced a hostname. Distinct-protocol and distinct-port
+    /// rules intentionally don't match — the whole point is that
+    /// each relay listens on exactly one (proto, port).
+    pub fn is_bypass_allowed(
+        &self,
+        hostname: &str,
+        protocol: BypassProtocol,
+        port: u16,
+    ) -> bool {
+        let key = hostname.to_ascii_lowercase();
+        let Some(rules) = self.by_host.get(&key) else {
+            tracing::trace!(host = %key, ?protocol, port,
+                "policy: is_bypass_allowed — host not in ruleset");
+            return false;
+        };
+        let allowed = rules
+            .iter()
+            .filter(|r| r.matches_host(hostname))
+            .any(|r| matches!(r.mechanism, Mechanism::Bypass { protocol: p, port: po }
+                if p == protocol && po == port));
+        tracing::trace!(host = %key, ?protocol, port, candidate_rules = rules.len(), allowed,
+            "policy: is_bypass_allowed");
+        allowed
+    }
+
+    /// Counterpart to [`is_bypass_allowed`] for the literal-IP
+    /// path. The bypass relays fall through to this when
+    /// `DnsCache::reverse` can't map the dst back to a name — the
+    /// child is trying to reach a raw IP, and we only allow that
+    /// when it was declared as an `ip = "…"` rule.
+    pub fn is_bypass_allowed_by_ip(
+        &self,
+        ip: std::net::IpAddr,
+        protocol: BypassProtocol,
+        port: u16,
+    ) -> bool {
+        let Some(rules) = self.by_ip.get(&ip) else {
+            tracing::trace!(%ip, ?protocol, port,
+                "policy: is_bypass_allowed_by_ip — ip not in ruleset");
+            return false;
+        };
+        let allowed = rules
+            .iter()
+            .any(|r| matches!(r.mechanism, Mechanism::Bypass { protocol: p, port: po }
+                if p == protocol && po == port));
+        tracing::trace!(%ip, ?protocol, port, candidate_rules = rules.len(), allowed,
+            "policy: is_bypass_allowed_by_ip");
+        allowed
+    }
+
+    /// Distinct `(protocol, port)` pairs touched by any bypass rule
+    /// — hostname- or IP-keyed. Used by the runtime to decide
+    /// which bypass listeners + nft redirects to set up. IP-only
+    /// endpoints still need their own listener and DNAT rule, so
+    /// they must be included here.
+    pub fn bypass_endpoints(&self) -> Vec<(BypassProtocol, u16)> {
+        let mut set = std::collections::HashSet::new();
+        for rules in self.by_host.values() {
+            for r in rules {
+                if let Mechanism::Bypass { protocol, port } = r.mechanism {
+                    set.insert((protocol, port));
+                }
+            }
+        }
+        for rules in self.by_ip.values() {
+            for r in rules {
+                if let Mechanism::Bypass { protocol, port } = r.mechanism {
+                    set.insert((protocol, port));
+                }
+            }
+        }
+        let mut v: Vec<_> = set.into_iter().collect();
+        v.sort(); // deterministic order for tests + log output
+        v
     }
 }
 
@@ -249,6 +476,14 @@ impl ConnectionPolicy for RuleSet {
             Some(rules) if rules.iter().any(|r| r.matches_host(hostname)) => Verdict::Allow,
             _ => Verdict::Deny,
         }
+    }
+
+    fn mechanism(&self, hostname: &str) -> Mechanism {
+        // An unknown host will be denied by `check`; the mechanism
+        // response for it doesn't route any real traffic, so we just
+        // fall back to the default rather than complicating the
+        // signature with a fallible return.
+        self.mechanism_for(hostname).unwrap_or_default()
     }
 }
 
@@ -540,6 +775,189 @@ mod tests {
         assert_eq!(
             policy.check_request("any.com", "/path", "POST"),
             Verdict::Allow
+        );
+    }
+
+    // --- Mechanism dispatch ---
+
+    fn rule_with_mech(host: &str, mechanism: Mechanism) -> AccessRule {
+        AccessRule {
+            hostname: host.to_string(),
+            path_prefix: None,
+            methods: None,
+            mechanism,
+        }
+    }
+
+    #[test]
+    fn mechanism_default_is_mitm() {
+        let r: AccessRule = "host.example".parse().unwrap();
+        assert_eq!(r.mechanism, Mechanism::Mitm);
+    }
+
+    #[test]
+    fn mechanism_for_unknown_host_is_none() {
+        let rs = RuleSet::new(vec![rule_with_mech("ok.example", Mechanism::Mitm)]);
+        assert!(rs.mechanism_for("other.example").is_none());
+    }
+
+    #[test]
+    fn mechanism_for_mitm_rule() {
+        let rs = RuleSet::new(vec![rule_with_mech("ok.example", Mechanism::Mitm)]);
+        assert_eq!(rs.mechanism_for("ok.example"), Some(Mechanism::Mitm));
+    }
+
+    #[test]
+    fn mechanism_for_sni_rule() {
+        let rs = RuleSet::new(vec![rule_with_mech("pinned.example", Mechanism::Sni)]);
+        assert_eq!(rs.mechanism_for("pinned.example"), Some(Mechanism::Sni));
+    }
+
+    #[test]
+    fn mechanism_mitm_wins_when_rules_conflict() {
+        // A hostname with both a Mitm rule (say, /api/ path_prefix) and
+        // a Sni rule (catch-all) must resolve to Mitm. Otherwise a
+        // Sni-wins rule would silently widen the allowlist by bypassing
+        // the path/method check the Mitm rule encoded.
+        let rs = RuleSet::new(vec![
+            rule_with_mech("dual.example", Mechanism::Sni),
+            rule_with_mech("dual.example", Mechanism::Mitm),
+        ]);
+        assert_eq!(rs.mechanism_for("dual.example"), Some(Mechanism::Mitm));
+    }
+
+    #[test]
+    fn mechanism_lookup_is_case_insensitive() {
+        let rs = RuleSet::new(vec![rule_with_mech("Mixed.Example", Mechanism::Sni)]);
+        assert_eq!(rs.mechanism_for("mixed.example"), Some(Mechanism::Sni));
+        assert_eq!(rs.mechanism_for("MIXED.EXAMPLE"), Some(Mechanism::Sni));
+    }
+
+    // --- Bypass ---
+
+    fn bypass_rule(host: &str, protocol: BypassProtocol, port: u16) -> AccessRule {
+        AccessRule {
+            hostname: host.to_string(),
+            path_prefix: None,
+            methods: None,
+            mechanism: Mechanism::Bypass { protocol, port },
+        }
+    }
+
+    #[test]
+    fn is_bypass_allowed_happy_path() {
+        let rs = RuleSet::new(vec![bypass_rule("kdc.example", BypassProtocol::Udp, 88)]);
+        assert!(rs.is_bypass_allowed("kdc.example", BypassProtocol::Udp, 88));
+    }
+
+    #[test]
+    fn is_bypass_allowed_rejects_wrong_protocol() {
+        // UDP rule must not authorize a TCP listener even on the
+        // matching port — they're different wires.
+        let rs = RuleSet::new(vec![bypass_rule("kdc.example", BypassProtocol::Udp, 88)]);
+        assert!(!rs.is_bypass_allowed("kdc.example", BypassProtocol::Tcp, 88));
+    }
+
+    #[test]
+    fn is_bypass_allowed_rejects_wrong_port() {
+        let rs = RuleSet::new(vec![bypass_rule("kdc.example", BypassProtocol::Udp, 88)]);
+        assert!(!rs.is_bypass_allowed("kdc.example", BypassProtocol::Udp, 99));
+    }
+
+    #[test]
+    fn is_bypass_allowed_rejects_wrong_host() {
+        let rs = RuleSet::new(vec![bypass_rule("kdc.example", BypassProtocol::Udp, 88)]);
+        assert!(!rs.is_bypass_allowed("other.example", BypassProtocol::Udp, 88));
+    }
+
+    #[test]
+    fn is_bypass_allowed_is_case_insensitive() {
+        let rs = RuleSet::new(vec![bypass_rule("KDC.Example", BypassProtocol::Udp, 88)]);
+        assert!(rs.is_bypass_allowed("kdc.example", BypassProtocol::Udp, 88));
+    }
+
+    #[test]
+    fn bypass_rules_do_not_influence_mechanism_for() {
+        // A bypass-only host must not surface as Mitm/Sni to the
+        // TLS dispatch — the mechanism_for result is what the MITM
+        // listener consults, and bypass belongs to a different
+        // listener entirely.
+        let rs = RuleSet::new(vec![bypass_rule("kdc.example", BypassProtocol::Udp, 88)]);
+        assert_eq!(rs.mechanism_for("kdc.example"), None);
+    }
+
+    #[test]
+    fn is_bypass_allowed_by_ip_happy_path() {
+        let rs = RuleSet::new(vec![]).with_ip_rules(vec![IpRule {
+            ip: "10.0.0.5".parse().unwrap(),
+            mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
+        }]);
+        assert!(rs.is_bypass_allowed_by_ip(
+            "10.0.0.5".parse().unwrap(),
+            BypassProtocol::Udp,
+            88,
+        ));
+    }
+
+    #[test]
+    fn is_bypass_allowed_by_ip_rejects_wrong_proto_port() {
+        let rs = RuleSet::new(vec![]).with_ip_rules(vec![IpRule {
+            ip: "10.0.0.5".parse().unwrap(),
+            mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
+        }]);
+        assert!(!rs.is_bypass_allowed_by_ip(
+            "10.0.0.5".parse().unwrap(),
+            BypassProtocol::Tcp,
+            88,
+        ));
+        assert!(!rs.is_bypass_allowed_by_ip(
+            "10.0.0.5".parse().unwrap(),
+            BypassProtocol::Udp,
+            99,
+        ));
+    }
+
+    #[test]
+    fn is_bypass_allowed_by_ip_unknown_ip_is_denied() {
+        let rs = RuleSet::new(vec![]).with_ip_rules(vec![IpRule {
+            ip: "10.0.0.5".parse().unwrap(),
+            mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
+        }]);
+        assert!(!rs.is_bypass_allowed_by_ip(
+            "10.0.0.99".parse().unwrap(),
+            BypassProtocol::Udp,
+            88,
+        ));
+    }
+
+    #[test]
+    fn bypass_endpoints_includes_ip_keyed_rules() {
+        // An ip-only rule still needs its own listener + DNAT
+        // entry, so it must show up in `bypass_endpoints`.
+        let rs = RuleSet::new(vec![]).with_ip_rules(vec![IpRule {
+            ip: "10.0.0.5".parse().unwrap(),
+            mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 389 },
+        }]);
+        assert_eq!(
+            rs.bypass_endpoints(),
+            vec![(BypassProtocol::Tcp, 389)]
+        );
+    }
+
+    #[test]
+    fn bypass_endpoints_deduplicates() {
+        let rs = RuleSet::new(vec![
+            bypass_rule("a.example", BypassProtocol::Udp, 88),
+            bypass_rule("b.example", BypassProtocol::Udp, 88), // same endpoint, different host
+            bypass_rule("a.example", BypassProtocol::Tcp, 389),
+        ]);
+        let got = rs.bypass_endpoints();
+        assert_eq!(
+            got,
+            vec![
+                (BypassProtocol::Tcp, 389),
+                (BypassProtocol::Udp, 88),
+            ]
         );
     }
 }

@@ -262,3 +262,103 @@ async fn disabled_logger_writes_nothing_even_on_block() {
     // logger).
     assert!(String::from_utf8_lossy(&sink).starts_with("HTTP/1.1 403"));
 }
+
+#[tokio::test]
+async fn http_proxy_connect_tunnel_splices_bytes() {
+    // Exercises the CONNECT path that HTTPS_PROXY-aware clients use.
+    // We stand up a bogus "origin" TCP server, let the proxy tunnel
+    // to it, and assert bytes flow in both directions. No real TLS —
+    // CONNECT splices raw bytes.
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+
+    // The origin echoes whatever it receives (single read/write is
+    // enough for a regression-catching signal).
+    tokio::spawn(async move {
+        let (mut s, _) = origin.accept().await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = s.read(&mut buf).await.unwrap();
+        s.write_all(&buf[..n]).await.unwrap();
+    });
+
+    let rules = vec![AccessRule::host_only("127.0.0.1")];
+    let config = Arc::new(HttpProxyConfig {
+        policy: Arc::new(RuleSet::new(rules)),
+        connector: Arc::new(DirectConnector),
+        upstream_port: 80,
+        block_log: BlockLogger::disabled(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = http_proxy::run(listener, config).await;
+    });
+
+    let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        origin_addr.port()
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    // Read the "200 Connection Established" status line + headers.
+    let mut status = [0u8; 64];
+    let n = client.read(&mut status).await.unwrap();
+    let status = std::str::from_utf8(&status[..n]).unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {status:?}"
+    );
+
+    client.write_all(b"ping!").await.unwrap();
+    let mut echo = [0u8; 5];
+    tokio::time::timeout(std::time::Duration::from_secs(2),
+        client.read_exact(&mut echo)).await.unwrap().unwrap();
+    assert_eq!(&echo, b"ping!");
+}
+
+#[tokio::test]
+async fn http_proxy_connect_denied_writes_block_event_and_403() {
+    let log_file = NamedTempFile::new().unwrap();
+    let block_log = BlockLogger::to_file(log_file.path()).await.unwrap();
+
+    // Rule allows only "allowed.example"; CONNECT to blocked.example
+    // must be denied *before* we try to open any upstream socket.
+    let rules = vec![AccessRule::host_only("allowed.example")];
+    let config = Arc::new(HttpProxyConfig {
+        policy: Arc::new(RuleSet::new(rules)),
+        connector: Arc::new(DirectConnector),
+        upstream_port: 80,
+        block_log,
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = http_proxy::run(listener, config).await;
+    });
+
+    let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut response),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"),
+        "expected 403, got: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let events = read_events(log_file.path()).await;
+    assert_eq!(events.len(), 1, "expected one block event, got: {events:?}");
+    assert_eq!(events[0]["type"], "http");
+    assert_eq!(events[0]["method"], "CONNECT");
+    assert_eq!(events[0]["hostname"], "blocked.example");
+}

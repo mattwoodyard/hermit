@@ -66,7 +66,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sni_proxy::credential::Credential;
 use sni_proxy::network_policy::{MatchRuleSpec, NetworkPolicy};
-use sni_proxy::policy::{AccessRule, HttpMethod};
+use sni_proxy::policy::{AccessRule, HttpMethod, IpRule};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -95,6 +95,11 @@ pub struct Config {
 
     #[serde(default, rename = "access_rule")]
     pub access_rules: Vec<AccessRuleSpec>,
+
+    /// `[dns]` section — upstream resolver configuration. Absent
+    /// means use the built-in default (Cloudflare's 1.1.1.1:53).
+    #[serde(default)]
+    pub dns: DnsConfig,
 
     /// Additional TCP ports (beyond the built-in 80/443) that the
     /// sandbox redirects into the proxy. Each entry picks which proxy
@@ -129,6 +134,43 @@ impl Config {
     /// config (or its includes) never specified one.
     pub fn sandbox(&self) -> SandboxConfig {
         self.sandbox_override.clone().unwrap_or_default()
+    }
+}
+
+/// `[dns]` section — controls where hermit's in-namespace DNS
+/// forwards allowed queries. Omitting the section entirely keeps the
+/// default upstream (Cloudflare public resolver); setting `upstream`
+/// points at an alternative.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsConfig {
+    /// `ip:port` of the resolver to forward allowed queries to.
+    /// Defaults to `1.1.1.1:53`. Must parse as a `SocketAddr`.
+    #[serde(default = "default_dns_upstream")]
+    pub upstream: String,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            upstream: default_dns_upstream(),
+        }
+    }
+}
+
+fn default_dns_upstream() -> String {
+    "1.1.1.1:53".to_string()
+}
+
+impl DnsConfig {
+    /// Parse `upstream` into a `SocketAddr`. Returns an error with
+    /// context when the string is malformed so the failure surface
+    /// is "hermit refuses to start with a bad config" rather than a
+    /// runtime panic on the first allowed DNS query.
+    pub fn upstream_addr(&self) -> Result<std::net::SocketAddr> {
+        self.upstream
+            .parse()
+            .with_context(|| format!("invalid dns.upstream {:?}", self.upstream))
     }
 }
 
@@ -178,15 +220,82 @@ pub enum HomeFileAction {
     Read,
 }
 
-/// `[[access_rule]]` entry — hostname plus optional path prefix / methods.
+/// `[[access_rule]]` entry — hostname plus optional path prefix /
+/// methods / enforcement mechanism.
+///
+/// Either `host` or `ip` must be set (but not both): `host` is the
+/// common case, `ip` is a bypass-only literal-IP entry for services
+/// the sandbox reaches without a DNS query we control.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessRuleSpec {
-    pub host: String,
+    /// Hostname this rule covers. Mutually exclusive with `ip`.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Literal IP address this rule covers (bypass rules only).
+    /// Mutually exclusive with `host`.
+    #[serde(default)]
+    pub ip: Option<std::net::IpAddr>,
     #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub methods: Option<Vec<String>>,
+    /// How this rule is enforced: `mitm` (default), `sni`, or
+    /// `bypass`.
+    ///
+    /// `sni` rules are cut-through: we look up the TLS SNI, match
+    /// against policy, and from there splice bytes without inspecting
+    /// them. `path_prefix`, `methods`, and credential injection cannot
+    /// be honored on an `sni` rule.
+    ///
+    /// `bypass` rules are plain-relay: the bypass listener on
+    /// `(protocol, port)` accepts child traffic, `SO_ORIGINAL_DST` /
+    /// `IP_RECVORIGDSTADDR` yields the real destination, the DNS
+    /// cache reverse-maps the IP back to a hostname for policy, and
+    /// bytes are spliced. Requires `protocol` + `port`; rejects
+    /// `path_prefix` + `methods` (no plaintext visibility).
+    #[serde(default)]
+    pub mechanism: AccessMechanismSpec,
+
+    /// For `mechanism = "bypass"`: which L4 protocol. Required.
+    #[serde(default)]
+    pub protocol: Option<BypassProtocolSpec>,
+
+    /// For `mechanism = "bypass"`: which TCP/UDP port to relay.
+    /// Required. Values 80 and 443 are reserved for the MITM/HTTP
+    /// listeners and rejected.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+/// TOML surface for [`sni_proxy::policy::Mechanism`]. Kept separate
+/// from the policy enum so we can evolve the user-facing string names
+/// (e.g. alias `sni-passthrough` → `Sni`) without changing the
+/// library type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessMechanismSpec {
+    #[default]
+    Mitm,
+    Sni,
+    Bypass,
+}
+
+/// TOML surface for [`sni_proxy::policy::BypassProtocol`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BypassProtocolSpec {
+    Tcp,
+    Udp,
+}
+
+impl BypassProtocolSpec {
+    pub fn to_policy(self) -> sni_proxy::policy::BypassProtocol {
+        match self {
+            BypassProtocolSpec::Tcp => sni_proxy::policy::BypassProtocol::Tcp,
+            BypassProtocolSpec::Udp => sni_proxy::policy::BypassProtocol::Udp,
+        }
+    }
 }
 
 /// `[[port_forward]]` entry — an extra sandboxed TCP port that the
@@ -317,34 +426,32 @@ impl Config {
             .collect()
     }
 
-    /// Adapt `[[access_rule]]` entries into sni-proxy's `AccessRule`.
+    /// Compile `[[access_rule]]` entries into hostname-keyed
+    /// [`AccessRule`]s and IP-keyed [`IpRule`]s. Validation is
+    /// performed during compilation so any error surfaces at
+    /// config-load time, not when the first connection tries to
+    /// exercise the bad rule.
+    pub fn compile_rules(&self) -> Result<(Vec<AccessRule>, Vec<IpRule>)> {
+        let mut host_rules = Vec::new();
+        let mut ip_rules = Vec::new();
+        for (i, ar) in self.access_rules.iter().enumerate() {
+            match compile_access_rule(i, ar)? {
+                CompiledRule::Host(r) => host_rules.push(r),
+                CompiledRule::Ip(r) => ip_rules.push(r),
+            }
+        }
+        Ok((host_rules, ip_rules))
+    }
+
+    /// Host-keyed subset of [`compile_rules`]. Kept for callers and
+    /// tests that only care about hostname rules.
     pub fn access_rules(&self) -> Result<Vec<AccessRule>> {
-        self.access_rules
-            .iter()
-            .enumerate()
-            .map(|(i, ar)| {
-                let methods = match &ar.methods {
-                    None => None,
-                    Some(list) => {
-                        let mut set = HashSet::new();
-                        for m in list {
-                            let method = HttpMethod::from_str(m)
-                                .with_context(|| format!("access_rule #{i}: method {m:?}"))?;
-                            set.insert(method);
-                        }
-                        if set.is_empty() {
-                            bail!("access_rule #{i}: empty methods list (omit the field to allow any method)");
-                        }
-                        Some(set)
-                    }
-                };
-                Ok(AccessRule {
-                    hostname: ar.host.to_ascii_lowercase(),
-                    path_prefix: ar.path_prefix.clone(),
-                    methods,
-                })
-            })
-            .collect()
+        Ok(self.compile_rules()?.0)
+    }
+
+    /// IP-keyed subset of [`compile_rules`].
+    pub fn ip_rules(&self) -> Result<Vec<IpRule>> {
+        Ok(self.compile_rules()?.1)
     }
 
     /// Build a `NetworkPolicy` (credential injection) from the
@@ -362,6 +469,157 @@ impl Config {
         .context("compiling credential-injection rules")?;
         Ok(Some(np))
     }
+}
+
+/// Output of [`compile_access_rule`] — a single spec lands in
+/// exactly one bucket.
+enum CompiledRule {
+    Host(AccessRule),
+    Ip(IpRule),
+}
+
+/// Validate one `[[access_rule]]` spec and emit either a host or
+/// IP rule. Most of the file's "parse don't validate" guarantees
+/// live here, so every error path names the offending field.
+fn compile_access_rule(i: usize, ar: &AccessRuleSpec) -> Result<CompiledRule> {
+    // First: which keying was used?
+    let label = match (&ar.host, &ar.ip) {
+        (Some(h), None) => format!("host={h:?}"),
+        (None, Some(ip)) => format!("ip={ip}"),
+        (Some(_), Some(_)) => bail!(
+            "access_rule #{i}: `host` and `ip` are mutually exclusive — \
+             set one or the other"
+        ),
+        (None, None) => bail!(
+            "access_rule #{i}: must set either `host = \"…\"` or `ip = \"…\"`"
+        ),
+    };
+
+    // `methods` validation is cross-cutting; check it up front so
+    // we can report the error with good context regardless of which
+    // keying the rule uses.
+    let methods = match &ar.methods {
+        None => None,
+        Some(list) => {
+            let mut set = HashSet::new();
+            for m in list {
+                let method = HttpMethod::from_str(m)
+                    .with_context(|| format!("access_rule #{i}: method {m:?}"))?;
+                set.insert(method);
+            }
+            if set.is_empty() {
+                bail!(
+                    "access_rule #{i}: empty methods list (omit the field to allow any method)"
+                );
+            }
+            Some(set)
+        }
+    };
+
+    // Resolve + validate the mechanism. L7 narrowing (path_prefix /
+    // methods) can only be enforced with plaintext visibility, so
+    // accepting it on `sni` or `bypass` would silently widen the
+    // allowlist. IP-keyed rules are bypass-only because MITM/SNI
+    // fundamentally work on hostnames.
+    let mechanism = match ar.mechanism {
+        AccessMechanismSpec::Mitm => {
+            if ar.protocol.is_some() || ar.port.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): `protocol` and `port` are only \
+                     meaningful with mechanism = \"bypass\""
+                );
+            }
+            if ar.ip.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): mechanism = \"mitm\" requires a \
+                     hostname — IP-keyed rules only support bypass"
+                );
+            }
+            sni_proxy::policy::Mechanism::Mitm
+        }
+        AccessMechanismSpec::Sni => {
+            if ar.path_prefix.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): mechanism = \"sni\" is \
+                     incompatible with path_prefix — the SNI cut-through proxy \
+                     never sees the HTTP path."
+                );
+            }
+            if ar.methods.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): mechanism = \"sni\" is \
+                     incompatible with methods — the SNI cut-through proxy \
+                     never sees the HTTP method."
+                );
+            }
+            if ar.protocol.is_some() || ar.port.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): `protocol` and `port` are only \
+                     meaningful with mechanism = \"bypass\""
+                );
+            }
+            if ar.ip.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): mechanism = \"sni\" requires a \
+                     hostname — IP-keyed rules only support bypass"
+                );
+            }
+            sni_proxy::policy::Mechanism::Sni
+        }
+        AccessMechanismSpec::Bypass => {
+            if ar.path_prefix.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): mechanism = \"bypass\" is \
+                     incompatible with path_prefix — the bypass relay never \
+                     inspects the payload."
+                );
+            }
+            if ar.methods.is_some() {
+                bail!(
+                    "access_rule #{i} ({label}): mechanism = \"bypass\" is \
+                     incompatible with methods — the bypass relay never \
+                     inspects the payload."
+                );
+            }
+            let protocol = ar.protocol.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "access_rule #{i} ({label}): mechanism = \"bypass\" requires \
+                     `protocol = \"tcp\"` or `\"udp\"`"
+                )
+            })?;
+            let port = ar.port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "access_rule #{i} ({label}): mechanism = \"bypass\" requires \
+                     `port = <number>`"
+                )
+            })?;
+            if port == 80 || port == 443 {
+                bail!(
+                    "access_rule #{i} ({label}): bypass port {port} is reserved \
+                     for the MITM/HTTP proxy. For certificate-pinned HTTPS use \
+                     mechanism = \"sni\" instead."
+                );
+            }
+            sni_proxy::policy::Mechanism::Bypass {
+                protocol: protocol.to_policy(),
+                port,
+            }
+        }
+    };
+
+    Ok(match (&ar.host, &ar.ip) {
+        (Some(h), None) => CompiledRule::Host(AccessRule {
+            hostname: h.to_ascii_lowercase(),
+            path_prefix: ar.path_prefix.clone(),
+            methods,
+            mechanism,
+        }),
+        (None, Some(ip)) => CompiledRule::Ip(IpRule {
+            ip: *ip,
+            mechanism,
+        }),
+        _ => unreachable!("earlier match on host/ip pair already exhaustive"),
+    })
 }
 
 fn expand_tilde(raw: &str, home_dir: &Path) -> PathBuf {
@@ -484,6 +742,343 @@ methods = ["BOGUS"]
 "#;
         let c = Config::parse(toml).unwrap();
         assert!(c.access_rules().is_err());
+    }
+
+    #[test]
+    fn access_rule_default_mechanism_is_mitm() {
+        let toml = r#"
+[[access_rule]]
+host = "x"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let rules = c.access_rules().unwrap();
+        assert_eq!(rules[0].mechanism, sni_proxy::policy::Mechanism::Mitm);
+    }
+
+    #[test]
+    fn access_rule_sni_mechanism_parses() {
+        let toml = r#"
+[[access_rule]]
+host = "pinned.example"
+mechanism = "sni"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let rules = c.access_rules().unwrap();
+        assert_eq!(rules[0].mechanism, sni_proxy::policy::Mechanism::Sni);
+    }
+
+    #[test]
+    fn access_rule_sni_with_path_prefix_is_error() {
+        // An `sni` rule splices without inspecting HTTP — silently
+        // ignoring `path_prefix` would widen the allowlist, so parse
+        // must reject it. The error must name the offending field.
+        let toml = r#"
+[[access_rule]]
+host = "pinned.example"
+mechanism = "sni"
+path_prefix = "/api/"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.access_rules().expect_err("sni + path_prefix must fail");
+        assert!(err.to_string().contains("path_prefix"),
+            "error must mention path_prefix, got: {err}");
+    }
+
+    #[test]
+    fn access_rule_sni_with_methods_is_error() {
+        let toml = r#"
+[[access_rule]]
+host = "pinned.example"
+mechanism = "sni"
+methods = ["GET"]
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.access_rules().expect_err("sni + methods must fail");
+        assert!(err.to_string().contains("methods"),
+            "error must mention methods, got: {err}");
+    }
+
+    #[test]
+    fn access_rule_unknown_mechanism_is_error() {
+        // Guards against typos like `mechanism = "snipassthrough"`
+        // silently falling back to the default.
+        let toml = r#"
+[[access_rule]]
+host = "x"
+mechanism = "bogus"
+"#;
+        assert!(Config::parse(toml).is_err());
+    }
+
+    #[test]
+    fn access_rule_bypass_parses_tcp_and_udp() {
+        let toml = r#"
+[[access_rule]]
+host = "kdc.example"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+
+[[access_rule]]
+host = "ldap.example"
+mechanism = "bypass"
+protocol = "tcp"
+port = 389
+"#;
+        let c = Config::parse(toml).unwrap();
+        let rules = c.access_rules().unwrap();
+        use sni_proxy::policy::{BypassProtocol, Mechanism};
+        assert_eq!(
+            rules[0].mechanism,
+            Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 }
+        );
+        assert_eq!(
+            rules[1].mechanism,
+            Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 389 }
+        );
+    }
+
+    #[test]
+    fn access_rule_bypass_requires_protocol() {
+        let toml = r#"
+[[access_rule]]
+host = "kdc.example"
+mechanism = "bypass"
+port = 88
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.access_rules().unwrap_err().to_string();
+        assert!(err.contains("protocol"), "error should name `protocol`: {err}");
+    }
+
+    #[test]
+    fn access_rule_bypass_requires_port() {
+        let toml = r#"
+[[access_rule]]
+host = "kdc.example"
+mechanism = "bypass"
+protocol = "udp"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.access_rules().unwrap_err().to_string();
+        assert!(err.contains("port"), "error should name `port`: {err}");
+    }
+
+    #[test]
+    fn access_rule_bypass_rejects_reserved_ports() {
+        // 80 + 443 belong to the MITM/HTTP listeners — a bypass rule
+        // there would silently break interception for every other
+        // host on that port, so the config loader rejects it.
+        for port in [80u16, 443] {
+            let toml = format!(
+                r#"
+[[access_rule]]
+host = "pinned.example"
+mechanism = "bypass"
+protocol = "tcp"
+port = {port}
+"#
+            );
+            let c = Config::parse(&toml).unwrap();
+            let err = c.access_rules().unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "port {port} should be rejected as reserved, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_rule_bypass_rejects_path_prefix_and_methods() {
+        let toml_path = r#"
+[[access_rule]]
+host = "x"
+mechanism = "bypass"
+protocol = "tcp"
+port = 8080
+path_prefix = "/api/"
+"#;
+        let err = Config::parse(toml_path)
+            .unwrap()
+            .access_rules()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path_prefix"));
+
+        let toml_methods = r#"
+[[access_rule]]
+host = "x"
+mechanism = "bypass"
+protocol = "tcp"
+port = 8080
+methods = ["GET"]
+"#;
+        let err = Config::parse(toml_methods)
+            .unwrap()
+            .access_rules()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("methods"));
+    }
+
+    #[test]
+    fn access_rule_ip_bypass_parses() {
+        let toml = r#"
+[[access_rule]]
+ip = "10.0.0.5"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+"#;
+        let c = Config::parse(toml).unwrap();
+        let (host_rules, ip_rules) = c.compile_rules().unwrap();
+        assert!(host_rules.is_empty());
+        assert_eq!(ip_rules.len(), 1);
+        assert_eq!(ip_rules[0].ip, "10.0.0.5".parse::<std::net::IpAddr>().unwrap());
+        use sni_proxy::policy::{BypassProtocol, Mechanism};
+        assert_eq!(
+            ip_rules[0].mechanism,
+            Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 }
+        );
+    }
+
+    #[test]
+    fn access_rule_requires_host_or_ip() {
+        let toml = r#"
+[[access_rule]]
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.compile_rules().unwrap_err().to_string();
+        assert!(err.contains("must set either `host`") || err.contains("must set either"));
+    }
+
+    #[test]
+    fn access_rule_host_and_ip_are_mutually_exclusive() {
+        let toml = r#"
+[[access_rule]]
+host = "x.example"
+ip = "10.0.0.5"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.compile_rules().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn access_rule_ip_rejects_mitm_mechanism() {
+        let toml = r#"
+[[access_rule]]
+ip = "10.0.0.5"
+mechanism = "mitm"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.compile_rules().unwrap_err().to_string();
+        assert!(err.contains("mitm"));
+    }
+
+    #[test]
+    fn access_rule_ip_rejects_sni_mechanism() {
+        let toml = r#"
+[[access_rule]]
+ip = "10.0.0.5"
+mechanism = "sni"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.compile_rules().unwrap_err().to_string();
+        assert!(err.contains("sni"));
+    }
+
+    #[test]
+    fn access_rule_mixed_host_and_ip_configs_both_compile() {
+        let toml = r#"
+[[access_rule]]
+host = "kdc.example"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+
+[[access_rule]]
+ip = "10.0.0.5"
+mechanism = "bypass"
+protocol = "udp"
+port = 88
+"#;
+        let c = Config::parse(toml).unwrap();
+        let (host_rules, ip_rules) = c.compile_rules().unwrap();
+        assert_eq!(host_rules.len(), 1);
+        assert_eq!(ip_rules.len(), 1);
+    }
+
+    #[test]
+    fn access_rule_protocol_port_require_bypass_mechanism() {
+        // If someone accidentally drops `mechanism = "bypass"` but
+        // leaves the protocol/port fields, they clearly meant bypass
+        // — surfacing the error tells them to add it rather than
+        // silently promoting the rule to a MITM rule that ignores
+        // both fields.
+        let toml = r#"
+[[access_rule]]
+host = "x"
+protocol = "tcp"
+port = 8080
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c.access_rules().unwrap_err().to_string();
+        assert!(err.contains("bypass"));
+    }
+
+    #[test]
+    fn dns_default_upstream_is_cloudflare() {
+        // Matches the documented default — don't silently move users
+        // off it. If you change the default, also change this test
+        // plus the doc string on `default_dns_upstream`.
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.dns.upstream, "1.1.1.1:53");
+        let addr = c.dns.upstream_addr().unwrap();
+        assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn dns_upstream_override_parses() {
+        let toml = r#"
+[dns]
+upstream = "8.8.8.8:53"
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert_eq!(c.dns.upstream, "8.8.8.8:53");
+        assert!(c.dns.upstream_addr().is_ok());
+    }
+
+    #[test]
+    fn dns_upstream_malformed_addr_is_error_at_load_time() {
+        // We don't want a bad `upstream` value to fail on the first
+        // DNS query — catch it at config parse so the user sees the
+        // problem before any work is done.
+        let toml = r#"
+[dns]
+upstream = "not-an-address"
+"#;
+        let c = Config::parse(toml).unwrap();
+        assert!(c.dns.upstream_addr().is_err());
+    }
+
+    #[test]
+    fn dns_unknown_field_is_rejected() {
+        // Guard against typos in the `[dns]` section being silently
+        // ignored — `deny_unknown_fields` on `DnsConfig` enforces
+        // this but a test pins the behavior.
+        let toml = r#"
+[dns]
+upstream = "1.1.1.1:53"
+servers = ["8.8.8.8:53"]
+"#;
+        assert!(Config::parse(toml).is_err());
     }
 
     #[test]
