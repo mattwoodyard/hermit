@@ -5,6 +5,7 @@
 //! upstream and relays the request/response.
 
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +36,18 @@ pub struct HttpProxyConfig<P, C> {
     pub policy: Arc<P>,
     pub connector: Arc<C>,
     pub upstream_port: u16,
+    /// Ports a `CONNECT` tunnel is permitted to target. Always
+    /// includes 443 plus any `[[port_forward]]` entries with
+    /// `protocol = "https"`. CONNECT to any other port is denied
+    /// even when the host is allow-listed — otherwise an
+    /// allow-listed hostname becomes a generic egress to arbitrary
+    /// ports (SSH/etc.) on that hostname's IP.
+    pub allowed_connect_ports: BTreeSet<u16>,
     /// Where to record block events. `BlockLogger::disabled()` by default.
     pub block_log: BlockLogger,
+    /// Where to record *allowed* access events (learn-mode trace).
+    /// `BlockLogger::disabled()` outside of `hermit learn`.
+    pub access_log: BlockLogger,
 }
 
 /// Run the HTTP proxy accept loop on port 80 traffic.
@@ -160,6 +171,16 @@ where
             http::write_403(&mut client, "blocked by hermit policy").await?;
             return Ok(());
         }
+        // Allowed: record the request for learn-mode trace.
+        config.access_log.log(BlockEvent {
+            time_unix_ms: now_unix_ms(),
+            kind: BlockKind::Http,
+            client: Some(client_addr.to_string()),
+            hostname: Some(hostname.clone()),
+            method: Some(request.method.clone()),
+            path: Some(request.path.clone()),
+            reason: None,
+        });
 
         let mut upstream = match timeout(
             UPSTREAM_CONNECT_TIMEOUT,
@@ -266,6 +287,32 @@ where
 
     debug!(%client_addr, %host, %port, "http: CONNECT");
 
+    // Port-allowlist check happens *before* the hostname check: an
+    // allow-listed host on a non-HTTPS port (e.g. ssh on 22) must
+    // be denied. Otherwise a malicious build could exfiltrate via
+    // ssh/smtp/etc. to whatever hostname the policy permits.
+    if !config.allowed_connect_ports.contains(&port) {
+        debug!(
+            %client_addr, %host, %port,
+            "hermit blocked: CONNECT to disallowed port"
+        );
+        config.block_log.log(BlockEvent {
+            time_unix_ms: now_unix_ms(),
+            kind: BlockKind::Http,
+            client: Some(client_addr.to_string()),
+            hostname: Some(host.clone()),
+            method: Some("CONNECT".to_string()),
+            path: Some(request.path.clone()),
+            reason: Some(format!(
+                "CONNECT to port {port} is not in the HTTPS port allowlist"
+            )),
+        });
+        let _ = client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .await;
+        return Ok(());
+    }
+
     if config.policy.check(&host) == Verdict::Deny {
         debug!(%client_addr, %host, "hermit blocked: CONNECT to {}:{}", host, port);
         config.block_log.log(BlockEvent {
@@ -285,6 +332,18 @@ where
             .await;
         return Ok(());
     }
+    // Allowed CONNECT: record the tunnel target for learn-mode
+    // trace. We don't see anything inside the tunnel after this
+    // point — the only cleartext signal is the host:port.
+    config.access_log.log(BlockEvent {
+        time_unix_ms: now_unix_ms(),
+        kind: BlockKind::Http,
+        client: Some(client_addr.to_string()),
+        hostname: Some(host.clone()),
+        method: Some("CONNECT".to_string()),
+        path: Some(request.path.clone()),
+        reason: None,
+    });
 
     let mut upstream = match timeout(
         UPSTREAM_CONNECT_TIMEOUT,
@@ -353,7 +412,9 @@ mod tests {
             policy: Arc::new(AllowAll),
             connector: Arc::new(crate::connector::DirectConnector),
             upstream_port: 80,
+            allowed_connect_ports: BTreeSet::from([443]),
             block_log: crate::block_log::BlockLogger::disabled(),
+            access_log: crate::block_log::BlockLogger::disabled(),
         };
         assert_eq!(config.upstream_port, 80);
     }
@@ -365,7 +426,9 @@ mod tests {
             policy: Arc::new(RuleSet::new(rules)),
             connector: Arc::new(crate::connector::DirectConnector),
             upstream_port: 80,
+            allowed_connect_ports: BTreeSet::from([443]),
             block_log: crate::block_log::BlockLogger::disabled(),
+            access_log: crate::block_log::BlockLogger::disabled(),
         };
         assert_eq!(config.upstream_port, 80);
     }

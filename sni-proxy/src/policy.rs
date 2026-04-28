@@ -163,6 +163,16 @@ impl AccessRule {
             if !path.starts_with(prefix.as_str()) {
                 return false;
             }
+            // `starts_with` alone is fooled by `/repos/../user/keys`,
+            // which the upstream will normalize back to `/user/keys`
+            // and serve outside the intended prefix. Reject any
+            // request whose path contains a `..` segment when a
+            // prefix is configured. We check both the literal form
+            // and the common percent-encoded variants since most
+            // upstream servers decode them before resolution.
+            if path_contains_dotdot_segment(path) {
+                return false;
+            }
         }
         if let Some(ref allowed) = self.methods {
             match HttpMethod::from_str(method) {
@@ -182,6 +192,50 @@ impl AccessRule {
     fn matches_host(&self, hostname: &str) -> bool {
         self.hostname.eq_ignore_ascii_case(hostname)
     }
+}
+
+/// Return true if any `/`-separated segment of `path` decodes to
+/// `..`. Catches `/repos/../user`, `/repos/%2e%2e/user`, and the
+/// mixed-encoding variants — all of which collapse to a path
+/// outside the configured prefix once the upstream server
+/// normalizes the request.
+///
+/// Only literal `..` (and its percent-encoded forms) is rejected;
+/// `%2e.` / `.%2e` / `%2e%2e` are normalized via a small per-byte
+/// decoder because pulling in a full percent-decoder for the proxy
+/// hot path is heavier than the surface justifies.
+fn path_contains_dotdot_segment(path: &str) -> bool {
+    // `?` and `#` separate the path from query/fragment; only the
+    // path portion is resolved by the server.
+    let path_only = path.split(['?', '#']).next().unwrap_or(path);
+    for segment in path_only.split('/') {
+        if segment_is_dotdot(segment) {
+            return true;
+        }
+    }
+    false
+}
+
+fn segment_is_dotdot(seg: &str) -> bool {
+    let bytes = seg.as_bytes();
+    let mut i = 0;
+    let mut dots = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'.' {
+            dots += 1;
+            i += 1;
+        } else if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'2'
+            && (bytes[i + 2] == b'e' || bytes[i + 2] == b'E')
+        {
+            dots += 1;
+            i += 3;
+        } else {
+            return false;
+        }
+    }
+    dots == 2
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +379,13 @@ pub struct RuleSet {
     /// IP rules grouped by literal IP. Only populated when the
     /// config declares `ip = "…"` rules.
     by_ip: HashMap<std::net::IpAddr, Vec<IpRule>>,
+    /// Learn-mode override: every `check` / `check_request` short-
+    /// circuits to [`Verdict::Allow`] regardless of `by_host` /
+    /// `by_ip`. Set via [`RuleSet::with_permit_all`]; intended
+    /// solely for `hermit learn` so the proxies *observe* every
+    /// access without enforcing a rule. Production runs leave this
+    /// `false`.
+    permit_all: bool,
 }
 
 impl RuleSet {
@@ -339,6 +400,7 @@ impl RuleSet {
         Self {
             by_host,
             by_ip: HashMap::new(),
+            permit_all: false,
         }
     }
 
@@ -350,6 +412,20 @@ impl RuleSet {
             self.by_ip.entry(rule.ip).or_default().push(rule);
         }
         self
+    }
+
+    /// Switch into learn mode — every check returns
+    /// [`Verdict::Allow`] regardless of `rules`. Used by
+    /// `hermit learn` so the proxies record what the child *would*
+    /// access without imposing a policy. Has no effect in normal
+    /// runs (the flag is otherwise never set).
+    pub fn with_permit_all(mut self, permit: bool) -> Self {
+        self.permit_all = permit;
+        self
+    }
+
+    pub fn is_permit_all(&self) -> bool {
+        self.permit_all
     }
 
     /// Pick the enforcement mechanism for a TLS connection that
@@ -471,6 +547,9 @@ impl RuleSet {
 
 impl ConnectionPolicy for RuleSet {
     fn check(&self, hostname: &str) -> Verdict {
+        if self.permit_all {
+            return Verdict::Allow;
+        }
         let key = hostname.to_ascii_lowercase();
         match self.by_host.get(&key) {
             Some(rules) if rules.iter().any(|r| r.matches_host(hostname)) => Verdict::Allow,
@@ -489,6 +568,9 @@ impl ConnectionPolicy for RuleSet {
 
 impl RequestPolicy for RuleSet {
     fn check_request(&self, hostname: &str, path: &str, method: &str) -> Verdict {
+        if self.permit_all {
+            return Verdict::Allow;
+        }
         let key = hostname.to_ascii_lowercase();
         match self.by_host.get(&key) {
             Some(rules) if rules.iter().any(|r| r.matches(hostname, path, method)) => {
@@ -931,6 +1013,33 @@ mod tests {
     }
 
     #[test]
+    fn permit_all_short_circuits_check_and_check_request() {
+        // Empty ruleset would normally deny everything. With
+        // `with_permit_all(true)` (learn mode), every call returns
+        // Allow regardless of rules — the proxies still observe
+        // and log, but enforcement is off.
+        let rs = RuleSet::new(vec![]).with_permit_all(true);
+        assert_eq!(rs.check("anything.example"), Verdict::Allow);
+        assert_eq!(
+            rs.check_request("anything.example", "/whatever", "POST"),
+            Verdict::Allow
+        );
+        assert!(rs.is_permit_all());
+    }
+
+    #[test]
+    fn permit_all_does_not_change_mechanism_for_unknown_host() {
+        // `mechanism_for` walks rules — with no matching rule it
+        // still returns None even in learn mode. The MITM layer
+        // calls `mechanism()` (the trait default), which falls
+        // through to `Mitm`. That's the expected learn-mode
+        // default — terminate TLS so we can record path + method.
+        let rs = RuleSet::new(vec![]).with_permit_all(true);
+        assert!(rs.mechanism_for("anything.example").is_none());
+        assert_eq!(rs.mechanism("anything.example"), Mechanism::Mitm);
+    }
+
+    #[test]
     fn bypass_endpoints_includes_ip_keyed_rules() {
         // An ip-only rule still needs its own listener + DNAT
         // entry, so it must show up in `bypass_endpoints`.
@@ -959,5 +1068,60 @@ mod tests {
                 (BypassProtocol::Udp, 88),
             ]
         );
+    }
+
+    fn rule_with_prefix(host: &str, prefix: &str) -> AccessRule {
+        AccessRule {
+            hostname: host.to_string(),
+            path_prefix: Some(prefix.to_string()),
+            methods: None,
+            mechanism: Mechanism::Mitm,
+        }
+    }
+
+    #[test]
+    fn matches_rejects_literal_dotdot_in_prefix_path() {
+        // The classic prefix bypass: server resolves `..` and serves
+        // outside the intended prefix. The proxy rejects it before it
+        // can reach the server.
+        let r = rule_with_prefix("api.example", "/repos/");
+        assert!(r.matches("api.example", "/repos/foo", "GET"));
+        assert!(!r.matches("api.example", "/repos/../user/keys", "GET"));
+        assert!(!r.matches("api.example", "/repos/..", "GET"));
+    }
+
+    #[test]
+    fn matches_rejects_percent_encoded_dotdot_in_prefix_path() {
+        // Apache/nginx-style upstreams decode `%2e%2e` to `..`
+        // before normalizing — so the proxy must catch the encoded
+        // form too.
+        let r = rule_with_prefix("api.example", "/repos/");
+        assert!(!r.matches("api.example", "/repos/%2e%2e/user", "GET"));
+        assert!(!r.matches("api.example", "/repos/%2E%2E/user", "GET"));
+        assert!(!r.matches("api.example", "/repos/.%2e/user", "GET"));
+        assert!(!r.matches("api.example", "/repos/%2e./user", "GET"));
+    }
+
+    #[test]
+    fn matches_allows_double_dot_inside_a_segment() {
+        // `..` is only dangerous as a *whole* segment. `/repos/foo..bar`
+        // doesn't traverse, so it must still match.
+        let r = rule_with_prefix("api.example", "/repos/");
+        assert!(r.matches("api.example", "/repos/foo..bar", "GET"));
+        assert!(r.matches("api.example", "/repos/.config", "GET"));
+    }
+
+    #[test]
+    fn matches_dotdot_check_only_applies_when_prefix_is_set() {
+        // No path_prefix → no traversal to bypass, so `..` is fine.
+        let r = AccessRule::host_only("api.example");
+        assert!(r.matches("api.example", "/anything/../else", "GET"));
+    }
+
+    #[test]
+    fn matches_ignores_dotdot_in_query_string() {
+        // The path-portion ends at `?`; query strings don't traverse.
+        let r = rule_with_prefix("api.example", "/repos/");
+        assert!(r.matches("api.example", "/repos/x?ref=..", "GET"));
     }
 }

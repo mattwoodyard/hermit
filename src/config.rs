@@ -96,10 +96,15 @@ pub struct Config {
     #[serde(default, rename = "access_rule")]
     pub access_rules: Vec<AccessRuleSpec>,
 
-    /// `[dns]` section — upstream resolver configuration. Absent
-    /// means use the built-in default (Cloudflare's 1.1.1.1:53).
-    #[serde(default)]
-    pub dns: DnsConfig,
+    /// `[dns]` section — upstream resolver configuration. Wrapped
+    /// in an `Option` at the serde layer so the merge path can
+    /// tell "no `[dns]` block" from "empty `[dns]` block" — the
+    /// same trick `sandbox_override` uses. Without this, a file
+    /// without a `[dns]` section would still deserialize to the
+    /// default `DnsConfig` and clobber a previously-merged
+    /// override. Use [`Config::dns()`] to get the effective value.
+    #[serde(default, rename = "dns", deserialize_with = "deserialize_dns_opt")]
+    pub dns_override: Option<DnsConfig>,
 
     /// Additional TCP ports (beyond the built-in 80/443) that the
     /// sandbox redirects into the proxy. Each entry picks which proxy
@@ -129,11 +134,25 @@ where
     SandboxConfig::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_dns_opt<'de, D>(deserializer: D) -> Result<Option<DnsConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    DnsConfig::deserialize(deserializer).map(Some)
+}
+
 impl Config {
     /// Effective `[sandbox]` values, falling back to defaults when the
     /// config (or its includes) never specified one.
     pub fn sandbox(&self) -> SandboxConfig {
         self.sandbox_override.clone().unwrap_or_default()
+    }
+
+    /// Effective `[dns]` values, falling back to the built-in
+    /// default (`1.1.1.1:53`) when no config in the include chain
+    /// set one.
+    pub fn dns(&self) -> DnsConfig {
+        self.dns_override.clone().unwrap_or_default()
     }
 }
 
@@ -366,6 +385,9 @@ impl Config {
         // state; there's nothing to merge.
         if let Some(sb) = other.sandbox_override {
             self.sandbox_override = Some(sb);
+        }
+        if let Some(d) = other.dns_override {
+            self.dns_override = Some(d);
         }
         self.home_files.extend(other.home_files);
         self.access_rules.extend(other.access_rules);
@@ -1039,8 +1061,9 @@ port = 8080
         // off it. If you change the default, also change this test
         // plus the doc string on `default_dns_upstream`.
         let c = Config::parse("").unwrap();
-        assert_eq!(c.dns.upstream, "1.1.1.1:53");
-        let addr = c.dns.upstream_addr().unwrap();
+        assert_eq!(c.dns().upstream, "1.1.1.1:53");
+        assert!(c.dns_override.is_none(), "absent [dns] must leave override at None");
+        let addr = c.dns().upstream_addr().unwrap();
         assert_eq!(addr.port(), 53);
     }
 
@@ -1051,8 +1074,9 @@ port = 8080
 upstream = "8.8.8.8:53"
 "#;
         let c = Config::parse(toml).unwrap();
-        assert_eq!(c.dns.upstream, "8.8.8.8:53");
-        assert!(c.dns.upstream_addr().is_ok());
+        assert_eq!(c.dns().upstream, "8.8.8.8:53");
+        assert!(c.dns_override.is_some(), "present [dns] must set the override");
+        assert!(c.dns().upstream_addr().is_ok());
     }
 
     #[test]
@@ -1065,7 +1089,57 @@ upstream = "8.8.8.8:53"
 upstream = "not-an-address"
 "#;
         let c = Config::parse(toml).unwrap();
-        assert!(c.dns.upstream_addr().is_err());
+        assert!(c.dns().upstream_addr().is_err());
+    }
+
+    #[test]
+    fn dns_override_survives_merge_with_include_lacking_dns() {
+        // Regression: before this fix, every parsed config always
+        // produced a `DnsConfig { upstream: "1.1.1.1:53" }` (via
+        // serde `default`) and the merge blindly replaced `self.dns`
+        // with `other.dns`, silently clobbering the top-level
+        // override with whatever the last-merged include reported.
+        let mut top = Config::parse(
+            r#"
+[dns]
+upstream = "9.9.9.9:53"
+"#,
+        )
+        .unwrap();
+        // Include simulates a shared ruleset with no `[dns]` block.
+        let include: Config = Config::parse(
+            r#"
+[[access_rule]]
+host = "shared.example"
+"#,
+        )
+        .unwrap();
+        top.merge_from(include);
+        assert_eq!(top.dns().upstream, "9.9.9.9:53",
+            "top-level [dns] must survive merging an include that has no [dns]");
+    }
+
+    #[test]
+    fn dns_override_last_writer_wins_across_merges() {
+        // When an include explicitly sets [dns], it overrides the
+        // accumulator — matching the documented "last writer wins"
+        // semantics for scalar/table fields.
+        let mut acc = Config::parse(
+            r#"
+[dns]
+upstream = "9.9.9.9:53"
+"#,
+        )
+        .unwrap();
+        let later: Config = Config::parse(
+            r#"
+[dns]
+upstream = "8.8.8.8:53"
+"#,
+        )
+        .unwrap();
+        acc.merge_from(later);
+        assert_eq!(acc.dns().upstream, "8.8.8.8:53");
     }
 
     #[test]

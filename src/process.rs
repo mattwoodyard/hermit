@@ -310,6 +310,10 @@ pub fn run_forked_proxied(
     port_forwards: &[PortForwardSpec],
     block_log_path: Option<&Path>,
     dns_upstream: std::net::SocketAddr,
+    // `hermit learn` writes a JSONL trace of every *allowed*
+    // access here. `None` outside learn mode (the access logger
+    // is disabled and the field is unused).
+    access_log_path: Option<&Path>,
 ) -> Result<i32> {
     // Generate the ephemeral CA before fork so both parent and child can use it.
     let ca = Arc::new(
@@ -357,9 +361,11 @@ pub fn run_forked_proxied(
                 ca,
                 network_policy,
                 block_log_path.map(|p| p.to_path_buf()),
+                access_log_path.map(|p| p.to_path_buf()),
                 dns_upstream,
                 bypass_tcp,
                 bypass_udp,
+                port_forwards.to_vec(),
             )
         }
     }
@@ -595,9 +601,11 @@ fn parent_main_proxied(
     ca: Arc<sni_proxy::ca::CertificateAuthority>,
     network_policy: Option<Arc<sni_proxy::network_policy::NetworkPolicy>>,
     block_log_path: Option<PathBuf>,
+    access_log_path: Option<PathBuf>,
     dns_upstream: std::net::SocketAddr,
     bypass_tcp: Vec<BypassTcpAllocation>,
     bypass_udp: Vec<BypassUdpAllocation>,
+    port_forwards: Vec<PortForwardSpec>,
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
@@ -652,11 +660,21 @@ fn parent_main_proxied(
         .collect::<Result<_>>()?;
 
     // Block logger must be constructed on the runtime because it opens
-    // an async file and spawns a writer task.
+    // an async file and spawns a writer task. The access logger
+    // shares the same machinery; it points at a different file
+    // when `hermit learn` is in use, otherwise it's disabled.
     let block_log = match block_log_path {
         Some(p) => rt
             .block_on(async { sni_proxy::block_log::BlockLogger::to_file(&p).await })
             .context("opening block log")?,
+        None => sni_proxy::block_log::BlockLogger::disabled(),
+    };
+    let access_log = match access_log_path {
+        Some(p) => {
+            info!("access log: {}", p.display());
+            rt.block_on(async { sni_proxy::block_log::BlockLogger::to_file(&p).await })
+                .context("opening access log")?
+        }
         None => sni_proxy::block_log::BlockLogger::disabled(),
     };
 
@@ -668,14 +686,29 @@ fn parent_main_proxied(
         upstream_port: HTTPS_PORT,
         network_policy: network_policy.clone(),
         block_log: block_log.clone(),
+        access_log: access_log.clone(),
     });
 
-    // HTTP proxy for port 80 -> 1080
+    // HTTP proxy for port 80 -> 1080. The CONNECT-tunnel port
+    // allowlist is the union of the standard HTTPS port and any
+    // `[[port_forward]]` entries the config marked as `https` —
+    // those are the ports the build's tools may legitimately
+    // tunnel through `HTTPS_PROXY`.
+    let mut allowed_connect_ports: std::collections::BTreeSet<u16> =
+        std::collections::BTreeSet::new();
+    allowed_connect_ports.insert(HTTPS_PORT);
+    for pf in port_forwards {
+        if matches!(pf.protocol, PortProtocol::Https) {
+            allowed_connect_ports.insert(pf.port);
+        }
+    }
     let http_config = Arc::new(sni_proxy::http_proxy::HttpProxyConfig {
         policy: Arc::clone(&policy),
         connector: Arc::new(sni_proxy::connector::DirectConnector),
         upstream_port: HTTP_PORT,
+        allowed_connect_ports,
         block_log: block_log.clone(),
+        access_log: access_log.clone(),
     });
 
     // DNS server — wrapped in Arc so `run` can spawn per-response
@@ -690,6 +723,7 @@ fn parent_main_proxied(
     let dns_server = Arc::new(
         sni_proxy::dns::DnsServer::new(Arc::clone(&policy))
             .with_block_log(block_log.clone())
+            .with_access_log(access_log.clone())
             .with_upstream(dns_forwarder)
             .with_cache(Arc::clone(&dns_cache)),
     );

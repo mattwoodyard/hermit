@@ -235,6 +235,9 @@ pub struct DnsServer<P> {
     ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
     block_log: BlockLogger,
+    /// Where to record *allowed* queries (learn-mode trace).
+    /// Disabled outside of `hermit learn`.
+    access_log: BlockLogger,
     upstream: Option<Arc<DnsForwarder>>,
     cache: Option<Arc<DnsCache>>,
 }
@@ -246,9 +249,17 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
             ipv4: Ipv4Addr::LOCALHOST,
             ipv6: Ipv6Addr::LOCALHOST,
             block_log: BlockLogger::disabled(),
+            access_log: BlockLogger::disabled(),
             upstream: None,
             cache: None,
         }
+    }
+
+    /// Attach an access logger. Allowed queries will be recorded —
+    /// used by `hermit learn` to trace what the child resolved.
+    pub fn with_access_log(mut self, access_log: BlockLogger) -> Self {
+        self.access_log = access_log;
+        self
     }
 
     /// Override the IPv4 address returned in A responses. Only
@@ -344,7 +355,22 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
         );
 
         match self.policy.check(&query.name) {
-            Verdict::Allow => self.answer_allowed(&query, buf, src).await,
+            Verdict::Allow => {
+                // Record the allowed query for learn-mode trace.
+                // Done here (not inside answer_allowed) so it
+                // fires for both the upstream-forward path and
+                // the legacy fixed-IP fallback.
+                self.access_log.log(BlockEvent {
+                    time_unix_ms: now_unix_ms(),
+                    kind: BlockKind::Dns,
+                    client: Some(src.to_string()),
+                    hostname: Some(query.name.clone()),
+                    method: None,
+                    path: None,
+                    reason: None,
+                });
+                self.answer_allowed(&query, buf, src).await
+            }
             Verdict::Deny => {
                 debug!(%src, name = %query.name,
                     "hermit blocked: DNS query for {} (not in allowlist)", query.name);

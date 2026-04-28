@@ -169,6 +169,32 @@ mod tests {
     }
 
     #[test]
+    fn multi_a_answers_produce_reverse_entry_per_ip() {
+        // Multi-A responses (load-balanced services) must land in
+        // the reverse map for *every* address, so the bypass relay
+        // can authorize traffic no matter which IP the child
+        // resolver picks. `fwd` also needs all three so
+        // hostname-driven lookups stay honest.
+        let c = DnsCache::new();
+        for octet in [1u8, 2, 3] {
+            c.insert(
+                "kdc.example",
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, octet)),
+                Duration::from_secs(300),
+            );
+        }
+        for octet in [1u8, 2, 3] {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, octet));
+            assert_eq!(
+                c.reverse(ip).as_deref(),
+                Some("kdc.example"),
+                "reverse({ip}) should map to kdc.example"
+            );
+        }
+        assert_eq!(c.lookup("kdc.example").len(), 3);
+    }
+
+    #[test]
     fn lookup_returns_all_ips_for_host() {
         let c = DnsCache::new();
         c.insert("multi.test", ipv4(10, 0, 0, 1), Duration::from_secs(60));

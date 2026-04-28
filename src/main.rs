@@ -5,9 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
 
-use hermit::cli::{Cli, Command, KeygenArgs, RunArgs, SignArgs, VerifyArgs};
+use hermit::cli::{
+    Cli, Command, EditConfigAction, EditConfigArgs, KeygenArgs, LearnArgs, LearnConvertArgs,
+    RunArgs, SignArgs, VerifyArgs,
+};
 use hermit::config_loader::TrustPolicy;
-use hermit::{config_loader, landlock, sandbox::run_sandboxed, signature};
+use hermit::sandbox::default_access_log_path;
+use hermit::{config_loader, edit_config, landlock, learn_convert, sandbox::run_sandboxed, signature};
 
 fn main() {
     let exit_code = match run() {
@@ -27,7 +31,101 @@ fn run() -> Result<i32> {
         Command::Sign(args) => sign_subcommand(args),
         Command::Verify(args) => verify_subcommand(args),
         Command::Keygen(args) => keygen_subcommand(args),
+        Command::EditConfig(args) => edit_config_subcommand(args),
+        Command::Learn(args) => learn_subcommand(args),
+        Command::LearnConvert(args) => learn_convert_subcommand(args),
     }
+}
+
+fn learn_convert_subcommand(args: LearnConvertArgs) -> Result<i32> {
+    learn_convert::convert(&args)?;
+    Ok(0)
+}
+
+fn learn_subcommand(args: LearnArgs) -> Result<i32> {
+    init_logging(args.verbose, args.log_file.as_deref())?;
+    if let Some(p) = &args.log_file {
+        info!("log file: {}", p.display());
+    }
+
+    landlock::ensure_available()?;
+
+    let project_dir = args
+        .project_dir
+        .canonicalize()
+        .with_context(|| format!("--project-dir '{}' does not exist", args.project_dir.display()))?;
+
+    // Learn mode skips signature verification by default — the
+    // workflow is "I'm authoring rules from scratch, take whatever
+    // I have right now". An operator who explicitly wants the
+    // signed path should use `hermit run` with their wip rules.
+    let trust = TrustPolicy::AllowUnsigned;
+    if !args.allow_unsigned {
+        warn!(
+            "learn mode: signature verification is always skipped \
+             (this is observation only; no enforcement happens)"
+        );
+    }
+
+    let config = match &args.config {
+        Some(url) => config_loader::assemble(url, &trust)
+            .with_context(|| format!("loading config from {}", url))?,
+        None => {
+            info!(
+                "learn mode: no --config provided, synthesizing a passthrough \
+                 config (passthrough = [\"/\"])"
+            );
+            default_learn_config()?
+        }
+    };
+
+    // Resolve the access-log path, defaulting to XDG and creating
+    // the parent directory so the BlockLogger writer's `open(...)`
+    // succeeds on a fresh machine.
+    let access_log_path = args
+        .access_log
+        .clone()
+        .unwrap_or_else(default_access_log_path);
+    if let Some(parent) = access_log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating access-log directory {}", parent.display()))?;
+    }
+    info!("learn mode: trace -> {}", access_log_path.display());
+
+    info!("command: {}", args.command.join(" "));
+    run_sandboxed(
+        &project_dir,
+        &args.command,
+        &config,
+        None,  // block log: irrelevant in learn mode (nothing is blocked)
+        true,  // no_block_log: skip the block log entirely
+        Some(&access_log_path),
+        true, // permit_all
+    )
+}
+
+/// Build the synthetic config used when `hermit learn` is invoked
+/// without `--config`. Carries `passthrough = ["/"]` so the build
+/// runs against the host filesystem (Landlock allows everything),
+/// while learn-mode's `permit_all` + forced `net = isolate` keep
+/// the proxies observing network access.
+fn default_learn_config() -> Result<hermit::config::Config> {
+    hermit::config::Config::parse(
+        r#"
+[sandbox]
+passthrough = ["/"]
+"#,
+    )
+    .context("building default learn-mode config")
+}
+
+fn edit_config_subcommand(args: EditConfigArgs) -> Result<i32> {
+    match args.action {
+        EditConfigAction::AddRule(a) => edit_config::add_rule(&a)?,
+        EditConfigAction::RemoveRule(a) => edit_config::remove_rule(&a)?,
+        EditConfigAction::Show(a) => edit_config::show(&a)?,
+    }
+    Ok(0)
 }
 
 fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
@@ -149,15 +247,25 @@ fn run_subcommand(args: RunArgs) -> Result<i32> {
         &config,
         args.block_log.as_deref(),
         args.no_block_log,
+        None,  // access log only used by `hermit learn`
+        false, // permit_all only set by `hermit learn`
     )
 }
 
 fn sign_subcommand(args: SignArgs) -> Result<i32> {
     init_logging(0, None)?;
-    let cert_pem = std::fs::read_to_string(&args.cert)
-        .with_context(|| format!("reading cert {}", args.cert.display()))?;
-    let key_pem = std::fs::read_to_string(&args.key)
-        .with_context(|| format!("reading key {}", args.key.display()))?;
+    let cert_path = match args.cert {
+        Some(p) => p,
+        None => default_signer_cert_path()?,
+    };
+    let key_path = match args.key {
+        Some(p) => p,
+        None => default_signer_key_path()?,
+    };
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("reading cert {}", cert_path.display()))?;
+    let key_pem = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("reading key {}", key_path.display()))?;
     let unsigned = std::fs::read(&args.config)
         .with_context(|| format!("reading config {}", args.config.display()))?;
     let signed = signature::sign(&unsigned, &cert_pem, &key_pem)?;
@@ -195,18 +303,63 @@ fn verify_subcommand(args: VerifyArgs) -> Result<i32> {
 fn keygen_subcommand(args: KeygenArgs) -> Result<i32> {
     init_logging(0, None)?;
 
-    if !args.force {
-        if args.cert.exists() {
-            bail!(
-                "{} already exists (use --force to overwrite)",
-                args.cert.display()
-            );
+    let cert_path = match args.cert {
+        Some(p) => p,
+        None => default_signer_cert_path()?,
+    };
+    let key_path = match args.key {
+        Some(p) => p,
+        None => default_signer_key_path()?,
+    };
+
+    // The default `~/.hermit/signer.{cert,key}.pem` paths put the
+    // output in a directory the user may not have created yet. Make
+    // it on demand so the very first `hermit keygen` run works
+    // out of the box. For an explicit --cert/--key the user has
+    // already chosen a parent — still create it for symmetry; if it
+    // already exists `create_dir_all` is a no-op.
+    for p in [&cert_path, &key_path] {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
         }
-        if args.key.exists() {
-            bail!(
-                "{} already exists (use --force to overwrite)",
-                args.key.display()
-            );
+    }
+
+    // Up-front existence check uses `symlink_metadata` so a
+    // pre-planted symlink at the target path is also detected
+    // (`Path::exists` would silently follow it). The actual write
+    // below is guarded by `O_EXCL | O_NOFOLLOW`; this branch is
+    // about producing a friendly error before we get there.
+    if !args.force {
+        for p in [&cert_path, &key_path] {
+            match std::fs::symlink_metadata(p) {
+                Ok(_) => bail!(
+                    "{} already exists (use --force to overwrite)",
+                    p.display()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("stat {}", p.display()));
+                }
+            }
+        }
+    } else {
+        // `--force` must remove any existing entry up front so the
+        // O_EXCL open below can succeed. `remove_file` unlinks
+        // both regular files and symlinks (it never follows the
+        // link), so a pre-planted symlink is dispatched cleanly.
+        for p in [&cert_path, &key_path] {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("removing existing {}", p.display()));
+                }
+            }
         }
     }
 
@@ -217,43 +370,70 @@ fn keygen_subcommand(args: KeygenArgs) -> Result<i32> {
         .self_signed(&kp)
         .context("self-signing certificate")?;
 
-    std::fs::write(&args.cert, cert.pem())
-        .with_context(|| format!("writing cert {}", args.cert.display()))?;
-    write_private_key(&args.key, &kp.serialize_pem())?;
+    write_new_file_excl(&cert_path, cert.pem().as_bytes(), 0o644)?;
+    write_new_file_excl(&key_path, kp.serialize_pem().as_bytes(), 0o600)?;
 
-    println!("cert  -> {}", args.cert.display());
-    println!("key   -> {} (mode 0600)", args.key.display());
+    println!("cert  -> {}", cert_path.display());
+    println!("key   -> {} (mode 0600)", key_path.display());
     println!(
         "note: to trust configs signed by this key, copy {} into ~/.hermit/keys/",
-        args.cert.display()
+        cert_path.display()
     );
     Ok(0)
 }
 
-/// Write a private key file with restrictive permissions (0600 on unix).
-/// Uses `OpenOptions` so the permission bits apply from creation, not as
-/// a follow-up chmod race.
-fn write_private_key(path: &Path, pem: &str) -> Result<()> {
+/// Create `path` with the given mode bits and write `bytes` to it.
+///
+/// Open is `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`:
+/// * `O_EXCL` rejects pre-existing files, so we never silently
+///   overwrite a file the user (or an attacker) planted at this
+///   path. Callers handle `--force` by `unlink`-ing first.
+/// * `O_NOFOLLOW` rejects a symlink at the target — combined with
+///   `O_EXCL` this means the file we're about to write definitely
+///   wasn't there a moment ago and isn't aliasing anything else.
+/// * `mode` is set from creation, not via a chmod race.
+///
+/// On non-unix platforms falls back to `std::fs::write` — the
+/// restrictive flags don't have direct equivalents.
+fn write_new_file_excl(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(mode)
             .open(path)
             .with_context(|| format!("creating {}", path.display()))?;
-        f.write_all(pem.as_bytes())
+        f.write_all(bytes)
             .with_context(|| format!("writing {}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, pem)
+        let _ = mode;
+        std::fs::write(path, bytes)
             .with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Default location for the signer's PEM cert when `hermit sign` /
+/// `hermit keygen` is invoked without `--cert`. Lives next to the
+/// trust dir so a user who runs keygen → moves the cert into
+/// `keys/` → re-runs sign has a single home directory to think about.
+fn default_signer_cert_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .context("cannot locate signer cert: $HOME is not set")?;
+    Ok(Path::new(&home).join(".hermit/signer.cert.pem"))
+}
+
+/// Companion to [`default_signer_cert_path`] for the private key.
+fn default_signer_key_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .context("cannot locate signer key: $HOME is not set")?;
+    Ok(Path::new(&home).join(".hermit/signer.key.pem"))
 }
 
 fn default_trust_dir() -> Result<PathBuf> {

@@ -53,6 +53,11 @@ pub struct MitmConfig<P, C> {
     pub network_policy: Option<Arc<NetworkPolicy>>,
     /// Where to record block events. `BlockLogger::disabled()` by default.
     pub block_log: BlockLogger,
+    /// Where to record *allowed* access events (learn-mode trace).
+    /// `BlockLogger::disabled()` outside of `hermit learn`. Same
+    /// writer machinery as `block_log`; semantic distinction is by
+    /// the file path the writer is pointed at.
+    pub access_log: BlockLogger,
 }
 
 /// Run the MITM proxy accept loop.
@@ -147,6 +152,18 @@ where
         });
         return Ok(());
     }
+    // Allowed at the hostname level: record an access event so
+    // `hermit learn` users see the SNI even if the connection
+    // never produces an HTTP request (e.g. SNI cut-through path).
+    config.access_log.log(BlockEvent {
+        time_unix_ms: now_unix_ms(),
+        kind: BlockKind::TlsHostname,
+        client: Some(client_addr.to_string()),
+        hostname: Some(hostname.clone()),
+        method: None,
+        path: None,
+        reason: None,
+    });
 
     // Step 2b: Mechanism dispatch. If the rule for this host is
     // `sni`, skip MITM entirely and splice raw bytes — certificate
@@ -231,6 +248,18 @@ where
             http::write_403(&mut client_tls, "blocked by hermit policy").await?;
             return Ok(());
         }
+        // Allowed: record the request for learn-mode trace.
+        // Emitted once per request so a multi-request keep-alive
+        // session yields one access event per HTTP exchange.
+        config.access_log.log(BlockEvent {
+            time_unix_ms: now_unix_ms(),
+            kind: BlockKind::Https,
+            client: Some(client_addr.to_string()),
+            hostname: Some(hostname.clone()),
+            method: Some(request.method.clone()),
+            path: Some(request.path.clone()),
+            reason: None,
+        });
 
         // Credential injection (if a network policy is configured)
         if let Some(np) = &config.network_policy {
@@ -678,6 +707,7 @@ mod tests {
             upstream_port,
             network_policy: None,
             block_log: crate::block_log::BlockLogger::disabled(),
+            access_log: crate::block_log::BlockLogger::disabled(),
         };
 
         let hello = b"CLIENTHELLO".to_vec();

@@ -240,6 +240,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_returns_every_a_record_for_multi_answer_response() {
+        // Multi-A rrsets are common for load-balanced services.
+        // The parser must surface every address so the DNS-cache
+        // populates a reverse entry for each, and the bypass relay
+        // can authorize a connection regardless of which IP the
+        // child resolver happens to pick.
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x1234u16.to_be_bytes()); // id
+        out.extend_from_slice(&0x8180u16.to_be_bytes()); // flags
+        out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+        out.extend_from_slice(&3u16.to_be_bytes()); // ancount
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        for label in ["kdc", "example"] {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        out.extend_from_slice(&1u16.to_be_bytes()); // IN
+
+        // Three A records for the same name, each a name pointer
+        // to offset 12 (the question name).
+        for octet in [1u8, 2, 3] {
+            out.extend_from_slice(&0xC00Cu16.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes()); // type A
+            out.extend_from_slice(&1u16.to_be_bytes()); // IN
+            out.extend_from_slice(&300u32.to_be_bytes()); // ttl
+            out.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+            out.extend_from_slice(&[10, 0, 0, octet]);
+        }
+
+        let got = parse_answers(&out);
+        let ips: Vec<IpAddr> = got.iter().map(|a| a.ip).collect();
+        assert_eq!(
+            ips,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_tolerates_unknown_rrtype() {
         // Mix an A record with an unknown RR type (65535) and check
         // we only surface the A answer.

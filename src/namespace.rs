@@ -414,21 +414,34 @@ fn write_proc_or_skip(path: &str, content: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy a file, directory (recursively), or symlink from `src` to `dest`.
+/// Copy a file or directory (recursively) from `src` to `dest`.
+///
+/// Symlinks at `src` are *dereferenced* — the target's bytes get
+/// copied, the link does not. Two reasons:
+///
+///   1. The host's symlink target may not be reachable from inside
+///      the sandbox (different mount layout, different rootfs), so
+///      preserving the link would produce a dangling reference at
+///      the destination.
+///   2. Re-creating an attacker-influenced symlink in the sandbox
+///      $HOME is a small but real defense-in-depth gap. Following
+///      it once at copy time and bailing on a missing target is
+///      easier to reason about than carrying the link forward.
+///
+/// `fs::metadata` (not `symlink_metadata`) is used precisely so a
+/// link is followed once. The recursive directory walker does the
+/// same on every nested entry, so a symlink-to-directory inside a
+/// `copy` source is materialised as a directory tree.
 fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(src).with_context(|| {
-        format!("failed to stat {}", src.display())
+    let meta = fs::metadata(src).with_context(|| {
+        format!("failed to stat {} (symlink target may not exist)", src.display())
     })?;
     if meta.is_dir() {
         copy_dir_recursive(src, dest)
-    } else if meta.is_symlink() {
-        let target = fs::read_link(src).with_context(|| {
-            format!("failed to read symlink {}", src.display())
-        })?;
-        std::os::unix::fs::symlink(&target, dest).with_context(|| {
-            format!("failed to create symlink at {}", dest.display())
-        })
     } else {
+        // `fs::copy` follows symlinks by default, which is what we
+        // want here — the materialised file is independent of the
+        // original link.
         fs::copy(src, dest).with_context(|| {
             format!("failed to copy {} to {}", src.display(), dest.display())
         })?;
@@ -566,17 +579,46 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_entry_symlink() {
+    fn test_copy_entry_dereferences_symlink() {
+        // Symlinks at `src` get dereferenced: the destination is a
+        // regular file holding the target's bytes, not another
+        // symlink. The host's symlink target may not exist inside
+        // the sandbox, so preserving the link would produce a
+        // dangling reference at the destination.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.txt");
         let link = dir.path().join("link.txt");
         let dest = dir.path().join("dest_link.txt");
         fs::write(&target, "data").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
+
         copy_entry(&link, &dest).unwrap();
-        // dest should be a symlink pointing to the same target
-        assert!(fs::symlink_metadata(&dest).unwrap().is_symlink());
-        assert_eq!(fs::read_link(&dest).unwrap(), target);
+
+        let meta = fs::symlink_metadata(&dest).unwrap();
+        assert!(!meta.is_symlink(), "destination must not preserve the symlink");
+        assert!(meta.is_file());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "data");
+    }
+
+    #[test]
+    fn test_copy_entry_dangling_symlink_errors() {
+        // A symlink whose target was already deleted must not
+        // silently produce an empty file at the destination — the
+        // user gets a clear error so they can fix their `copy`
+        // directive instead of debugging mysterious empty files
+        // inside the sandbox.
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("dangling.txt");
+        let dest = dir.path().join("dest.txt");
+        std::os::unix::fs::symlink(dir.path().join("nope"), &dangling).unwrap();
+
+        let err = copy_entry(&dangling, &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to stat")
+                || err.to_string().contains("symlink target may not exist"),
+            "expected stat-failure context, got: {err:#}"
+        );
+        assert!(!dest.exists());
     }
 
     #[test]

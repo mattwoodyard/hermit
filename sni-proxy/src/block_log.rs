@@ -91,7 +91,23 @@ impl BlockLogger {
     ///
     /// Writes are flushed after every line so a crash loses at most the
     /// currently-in-channel events, not buffered ones.
+    ///
+    /// `O_NOFOLLOW` is set so a pre-planted symlink at the configured
+    /// path can't redirect log writes elsewhere — the default location
+    /// `$XDG_STATE_HOME/hermit/blocks.jsonl` is in user-writable space
+    /// and would otherwise be a small symlink-redirect surface.
     pub async fn to_file(path: &Path) -> Result<Self> {
+        // tokio's OpenOptions exposes `custom_flags` directly on
+        // unix — no trait import needed.
+        #[cfg(unix)]
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await
+            .with_context(|| format!("opening block log {}", path.display()))?;
+        #[cfg(not(unix))]
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -257,6 +273,35 @@ mod tests {
         let contents = tokio::fs::read_to_string(tmp.path()).await.unwrap();
         assert!(contents.starts_with("pre-existing\n"), "existing content preserved");
         assert!(contents.lines().count() >= 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_refuses_to_follow_a_symlink() {
+        // The default block-log path lives in user-writable space.
+        // If an attacker can plant a symlink at that path, we don't
+        // want hermit to start happily appending JSON to whatever
+        // file the symlink points at. The O_NOFOLLOW open should
+        // surface ELOOP rather than create the file.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        tokio::fs::write(&target, b"original\n").await.unwrap();
+        let link = dir.path().join("blocks.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = BlockLogger::to_file(&link).await;
+        let err = match result {
+            Ok(_) => panic!("expected open() through symlink to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("opening block log"),
+            "expected open-failure context, got: {err:#}"
+        );
+
+        // The symlink target must not have been touched.
+        let still = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(still, "original\n");
     }
 
     #[test]

@@ -43,6 +43,176 @@ pub enum Command {
     Verify(VerifyArgs),
     /// Generate a fresh ed25519 signer keypair + self-signed x509 cert.
     Keygen(KeygenArgs),
+    /// Edit an unsigned config TOML — add or remove `[[access_rule]]`
+    /// entries. Any existing `[signature]` section is dropped on
+    /// write because an edit invalidates the signature; re-sign with
+    /// `hermit sign` afterwards.
+    EditConfig(EditConfigArgs),
+    /// Run a command in the sandbox in *learn* mode: nothing is
+    /// blocked, every DNS query / TLS hostname / HTTP request is
+    /// recorded to a JSONL trace file. Use the trace to author
+    /// `[[access_rule]]` entries that match what the build
+    /// actually does.
+    Learn(LearnArgs),
+    /// Convert a `hermit learn` JSONL trace into a hermit.toml
+    /// scaffold — one `[[access_rule]]` per unique hostname,
+    /// with a best-effort mechanism guess (`sni` if the host's TLS
+    /// handshake never produced an HTTPS request, suggesting a
+    /// cert-pinning client; `mitm` otherwise).
+    LearnConvert(LearnConvertArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct LearnConvertArgs {
+    /// Path to the JSONL trace produced by `hermit learn`. Defaults
+    /// to `$XDG_STATE_HOME/hermit/access.jsonl`.
+    #[arg(long)]
+    pub input: Option<PathBuf>,
+
+    /// Where to write the generated TOML. Stdout when omitted, so
+    /// the output can be piped through `tee` / `>>` to combine with
+    /// an existing config.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// For each MITM rule, narrow with `methods = […]` listing every
+    /// HTTP method observed for that host. Off by default — the
+    /// resulting allowlist is broader but more forgiving.
+    #[arg(long)]
+    pub with_methods: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct LearnArgs {
+    /// URL of the config to load. Same shape as `hermit run --config`.
+    /// Hostname/path/method rules in this config are *ignored*; the
+    /// runtime builds an allow-all policy from it. Other sections
+    /// (`[sandbox]`, `[dns]`, includes, etc.) still apply.
+    ///
+    /// Optional in learn mode. When omitted, hermit synthesizes a
+    /// minimal config with `passthrough = ["/"]`, so the build can
+    /// touch the host filesystem freely while the proxies observe
+    /// network access. The intended workflow is "I have no rules
+    /// yet — let me see what my build does."
+    #[arg(long)]
+    pub config: Option<String>,
+
+    /// Skip signature verification on the loaded config(s).
+    #[arg(long)]
+    pub allow_unsigned: bool,
+
+    /// Verbose output. `-v` info, `-vv` debug, `-vvv` trace.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Project directory (read-write inside the sandbox).
+    #[arg(long, default_value = ".")]
+    pub project_dir: PathBuf,
+
+    /// Where to write the JSONL access trace. One line per allowed
+    /// DNS query / TLS connection / HTTP request. Defaults to
+    /// `$XDG_STATE_HOME/hermit/access.jsonl` (fallback
+    /// `~/.local/state/hermit/access.jsonl`).
+    #[arg(long)]
+    pub access_log: Option<PathBuf>,
+
+    /// Write hermit's own info/debug output to this file instead of
+    /// stderr.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
+
+    /// Command and arguments to run inside the sandbox.
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct EditConfigArgs {
+    #[command(subcommand)]
+    pub action: EditConfigAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EditConfigAction {
+    /// Append an `[[access_rule]]` to `<config>`. Same validation
+    /// as the runtime loader, so a bad combination of flags is
+    /// rejected before the file is written.
+    AddRule(AddRuleArgs),
+    /// Remove `[[access_rule]]` entries matching the given selector.
+    RemoveRule(RemoveRuleArgs),
+    /// Print a human-readable summary of the config (rules,
+    /// mechanisms, DNS upstream, sandbox mode, etc.). Useful for
+    /// confirming the result of add-rule / remove-rule.
+    Show(ShowArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ShowArgs {
+    /// Path to the TOML config. Not modified. Defaults to `hermit.toml`
+    /// in the current directory.
+    #[arg(default_value = "hermit.toml")]
+    pub config: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+pub struct AddRuleArgs {
+    /// Path to the TOML config. Edited in place. Defaults to
+    /// `hermit.toml` in the current directory.
+    #[arg(default_value = "hermit.toml")]
+    pub config: PathBuf,
+
+    /// Hostname this rule covers. Mutually exclusive with `--ip`.
+    #[arg(long, conflicts_with = "ip")]
+    pub host: Option<String>,
+
+    /// Literal IP this rule covers (bypass-only). Mutually
+    /// exclusive with `--host`.
+    #[arg(long)]
+    pub ip: Option<std::net::IpAddr>,
+
+    /// Enforcement mechanism: `mitm` (default), `sni`, or `bypass`.
+    #[arg(long, default_value = "mitm")]
+    pub mechanism: String,
+
+    /// Optional path prefix (mitm only).
+    #[arg(long)]
+    pub path_prefix: Option<String>,
+
+    /// Optional comma-separated HTTP methods (mitm only).
+    #[arg(long, value_delimiter = ',')]
+    pub methods: Option<Vec<String>>,
+
+    /// Protocol — `tcp` or `udp`. Required for bypass.
+    #[arg(long)]
+    pub protocol: Option<String>,
+
+    /// Port. Required for bypass. Reserved values 80/443 are
+    /// rejected.
+    #[arg(long)]
+    pub port: Option<u16>,
+}
+
+#[derive(Parser, Debug)]
+pub struct RemoveRuleArgs {
+    /// Path to the TOML config. Edited in place. Defaults to
+    /// `hermit.toml` in the current directory.
+    #[arg(default_value = "hermit.toml")]
+    pub config: PathBuf,
+
+    /// Match rules with this hostname.
+    #[arg(long, conflicts_with = "ip")]
+    pub host: Option<String>,
+
+    /// Match rules with this literal IP.
+    #[arg(long)]
+    pub ip: Option<std::net::IpAddr>,
+
+    /// When multiple rules match the selector, remove all of them.
+    /// Without this flag, matching more than one entry is an error
+    /// (safer default — ambiguity usually means the selector was
+    /// too broad).
+    #[arg(long)]
+    pub all_matching: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -96,14 +266,20 @@ pub struct RunArgs {
 #[derive(Parser, Debug)]
 pub struct SignArgs {
     /// Path to the signer's x509 certificate in PEM form.
+    /// Defaults to `~/.hermit/signer.cert.pem` (the path written by
+    /// `hermit keygen` with default flags).
     #[arg(long)]
-    pub cert: PathBuf,
+    pub cert: Option<PathBuf>,
 
     /// Path to the signer's PKCS8 ed25519 private key in PEM form.
+    /// Defaults to `~/.hermit/signer.key.pem` (the path written by
+    /// `hermit keygen` with default flags).
     #[arg(long)]
-    pub key: PathBuf,
+    pub key: Option<PathBuf>,
 
-    /// Config file to sign (must not already have a `[signature]` section).
+    /// Config file to sign (must not already have a `[signature]`
+    /// section). Defaults to `hermit.toml` in the current directory.
+    #[arg(default_value = "hermit.toml")]
     pub config: PathBuf,
 
     /// Write the signed output here. If omitted, overwrite `config` in place.
@@ -124,13 +300,16 @@ pub struct VerifyArgs {
 #[derive(Parser, Debug)]
 pub struct KeygenArgs {
     /// Write the self-signed x509 certificate here (PEM).
+    /// Defaults to `~/.hermit/signer.cert.pem` (parent directory
+    /// is created on demand).
     #[arg(long)]
-    pub cert: PathBuf,
+    pub cert: Option<PathBuf>,
 
-    /// Write the PKCS8 ed25519 private key here (PEM).
-    /// The file is created with mode 0600.
+    /// Write the PKCS8 ed25519 private key here (PEM). The file is
+    /// created with mode 0600. Defaults to `~/.hermit/signer.key.pem`
+    /// (parent directory is created on demand).
     #[arg(long)]
-    pub key: PathBuf,
+    pub key: Option<PathBuf>,
 
     /// Subject common name for the generated cert.
     #[arg(long, default_value = "hermit-signer")]
@@ -217,8 +396,8 @@ mod tests {
         ]);
         match cli.command {
             Command::Sign(args) => {
-                assert_eq!(args.cert, PathBuf::from("/tmp/cert.pem"));
-                assert_eq!(args.key, PathBuf::from("/tmp/key.pem"));
+                assert_eq!(args.cert, Some(PathBuf::from("/tmp/cert.pem")));
+                assert_eq!(args.key, Some(PathBuf::from("/tmp/key.pem")));
                 assert_eq!(args.config, PathBuf::from("config.toml"));
                 assert!(args.output.is_none());
             }
@@ -242,6 +421,22 @@ mod tests {
         match cli.command {
             Command::Sign(args) => {
                 assert_eq!(args.output, Some(PathBuf::from("/tmp/out.toml")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_sign_uses_defaults_when_flags_omitted() {
+        // No --cert, --key, or positional config: clap should accept
+        // the call so the runtime can substitute the default paths.
+        let cli = Cli::parse_from(["hermit", "sign"]);
+        match cli.command {
+            Command::Sign(args) => {
+                assert!(args.cert.is_none());
+                assert!(args.key.is_none());
+                assert_eq!(args.config, PathBuf::from("hermit.toml"));
+                assert!(args.output.is_none());
             }
             _ => panic!("wrong subcommand"),
         }
@@ -463,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_keygen_required_args() {
+    fn parse_keygen_with_explicit_paths() {
         let cli = Cli::parse_from([
             "hermit",
             "keygen",
@@ -474,8 +669,8 @@ mod tests {
         ]);
         match cli.command {
             Command::Keygen(args) => {
-                assert_eq!(args.cert, PathBuf::from("/tmp/c.pem"));
-                assert_eq!(args.key, PathBuf::from("/tmp/k.pem"));
+                assert_eq!(args.cert, Some(PathBuf::from("/tmp/c.pem")));
+                assert_eq!(args.key, Some(PathBuf::from("/tmp/k.pem")));
                 assert_eq!(args.subject, "hermit-signer");
                 assert!(!args.force);
             }
@@ -502,10 +697,81 @@ mod tests {
     }
 
     #[test]
-    fn keygen_requires_cert_and_key() {
-        assert!(Cli::try_parse_from(["hermit", "keygen"]).is_err());
-        assert!(Cli::try_parse_from(["hermit", "keygen", "--cert", "/x"]).is_err());
-        assert!(Cli::try_parse_from(["hermit", "keygen", "--key", "/x"]).is_err());
+    fn parse_keygen_uses_defaults_when_flags_omitted() {
+        // `hermit keygen` with no flags now succeeds; both --cert and
+        // --key fall back to ~/.hermit/signer.{cert,key}.pem at
+        // runtime.
+        let cli = Cli::parse_from(["hermit", "keygen"]);
+        match cli.command {
+            Command::Keygen(args) => {
+                assert!(args.cert.is_none());
+                assert!(args.key.is_none());
+                assert_eq!(args.subject, "hermit-signer");
+                assert!(!args.force);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_keygen_partial_flags_are_independent() {
+        // Either flag on its own is legal — the missing one falls
+        // back to its default.
+        let cli = Cli::parse_from(["hermit", "keygen", "--cert", "/x"]);
+        match cli.command {
+            Command::Keygen(args) => {
+                assert_eq!(args.cert, Some(PathBuf::from("/x")));
+                assert!(args.key.is_none());
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        let cli = Cli::parse_from(["hermit", "keygen", "--key", "/x"]);
+        match cli.command {
+            Command::Keygen(args) => {
+                assert!(args.cert.is_none());
+                assert_eq!(args.key, Some(PathBuf::from("/x")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_learn_with_config() {
+        let cli = Cli::parse_from([
+            "hermit",
+            "learn",
+            "--config",
+            "file:///tmp/wip.toml",
+            "--",
+            "make",
+        ]);
+        match cli.command {
+            Command::Learn(args) => {
+                assert_eq!(args.config.as_deref(), Some("file:///tmp/wip.toml"));
+                assert_eq!(args.command, vec!["make"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_learn_without_config() {
+        // The whole point of making --config optional: a fresh
+        // user with no rules yet should be able to invoke learn
+        // and have hermit synthesize a passthrough config.
+        let cli = Cli::parse_from(["hermit", "learn", "--", "make"]);
+        match cli.command {
+            Command::Learn(args) => {
+                assert!(args.config.is_none());
+                assert_eq!(args.command, vec!["make"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn learn_requires_command() {
+        assert!(Cli::try_parse_from(["hermit", "learn"]).is_err());
     }
 
     #[test]
@@ -515,5 +781,48 @@ mod tests {
         assert!(Cli::try_parse_from(["hermit", "--net", "isolate", "--", "make"]).is_err());
         assert!(Cli::try_parse_from(["hermit", "--allow", "x", "--", "make"]).is_err());
         assert!(Cli::try_parse_from(["hermit", "--", "make"]).is_err());
+    }
+
+    #[test]
+    fn parse_edit_config_show_defaults_to_local_hermit_toml() {
+        // edit-config show / add-rule / remove-rule: the positional
+        // <CONFIG> defaults to `hermit.toml` so the common case
+        // (operating on the project's config) needs no argument.
+        let cli = Cli::parse_from(["hermit", "edit-config", "show"]);
+        match cli.command {
+            Command::EditConfig(EditConfigArgs {
+                action: EditConfigAction::Show(args),
+            }) => assert_eq!(args.config, PathBuf::from("hermit.toml")),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_edit_config_add_rule_defaults_config_path() {
+        let cli = Cli::parse_from(["hermit", "edit-config", "add-rule", "--host", "x.example"]);
+        match cli.command {
+            Command::EditConfig(EditConfigArgs {
+                action: EditConfigAction::AddRule(args),
+            }) => {
+                assert_eq!(args.config, PathBuf::from("hermit.toml"));
+                assert_eq!(args.host.as_deref(), Some("x.example"));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_edit_config_remove_rule_defaults_config_path() {
+        let cli =
+            Cli::parse_from(["hermit", "edit-config", "remove-rule", "--host", "x.example"]);
+        match cli.command {
+            Command::EditConfig(EditConfigArgs {
+                action: EditConfigAction::RemoveRule(args),
+            }) => {
+                assert_eq!(args.config, PathBuf::from("hermit.toml"));
+                assert_eq!(args.host.as_deref(), Some("x.example"));
+            }
+            _ => panic!("wrong subcommand"),
+        }
     }
 }

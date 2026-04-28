@@ -36,6 +36,11 @@ path = "~/.rustup"
 action = "read"
 path = "~/.cargo"
 
+[[home_file]]
+action="pass"
+path="/data/cargo"
+
+
 # --- network: allow only claude.ai and its API ---------------------------
 # Any other host (DNS or TLS SNI) is dropped by the proxy. To extend the
 # allowlist, add more [[access_rule]] entries — e.g. statsig.anthropic.com

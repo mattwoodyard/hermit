@@ -3,6 +3,7 @@
 //! Each test exercises a different proxy surface (DNS, HTTP proxy) and
 //! asserts that a denial produces a JSON line in the configured file.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -143,7 +144,9 @@ async fn http_proxy_deny_writes_block_event() {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
+        allowed_connect_ports: BTreeSet::from([443]),
         block_log,
+        access_log: BlockLogger::disabled(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -196,7 +199,9 @@ async fn http_proxy_missing_host_emits_block_event() {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
+        allowed_connect_ports: BTreeSet::from([443]),
         block_log,
+        access_log: BlockLogger::disabled(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -234,7 +239,9 @@ async fn disabled_logger_writes_nothing_even_on_block() {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
+        allowed_connect_ports: BTreeSet::from([443]),
         block_log: BlockLogger::disabled(),
+        access_log: BlockLogger::disabled(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -286,7 +293,11 @@ async fn http_proxy_connect_tunnel_splices_bytes() {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
+        // Whitelist the dynamic origin port so the splice path is
+        // exercised without tripping the new CONNECT-port guard.
+        allowed_connect_ports: BTreeSet::from([origin_addr.port()]),
         block_log: BlockLogger::disabled(),
+        access_log: BlockLogger::disabled(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
@@ -329,7 +340,9 @@ async fn http_proxy_connect_denied_writes_block_event_and_403() {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
+        allowed_connect_ports: BTreeSet::from([443]),
         block_log,
+        access_log: BlockLogger::disabled(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
@@ -361,4 +374,59 @@ async fn http_proxy_connect_denied_writes_block_event_and_403() {
     assert_eq!(events[0]["type"], "http");
     assert_eq!(events[0]["method"], "CONNECT");
     assert_eq!(events[0]["hostname"], "blocked.example");
+}
+
+#[tokio::test]
+async fn http_proxy_connect_to_disallowed_port_blocks() {
+    // An allow-listed host on a non-HTTPS port (e.g. ssh on 22) must
+    // be denied even though the hostname rule would otherwise permit
+    // it. Otherwise a malicious build could use any allow-listed
+    // hostname as a generic egress to ssh/smtp/etc.
+    let log_file = NamedTempFile::new().unwrap();
+    let block_log = BlockLogger::to_file(log_file.path()).await.unwrap();
+
+    let rules = vec![AccessRule::host_only("allowed.example")];
+    let config = Arc::new(HttpProxyConfig {
+        policy: Arc::new(RuleSet::new(rules)),
+        connector: Arc::new(DirectConnector),
+        upstream_port: 80,
+        allowed_connect_ports: BTreeSet::from([443]),
+        block_log,
+        access_log: BlockLogger::disabled(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = http_proxy::run(listener, config).await;
+    });
+
+    let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT allowed.example:22 HTTP/1.1\r\nHost: allowed.example:22\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut response),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"),
+        "expected 403, got: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let events = read_events(log_file.path()).await;
+    assert_eq!(events.len(), 1, "expected one block event, got: {events:?}");
+    let e = &events[0];
+    assert_eq!(e["type"], "http");
+    assert_eq!(e["method"], "CONNECT");
+    assert_eq!(e["hostname"], "allowed.example");
+    assert!(
+        e["reason"].as_str().unwrap().contains("port 22"),
+        "block reason should name the bad port: {e:?}"
+    );
 }

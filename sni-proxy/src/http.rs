@@ -81,8 +81,9 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                     split_absolute_form(&raw_path)
                 };
 
-                let mut content_length = None;
+                let mut content_length: Option<u64> = None;
                 let mut chunked = false;
+                let mut transfer_encoding_seen = false;
                 let mut host = None;
                 let mut has_close = false;
                 let mut has_keep_alive = false;
@@ -91,9 +92,32 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                     if h.name.eq_ignore_ascii_case("content-length") {
                         let val = std::str::from_utf8(h.value)
                             .context("invalid content-length")?;
-                        content_length = Some(val.trim().parse::<u64>()
-                            .context("invalid content-length value")?);
+                        let parsed = val.trim().parse::<u64>()
+                            .context("invalid content-length value")?;
+                        // RFC 9112 §6.1: multiple Content-Length headers
+                        // with non-identical values are unrecoverable —
+                        // the proxy and the upstream may pick different
+                        // values, opening a smuggling window. Reject
+                        // unconditionally; the only safe duplicate is an
+                        // identical repeat.
+                        if let Some(prev) = content_length {
+                            if prev != parsed {
+                                bail!(
+                                    "request has conflicting Content-Length values \
+                                     ({prev} vs {parsed})"
+                                );
+                            }
+                        }
+                        content_length = Some(parsed);
                     } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                        // Multiple Transfer-Encoding headers leave
+                        // last-write-wins ambiguity that smugglers
+                        // exploit when the upstream parser disagrees.
+                        // Reject the second occurrence outright.
+                        if transfer_encoding_seen {
+                            bail!("request has multiple Transfer-Encoding headers");
+                        }
+                        transfer_encoding_seen = true;
                         let val = std::str::from_utf8(h.value)
                             .context("invalid transfer-encoding")?;
                         chunked = val.to_ascii_lowercase().contains("chunked");
@@ -552,16 +576,30 @@ pub async fn read_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Resp
         let mut resp = httparse::Response::new(&mut headers);
         match resp.parse(&buf) {
             Ok(httparse::Status::Complete(head_len)) => {
-                let mut content_length = None;
+                let mut content_length: Option<u64> = None;
                 let mut chunked = false;
+                let mut transfer_encoding_seen = false;
 
                 for h in resp.headers.iter() {
                     if h.name.eq_ignore_ascii_case("content-length") {
                         let val = std::str::from_utf8(h.value)
                             .context("invalid content-length")?;
-                        content_length = Some(val.trim().parse::<u64>()
-                            .context("invalid content-length value")?);
+                        let parsed = val.trim().parse::<u64>()
+                            .context("invalid content-length value")?;
+                        if let Some(prev) = content_length {
+                            if prev != parsed {
+                                bail!(
+                                    "response has conflicting Content-Length values \
+                                     ({prev} vs {parsed})"
+                                );
+                            }
+                        }
+                        content_length = Some(parsed);
                     } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                        if transfer_encoding_seen {
+                            bail!("response has multiple Transfer-Encoding headers");
+                        }
+                        transfer_encoding_seen = true;
                         let val = std::str::from_utf8(h.value)
                             .context("invalid transfer-encoding")?;
                         chunked = val.to_ascii_lowercase().contains("chunked");
@@ -683,6 +721,44 @@ mod tests {
         let mut reader = data;
         let req = read_request(&mut reader).await.unwrap();
         assert!(req.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_conflicting_content_length() {
+        // Two non-identical Content-Length headers — the proxy and
+        // the upstream might pick different values, opening a
+        // smuggling window. Reject with a parse error.
+        let data = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nhello";
+        let mut reader = &data[..];
+        let err = read_request(&mut reader).await.unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting Content-Length"),
+            "expected smuggling guard, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_accepts_identical_duplicate_content_length() {
+        // RFC 9112 §6.1 explicitly permits identical duplicates
+        // (an upstream proxy may have folded them); the parser
+        // collapses them silently.
+        let data = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader = &data[..];
+        let (req, _) = read_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(req.content_length, Some(5));
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_multiple_transfer_encoding_headers() {
+        // Multiple TE headers leave last-write-wins ambiguity that
+        // smugglers exploit when the upstream parser disagrees.
+        let data = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n";
+        let mut reader = &data[..];
+        let err = read_request(&mut reader).await.unwrap_err();
+        assert!(
+            err.to_string().contains("multiple Transfer-Encoding"),
+            "expected smuggling guard, got: {err}"
+        );
     }
 
     #[test]

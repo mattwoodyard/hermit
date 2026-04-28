@@ -98,6 +98,14 @@ pub fn run_sandboxed(
     config: &Config,
     block_log_override: Option<&Path>,
     block_log_disabled: bool,
+    // `hermit learn` passes the JSONL trace path here. `None` for
+    // `hermit run`. The proxies' `access_log` is disabled when
+    // this is None, so production runs pay nothing for it.
+    access_log_path: Option<&Path>,
+    // `true` for `hermit learn`. Switches the RuleSet into
+    // `permit_all` so every check returns Allow — the proxies
+    // observe and log without enforcing.
+    permit_all: bool,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("no command specified");
@@ -123,7 +131,15 @@ pub fn run_sandboxed(
     let passthrough: Vec<PathBuf> = drop_missing_passthrough(sandbox_cfg.passthrough.clone());
     let rw_paths = build_rw_paths(home_path, project_dir, &passthrough, &home_files);
 
-    let net = sandbox_cfg.net.to_cli();
+    // Learn mode (`permit_all`) forces `net = isolate` so the
+    // proxies actually run. A user who declared `net = "host"`
+    // expecting passthrough gets a warning here; without the
+    // override, learn mode would silently observe nothing.
+    let mut net = sandbox_cfg.net.to_cli();
+    if permit_all && net != NetMode::Isolate {
+        info!("learn mode: overriding net to `isolate` so the proxies can observe");
+        net = NetMode::Isolate;
+    }
     let access_rules = config.access_rules()?;
 
     match net {
@@ -139,7 +155,10 @@ pub fn run_sandboxed(
             }
             run_sandboxed_direct(home_path, project_dir, &passthrough, &home_files, &rw_paths, command)
         }
-        NetMode::Isolate if !access_rules.is_empty() => {
+        // Proxied path: triggered when there are explicit rules OR
+        // when learn mode wants to observe (which has no rules of
+        // its own but still needs the proxy listeners running).
+        NetMode::Isolate if !access_rules.is_empty() || permit_all => {
             info!(
                 "using proxied sandbox with network isolation ({} rules, {} extra port_forwards)",
                 access_rules.len(),
@@ -165,10 +184,14 @@ pub fn run_sandboxed(
             for (i, r) in ip_rules.iter().enumerate() {
                 debug!("  [{i}] ip={} mechanism={}", r.ip, r.mechanism);
             }
-            let policy = Arc::new(RuleSet::new(access_rules).with_ip_rules(ip_rules));
+            let policy = Arc::new(
+                RuleSet::new(access_rules)
+                    .with_ip_rules(ip_rules)
+                    .with_permit_all(permit_all),
+            );
             let network_policy = config.network_policy()?.map(Arc::new);
             let port_forwards: Vec<PortForwardSpec> = config.port_forwards.clone();
-            let dns_upstream = config.dns.upstream_addr()?;
+            let dns_upstream = config.dns().upstream_addr()?;
             process::run_forked_proxied(
                 home_path,
                 project_dir,
@@ -181,6 +204,7 @@ pub fn run_sandboxed(
                 &port_forwards,
                 block_log_path.as_deref(),
                 dns_upstream,
+                access_log_path,
             )
         }
         NetMode::Isolate => {
@@ -233,6 +257,19 @@ fn default_block_log_path() -> PathBuf {
     )
     .join("hermit")
     .join("blocks.jsonl")
+}
+
+/// Sibling of [`default_block_log_path`] for the access-trace
+/// produced by `hermit learn`. Lives next to `blocks.jsonl` so an
+/// operator running both `run` and `learn` finds both files in
+/// one place.
+pub fn default_access_log_path() -> PathBuf {
+    xdg_state_home_from(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .join("hermit")
+    .join("access.jsonl")
 }
 
 /// Pure resolver for `$XDG_STATE_HOME` given the two env vars it
@@ -290,7 +327,7 @@ mod tests {
     #[test]
     fn test_empty_command_fails() {
         let config = Config::default();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false, None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }
@@ -298,7 +335,7 @@ mod tests {
     #[test]
     fn test_empty_command_fails_net_isolate() {
         let config = Config::parse("[sandbox]\nnet = \"isolate\"\n").unwrap();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false);
+        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false, None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no command specified"));
     }

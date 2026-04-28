@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod config;
 pub mod config_loader;
+pub mod edit_config;
+pub mod learn_convert;
 pub mod fdpass;
 pub mod home_files;
 pub mod landlock;

@@ -29,11 +29,42 @@ hermit --passthrough /opt/toolchain -- cargo build
 ## CLI reference
 
 ```
-hermit run    [OPTIONS] -- <COMMAND>...
-hermit sign   --cert <PEM> --key <PEM> <CONFIG> [--output <PATH>]
-hermit verify [--trust-dir <DIR>] <CONFIG_URL>
-hermit keygen --cert <PEM> --key <PEM> [--subject <CN>] [--force]
+hermit run         [OPTIONS] -- <COMMAND>...
+hermit sign        [--cert <PEM>] [--key <PEM>] [<CONFIG>] [--output <PATH>]
+hermit verify      [--trust-dir <DIR>] <CONFIG_URL>
+hermit keygen      [--cert <PEM>] [--key <PEM>] [--subject <CN>] [--force]
+hermit edit-config add-rule    [<CONFIG>] [--host <H> | --ip <IP>] [--mechanism <M>] ...
+hermit edit-config remove-rule [<CONFIG>] [--host <H> | --ip <IP>] [--all-matching]
+hermit edit-config show        [<CONFIG>]
+hermit learn                   [--config <URL>] [--access-log <PATH>] -- <COMMAND>...
+hermit learn-convert           [--input <PATH>] [--output <PATH>] [--with-methods]
 ```
+
+Default paths picked up when a flag or positional argument is omitted:
+
+| Argument | Default |
+|---|---|
+| `run --config <URL>` | _(required — no default)_ |
+| `run --project-dir <DIR>` | `.` (current directory) |
+| `run --block-log <PATH>` | `$XDG_STATE_HOME/hermit/blocks.jsonl` (fallback `~/.local/state/hermit/blocks.jsonl`) |
+| `run --log-file <PATH>` | stderr |
+| `learn --config <URL>` | _(synthesizes a `passthrough = ["/"]` config)_ |
+| `learn --project-dir <DIR>` | `.` |
+| `learn --access-log <PATH>` | `$XDG_STATE_HOME/hermit/access.jsonl` |
+| `learn --log-file <PATH>` | stderr |
+| `learn-convert --input <PATH>` | `$XDG_STATE_HOME/hermit/access.jsonl` |
+| `learn-convert --output <PATH>` | stdout |
+| `sign --cert <PEM>` | `~/.hermit/signer.cert.pem` |
+| `sign --key <PEM>` | `~/.hermit/signer.key.pem` |
+| `sign <CONFIG>` | `hermit.toml` (current directory) |
+| `sign --output <PATH>` | overwrite `<CONFIG>` in place |
+| `verify <CONFIG_URL>` | _(required — no default)_ |
+| `verify --trust-dir <DIR>` | `~/.hermit/keys` (override with `HERMIT_TRUST_DIR`) |
+| `keygen --cert <PEM>` | `~/.hermit/signer.cert.pem` (parent dir created on demand) |
+| `keygen --key <PEM>` | `~/.hermit/signer.key.pem` (parent dir created on demand) |
+| `edit-config add-rule <CONFIG>` | `hermit.toml` |
+| `edit-config remove-rule <CONFIG>` | `hermit.toml` |
+| `edit-config show <CONFIG>` | `hermit.toml` |
 
 `hermit run` flags:
 
@@ -48,6 +79,112 @@ hermit keygen --cert <PEM> --key <PEM> [--subject <CN>] [--force]
 | `-v` / `--verbose` | off | Verbosity: `-v` info, `-vv` debug, `-vvv` trace |
 
 Everything after `--` is the command (and arguments) to run inside the sandbox.
+
+### Learn mode — discovering what rules to write
+
+`hermit learn` runs the same sandbox as `hermit run` but with one
+crucial difference: **nothing is blocked**. The DNS server, MITM
+proxy, HTTP proxy, and bypass relays observe every access and
+record it to a JSONL trace; the policy engine is forced into
+permit-all so the build completes normally.
+
+```sh
+# Use an existing wip config — its [sandbox] / [dns] / includes still apply,
+# only the access rules are ignored (replaced with permit-all).
+hermit learn --config file:///path/to/wip-rules.toml -- make
+
+# No config at all. Hermit synthesizes one with passthrough = ["/"]
+# so the build runs against the host filesystem unrestricted while
+# the proxies observe network access. Useful when you have no rules
+# yet and just want to see what the build does.
+hermit learn -- make
+```
+
+The trace file (default `$XDG_STATE_HOME/hermit/access.jsonl`,
+override with `--access-log`) holds one JSON object per access:
+DNS queries, TLS SNI hostnames, HTTP request lines, and CONNECT
+tunnel targets. Pipe it through `jq` to get the unique hosts a
+build needs:
+
+```sh
+jq -r '.hostname' ~/.local/state/hermit/access.jsonl | sort -u
+```
+
+Or use `hermit learn-convert` to turn the trace into a TOML
+scaffold directly:
+
+```sh
+# Stdout: dump rules to inspect, then redirect.
+hermit learn-convert > my-rules.toml
+
+# Or write directly.
+hermit learn-convert --output my-rules.toml
+
+# Aggregate the HTTP methods observed for each host into the rule
+# (broader allowlist by default; this narrows it).
+hermit learn-convert --with-methods --output my-rules.toml
+```
+
+The converter aggregates events by hostname (one rule per unique
+host, sorted alphabetically for stable diffs), and guesses the
+mechanism: a host whose TLS handshake never produced an HTTPS
+request is emitted as `mechanism = "sni"` (typical of cert-pinning
+clients), everything else is left at the `mitm` default. Each
+rule carries a `# observed: …` comment summarising the trace
+evidence so you can review before signing.
+
+Either way, end with `hermit run` for real enforcement.
+
+Notes:
+
+- Learn mode forces `net = isolate` regardless of the config so
+  the proxies can observe — a `net = host` config is a passthrough
+  to the host network and would skip every listener.
+- Bypass TCP/UDP relays only run when the config declares bypass
+  rules. Learn mode for non-HTTP protocols requires authoring the
+  rule first; the trace then confirms what bypass traffic looks
+  like.
+- Signature verification is skipped (the workflow assumes you're
+  authoring rules from scratch).
+
+### Editing a config
+
+`hermit edit-config` edits unsigned TOML in place while preserving
+comments and formatting. Any existing `[signature]` section is
+dropped on write (any edit invalidates the signature — re-sign
+with `hermit sign` afterwards).
+
+The positional `<CONFIG>` argument defaults to `hermit.toml` in the
+current directory; pass an explicit path to operate on a config
+elsewhere.
+
+```sh
+# Add a host rule (operates on ./hermit.toml by default)
+hermit edit-config add-rule --host api.example
+
+# Add a Kerberos-style bypass rule against an explicit path
+hermit edit-config add-rule path/to/hermit.toml \
+    --host kdc.example --mechanism bypass --protocol udp --port 88
+
+# Add a literal-IP bypass rule
+hermit edit-config add-rule --ip 10.0.0.5 \
+    --mechanism bypass --protocol tcp --port 389
+
+# Inspect what a config contains (rules, mechanisms, DNS, signature)
+hermit edit-config show
+
+# Remove a rule by host
+hermit edit-config remove-rule --host api.example
+
+# Remove all rules with the same host (when two rules disagree
+# only on path_prefix, for example)
+hermit edit-config remove-rule --host same.example --all-matching
+```
+
+Rules are validated before the file is touched — a bad combination
+of flags (e.g. `--mechanism bypass --path-prefix /foo`) surfaces the
+same error the runtime loader would produce, and the file stays
+unmodified.
 
 ## Filesystem isolation
 
