@@ -132,6 +132,7 @@ where
                 hostname: None,
                 method: None,
                 path: None,
+                port: None,
                 reason: Some("TLS connection without SNI".to_string()),
             });
             return Ok(());
@@ -148,6 +149,7 @@ where
             hostname: Some(hostname.clone()),
             method: None,
             path: None,
+            port: None,
             reason: Some("hostname not in allowlist".to_string()),
         });
         return Ok(());
@@ -162,6 +164,7 @@ where
         hostname: Some(hostname.clone()),
         method: None,
         path: None,
+        port: None,
         reason: None,
     });
 
@@ -243,6 +246,7 @@ where
                 hostname: Some(hostname.clone()),
                 method: Some(request.method.clone()),
                 path: Some(request.path.clone()),
+                port: None,
                 reason: Some("blocked by access rules".to_string()),
             });
             http::write_403(&mut client_tls, "blocked by hermit policy").await?;
@@ -258,6 +262,7 @@ where
             hostname: Some(hostname.clone()),
             method: Some(request.method.clone()),
             path: Some(request.path.clone()),
+            port: None,
             reason: None,
         });
 

@@ -38,6 +38,12 @@ pub(crate) struct TraceEvent {
     hostname: Option<String>,
     #[serde(default)]
     method: Option<String>,
+    /// Destination port. Only set for `tcp_observe` events today
+    /// (the learn-mode catch-all observer logs the pre-DNAT port
+    /// here so we can emit a `mechanism = "bypass"` rule that
+    /// names it).
+    #[serde(default)]
+    port: Option<u16>,
     // path, client, time_unix_ms, reason are present in the JSONL
     // but unused for v1 conversion.
 }
@@ -52,6 +58,22 @@ struct HostAggregate {
     saw_http: bool,
     saw_https: bool,
     methods: BTreeSet<String>,
+    /// TCP destination ports observed via the learn-mode
+    /// catch-all (`tcp_observe` events). Each port becomes a
+    /// separate `mechanism = "bypass"` rule when the scaffold is
+    /// rendered.
+    bypass_tcp_ports: BTreeSet<u16>,
+}
+
+impl HostAggregate {
+    /// True iff the host generated any HTTP/TLS/DNS traffic the
+    /// existing mitm/sni mechanism guess can speak to. A host with
+    /// only `tcp_observe` events skips the mitm/sni rule —
+    /// emitting one would be meaningless because the build wasn't
+    /// using HTTP.
+    fn has_web_traffic(&self) -> bool {
+        self.saw_dns || self.saw_tls || self.saw_http || self.saw_https
+    }
 }
 
 /// Top-level entry. Reads `args.input` (defaulting to the XDG
@@ -127,6 +149,16 @@ pub(crate) fn render(events: &[TraceEvent], input_path: &Path, with_methods: boo
                     entry.methods.insert(m.to_ascii_uppercase());
                 }
             }
+            "tcp_observe" => {
+                // The learn-mode catch-all observer fires for any
+                // TCP connection on a port outside the proxied
+                // set. Without a port the event isn't actionable
+                // (we can't write a bypass rule for "some port"),
+                // so events missing it are silently skipped.
+                if let Some(p) = ev.port {
+                    entry.bypass_tcp_ports.insert(p);
+                }
+            }
             _ => {} // tls_no_sni etc. — ignored at host level
         }
     }
@@ -159,24 +191,92 @@ pub(crate) fn render(events: &[TraceEvent], input_path: &Path, with_methods: boo
     let _ = writeln!(out);
 
     for (host, agg) in &hosts {
-        let mechanism = guess_mechanism(agg);
         let provenance = describe_provenance(agg);
-        let _ = writeln!(out, "# observed: {provenance}");
-        let _ = writeln!(out, "[[access_rule]]");
-        let _ = writeln!(out, "host = {host:?}");
-        // Emit `mechanism` even when it matches the default
-        // (`mitm`). The scaffold is meant to be edited, and a
-        // reader skimming the file shouldn't have to remember
-        // which fields fall back to which defaults — every rule
-        // should be self-describing.
-        let _ = writeln!(out, "mechanism = {mechanism:?}");
-        if with_methods && mechanism == "mitm" && !agg.methods.is_empty() {
-            let methods: Vec<String> = agg.methods.iter().map(|m| format!("{m:?}")).collect();
-            let _ = writeln!(out, "methods = [{}]", methods.join(", "));
+        let target_key = HostKey::parse(host);
+
+        // Web-shaped traffic gets a single mitm/sni rule. A host
+        // with only tcp_observe events (no DNS/TLS/HTTP) skips
+        // this branch entirely.
+        if agg.has_web_traffic() {
+            let mechanism = guess_mechanism(agg);
+            let _ = writeln!(out, "# observed: {provenance}");
+            let _ = writeln!(out, "[[access_rule]]");
+            target_key.write_target(&mut out);
+            // Emit `mechanism` even when it matches the default
+            // (`mitm`). The scaffold is meant to be edited, and a
+            // reader skimming the file shouldn't have to
+            // remember which fields fall back to which defaults
+            // — every rule should be self-describing.
+            let _ = writeln!(out, "mechanism = {mechanism:?}");
+            if with_methods && mechanism == "mitm" && !agg.methods.is_empty() {
+                let methods: Vec<String> = agg
+                    .methods
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect();
+                let _ = writeln!(out, "methods = [{}]", methods.join(", "));
+            }
+            let _ = writeln!(out);
         }
-        let _ = writeln!(out);
+
+        // One bypass rule per observed (host, port). Multiple
+        // ports for the same host become multiple rules so the
+        // operator can prune them individually.
+        for port in &agg.bypass_tcp_ports {
+            let _ = writeln!(out, "# observed: tcp port={port}");
+            let _ = writeln!(out, "[[access_rule]]");
+            target_key.write_target(&mut out);
+            let _ = writeln!(out, "mechanism = \"bypass\"");
+            let _ = writeln!(out, "protocol = \"tcp\"");
+            let _ = writeln!(out, "port = {port}");
+            let _ = writeln!(out);
+        }
     }
     out
+}
+
+/// What the observer recorded as `hostname` for an event:
+/// either a real DNS name (the common case, when the DNS cache
+/// reverse-mapped the dst IP) or a synthetic `ip:1.2.3.4` /
+/// `ip:unknown` placeholder. The latter rendering would not be
+/// a legal hostname; emit the rule using `ip = "…"` instead.
+enum HostKey<'a> {
+    Hostname(&'a str),
+    Ip(&'a str),
+    Unknown,
+}
+
+impl<'a> HostKey<'a> {
+    fn parse(raw: &'a str) -> Self {
+        if let Some(rest) = raw.strip_prefix("ip:") {
+            if rest == "unknown" {
+                HostKey::Unknown
+            } else {
+                HostKey::Ip(rest)
+            }
+        } else {
+            HostKey::Hostname(raw)
+        }
+    }
+
+    /// Write either a `host = "…"` or `ip = "…"` line. Synthetic
+    /// "unknown" sources are still emitted as a placeholder so
+    /// the operator notices and can fix the rule manually.
+    fn write_target(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            HostKey::Hostname(h) => {
+                let _ = writeln!(out, "host = {h:?}");
+            }
+            HostKey::Ip(ip) => {
+                let _ = writeln!(out, "ip = {ip:?}");
+            }
+            HostKey::Unknown => {
+                let _ = writeln!(out, "# FIXME: no hostname or IP captured for this connection");
+                let _ = writeln!(out, "host = \"REPLACE_ME\"");
+            }
+        }
+    }
 }
 
 fn guess_mechanism(a: &HostAggregate) -> &'static str {
@@ -224,6 +324,18 @@ fn ev(kind: &str, host: Option<&str>, method: Option<&str>) -> TraceEvent {
         kind: kind.to_string(),
         hostname: host.map(|s| s.to_string()),
         method: method.map(|s| s.to_string()),
+        port: None,
+    }
+}
+
+/// Test-only constructor for a `tcp_observe` event with a port.
+#[cfg(test)]
+fn ev_tcp(host: Option<&str>, port: u16) -> TraceEvent {
+    TraceEvent {
+        kind: "tcp_observe".to_string(),
+        hostname: host.map(|s| s.to_string()),
+        method: None,
+        port: Some(port),
     }
 }
 
@@ -393,5 +505,115 @@ this is not json
         convert(&args).unwrap();
         let written = std::fs::read_to_string(&output).unwrap();
         assert!(written.contains(r#"host = "ok.example""#));
+    }
+
+    #[test]
+    fn render_tcp_observe_only_host_emits_bypass_rule() {
+        // A host seen exclusively via the learn-mode catch-all
+        // observer (e.g. ssh on 22) should produce a bypass rule
+        // and *no* mitm rule — emitting mitm here would be a lie
+        // about the protocol.
+        let events = vec![ev_tcp(Some("git.example"), 22)];
+        let out = render(&events, &dummy_path(), false);
+
+        assert!(
+            !out.contains(r#"mechanism = "mitm""#),
+            "tcp-only host must not get a mitm rule: {out}"
+        );
+        assert!(out.contains(r#"host = "git.example""#));
+        assert!(out.contains(r#"mechanism = "bypass""#));
+        assert!(out.contains(r#"protocol = "tcp""#));
+        assert!(out.contains("port = 22"));
+        assert!(out.contains("# observed: tcp port=22"));
+    }
+
+    #[test]
+    fn render_tcp_observe_alongside_https_emits_both_rules() {
+        // A host that's both an HTTPS endpoint *and* a bypass
+        // target gets two rules — one mitm, one bypass — so the
+        // user can keep the L7 enforcement for 443 and add bypass
+        // for the non-HTTP port.
+        let events = vec![
+            ev("https", Some("dual.example"), Some("GET")),
+            ev_tcp(Some("dual.example"), 8000),
+        ];
+        let out = render(&events, &dummy_path(), false);
+
+        assert_eq!(
+            out.matches("[[access_rule]]").count(),
+            2,
+            "expected two rules (mitm + bypass), got: {out}"
+        );
+        assert!(out.contains(r#"mechanism = "mitm""#));
+        assert!(out.contains(r#"mechanism = "bypass""#));
+        assert!(out.contains("port = 8000"));
+    }
+
+    #[test]
+    fn render_tcp_observe_multiple_ports_per_host_emits_one_rule_each() {
+        // Two distinct ports for the same host → two bypass
+        // rules. The operator gets to prune them individually.
+        let events = vec![
+            ev_tcp(Some("svc.example"), 22),
+            ev_tcp(Some("svc.example"), 5432),
+            ev_tcp(Some("svc.example"), 22), // duplicate, dedup
+        ];
+        let out = render(&events, &dummy_path(), false);
+
+        assert_eq!(
+            out.matches("[[access_rule]]").count(),
+            2,
+            "expected two bypass rules (one per unique port): {out}"
+        );
+        assert!(out.contains("port = 22"));
+        assert!(out.contains("port = 5432"));
+    }
+
+    #[test]
+    fn render_tcp_observe_with_synthetic_ip_host_uses_ip_field() {
+        // The observer falls back to a synthetic `ip:1.2.3.4`
+        // hostname when the DNS cache has no reverse mapping.
+        // The converter must turn that into an `ip = "…"` rule
+        // (not `host = "ip:1.2.3.4"`) so the runtime parses it.
+        let events = vec![ev_tcp(Some("ip:10.0.0.5"), 22)];
+        let out = render(&events, &dummy_path(), false);
+
+        assert!(out.contains(r#"ip = "10.0.0.5""#),
+            "synthetic ip:… should become an ip = field: {out}");
+        assert!(!out.contains(r#"host = "ip:"#),
+            "synthetic prefix must not leak into a host = field: {out}");
+    }
+
+    #[test]
+    fn render_tcp_observe_unknown_host_emits_fixme() {
+        // The synthetic `ip:unknown` placeholder means the
+        // observer didn't have an SO_ORIGINAL_DST. The rule we
+        // emit is unusable as-is on purpose — it surfaces a
+        // FIXME so the operator notices instead of signing a
+        // garbage rule.
+        let events = vec![ev_tcp(Some("ip:unknown"), 22)];
+        let out = render(&events, &dummy_path(), false);
+
+        assert!(out.contains("# FIXME"),
+            "unknown-host rule should carry a FIXME marker: {out}");
+        assert!(out.contains("REPLACE_ME"));
+    }
+
+    #[test]
+    fn render_tcp_observe_event_without_port_is_ignored() {
+        // `port` is the only field we care about for tcp_observe
+        // — without it the event isn't actionable. Skip it
+        // silently so a malformed event doesn't poison the
+        // scaffold with a `port = 0` rule the runtime would
+        // reject.
+        let bad = TraceEvent {
+            kind: "tcp_observe".to_string(),
+            hostname: Some("svc.example".to_string()),
+            method: None,
+            port: None,
+        };
+        let out = render(&[bad], &dummy_path(), false);
+        assert!(!out.contains("[[access_rule]]"),
+            "tcp_observe without a port should produce no rule: {out}");
     }
 }

@@ -367,6 +367,7 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
                     hostname: Some(query.name.clone()),
                     method: None,
                     path: None,
+                    port: None,
                     reason: None,
                 });
                 self.answer_allowed(&query, buf, src).await
@@ -381,6 +382,7 @@ impl<P: ConnectionPolicy + Send + Sync + 'static> DnsServer<P> {
                     hostname: Some(query.name.clone()),
                     method: None,
                     path: None,
+                    port: None,
                     reason: Some("name not in allowlist".to_string()),
                 });
                 Some(build_refused(&query))

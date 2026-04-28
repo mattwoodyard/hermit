@@ -109,6 +109,7 @@ where
             hostname: None,
             method: None,
             path: None,
+            port: None,
             reason: Some("bypass-tcp: missing SO_ORIGINAL_DST".to_string()),
         });
         return Ok(());
@@ -161,6 +162,7 @@ where
             hostname: hostname_opt.clone(),
             method: None,
             path: Some(format!("{dst_ip}:{dst_port}")),
+            port: None,
             reason: Some(match hostname_opt.as_ref() {
                 Some(_) => "bypass-tcp: no matching host rule".to_string(),
                 None => "bypass-tcp: dst IP not in DNS cache and not allowed by ip rule".to_string(),

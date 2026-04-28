@@ -9,6 +9,7 @@ pub mod dns_cache;
 pub mod dns_forwarder;
 pub mod http;
 pub mod http_proxy;
+pub mod learn_observer;
 pub mod match_dsl;
 pub mod mitm;
 pub mod network_policy;

@@ -180,6 +180,7 @@ async fn handle_datagram(
             hostname: None,
             method: None,
             path: None,
+            port: None,
             reason: Some("bypass-udp: missing IP_ORIGDSTADDR cmsg".to_string()),
         });
         return;
@@ -353,6 +354,7 @@ async fn authorize(config: &BypassUdpConfig, src: &SocketAddr, orig_dst: SocketA
             hostname: hostname_opt.clone(),
             method: None,
             path: Some(orig_dst.to_string()),
+            port: None,
             reason: Some(match hostname_opt.as_ref() {
                 Some(_) => "bypass-udp: no matching host rule".to_string(),
                 None => "bypass-udp: dst IP not in DNS cache and not allowed by ip rule".to_string(),

@@ -44,6 +44,12 @@ pub enum BlockKind {
     Http,
     /// HTTPS request (post-MITM) was denied by access rules.
     Https,
+    /// Learn-mode catch-all observer saw a TCP connection on a port
+    /// that wasn't being intercepted by any of the named proxies.
+    /// Emitted to the access log only — there is no "block" path
+    /// for this kind in run mode (the connection would simply fail
+    /// because no DNAT exists for the port).
+    TcpObserve,
 }
 
 /// One block event. Owned strings because the event crosses a channel
@@ -64,6 +70,12 @@ pub struct BlockEvent {
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Destination port. Only set by [`BlockKind::TcpObserve`]
+    /// today; other kinds embed the port in `client` / `path` /
+    /// `hostname` per their own conventions and leave this field
+    /// `None` so the JSONL stays terse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -203,6 +215,7 @@ mod tests {
             hostname: Some("example.com".to_string()),
             method: None,
             path: None,
+            port: None,
             reason: None,
         }
     }
@@ -349,6 +362,7 @@ mod tests {
             hostname: None,
             method: None,
             path: None,
+            port: None,
             reason: None,
         };
         let s = serde_json::to_string(&evt).unwrap();

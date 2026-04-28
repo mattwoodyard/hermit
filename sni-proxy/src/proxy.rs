@@ -160,6 +160,7 @@ where
                 hostname: None,
                 method: None,
                 path: None,
+                port: None,
                 reason: Some("TLS connection without SNI".to_string()),
             });
             return Ok(());
@@ -177,6 +178,7 @@ where
                 hostname: Some(hostname),
                 method: None,
                 path: None,
+                port: None,
                 reason: Some("hostname not in allowlist".to_string()),
             });
             return Ok(());

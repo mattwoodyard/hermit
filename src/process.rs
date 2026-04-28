@@ -44,6 +44,10 @@ const BYPASS_TCP_BASE_PORT: u16 = 1090;
 /// about UDP-TCP clashes (they don't share port space) but the
 /// alignment is handy for logs.
 const BYPASS_UDP_BASE_PORT: u16 = 1400;
+/// Loopback port for the learn-mode catch-all TCP observer. Only
+/// bound + DNAT'd to when `permit_all = true`; the rest of run
+/// mode never opens this socket.
+const LEARN_OBSERVER_PORT: u16 = 1500;
 
 /// One TCP-bypass endpoint plus the loopback port where the relay
 /// listens for it. Both sides of the fork compute the same
@@ -330,6 +334,12 @@ pub fn run_forked_proxied(
     // SCM_RIGHTS channel.
     let bypass_tcp = compute_bypass_tcp_allocations(&policy);
     let bypass_udp = compute_bypass_udp_allocations(&policy);
+    // `permit_all` is set only by `hermit learn`. When it's on,
+    // the child binds an extra catch-all observer listener and
+    // installs a wildcard nft DNAT so connections on un-proxied
+    // ports get logged for `hermit learn-convert` to consume
+    // instead of failing with "no route to host".
+    let learn_mode = policy.is_permit_all();
 
     match unsafe { fork() }.context("fork failed")? {
         ForkResult::Child => {
@@ -348,6 +358,7 @@ pub fn run_forked_proxied(
                 port_forwards,
                 &bypass_tcp,
                 &bypass_udp,
+                learn_mode,
             );
         }
         ForkResult::Parent { child } => {
@@ -366,6 +377,7 @@ pub fn run_forked_proxied(
                 bypass_tcp,
                 bypass_udp,
                 port_forwards.to_vec(),
+                learn_mode,
             )
         }
     }
@@ -388,12 +400,13 @@ fn child_main_proxied(
     port_forwards: &[PortForwardSpec],
     bypass_tcp: &[BypassTcpAllocation],
     bypass_udp: &[BypassUdpAllocation],
+    learn_mode: bool,
 ) -> ! {
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
     if let Err(e) = child_proxied_setup(
         sock_fd, ca_pem, home_path, project_dir, passthrough, home_files, rw_paths,
-        port_forwards, bypass_tcp, bypass_udp,
+        port_forwards, bypass_tcp, bypass_udp, learn_mode,
     ) {
         eprintln!("hermit: proxied namespace setup failed: {:#}", e);
         std::process::exit(126);
@@ -450,6 +463,7 @@ fn child_proxied_setup(
     port_forwards: &[PortForwardSpec],
     bypass_tcp: &[BypassTcpAllocation],
     bypass_udp: &[BypassUdpAllocation],
+    learn_mode: bool,
 ) -> Result<()> {
     // Set up namespace isolation (user + mount + net)
     setup_namespace(home_path, project_dir, passthrough, home_files, true)?;
@@ -457,6 +471,17 @@ fn child_proxied_setup(
     // Network namespace setup
     netns::bring_up_loopback()?;
     netns::ensure_nft_nat_table()?;
+    // Learn-mode catch-all goes in FIRST. Specific port rules
+    // below get installed after it, and nftables `dnat`
+    // last-match-wins on the first packet of a flow — so a packet
+    // for :443 hits the wildcard (DNAT to observer) and then the
+    // specific rule (DNAT to MITM); the second wins. A packet
+    // for, say, :22 hits only the wildcard and lands on the
+    // observer. See `netns::add_nft_redirect_all_tcp`.
+    if learn_mode {
+        info!("netns: learn mode — installing catch-all observer DNAT");
+        netns::add_nft_redirect_all_tcp(LEARN_OBSERVER_PORT)?;
+    }
     netns::add_nft_redirect(HTTPS_PORT, PROXY_LISTEN_PORT)?;
     netns::add_nft_redirect(HTTP_PORT, HTTP_PROXY_LISTEN_PORT)?;
     for pf in port_forwards {
@@ -502,6 +527,17 @@ fn child_proxied_setup(
         .context("failed to bind HTTP proxy listener")?;
     let udp_socket = std::net::UdpSocket::bind("127.0.0.1:53")
         .context("failed to bind DNS socket")?;
+    // Learn-mode catch-all observer listener. Bound before the
+    // bypass sockets so the fd-order in the SCM_RIGHTS payload is
+    // stable for run mode (which doesn't include this fd at all).
+    let learn_observer_listener: Option<std::net::TcpListener> = if learn_mode {
+        Some(
+            std::net::TcpListener::bind(format!("127.0.0.1:{}", LEARN_OBSERVER_PORT))
+                .context("failed to bind learn-mode observer listener")?,
+        )
+    } else {
+        None
+    };
 
     // Bind one listener per bypass-tcp allocation. Order matches the
     // allocation order (which is deterministic), so the parent can
@@ -556,8 +592,11 @@ fn child_proxied_setup(
 
     // Send the fds to the parent. Order: HTTPS, HTTP, DNS, then
     // bypass-tcp fds (in allocation order), then bypass-udp-v4
-    // fds, then bypass-udp-v6 fds. The parent recomputes the same
-    // allocation order and splits the received vector by index.
+    // fds, then bypass-udp-v6 fds, then (learn mode only) the
+    // observer fd. The parent recomputes the same allocation
+    // order and splits the received vector by index — it knows
+    // whether to expect the observer fd from the same `learn_mode`
+    // flag that drove the binding here.
     let mut fds: Vec<i32> = vec![
         https_listener.as_raw_fd(),
         http_listener.as_raw_fd(),
@@ -571,6 +610,9 @@ fn child_proxied_setup(
     }
     for s in &bypass_udp_v6 {
         fds.push(s.as_raw_fd());
+    }
+    if let Some(l) = &learn_observer_listener {
+        fds.push(l.as_raw_fd());
     }
     fdpass::send_fds(sock_fd, &fds)
         .context("failed to send listener fds to parent")?;
@@ -606,21 +648,25 @@ fn parent_main_proxied(
     bypass_tcp: Vec<BypassTcpAllocation>,
     bypass_udp: Vec<BypassUdpAllocation>,
     port_forwards: Vec<PortForwardSpec>,
+    learn_mode: bool,
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
     // Receive the listener fds from the child. Layout (must match
     // `child_proxied_setup`'s send order): HTTPS, HTTP, DNS, then
     // TCP-bypass fds, then UDP-bypass v4 fds, then UDP-bypass v6
-    // fds. Each UDP allocation contributes two fds (one per
-    // family) so the split is `2 × bypass_udp.len()`.
+    // fds, then (only when `learn_mode`) the catch-all observer fd.
+    // Each UDP allocation contributes two fds (one per family) so
+    // the split is `2 × bypass_udp.len()`.
     let fixed_count = 3usize;
     let tcp_count = bypass_tcp.len();
     let udp_count = bypass_udp.len();
-    let total = fixed_count + tcp_count + 2 * udp_count;
+    let observer_count = if learn_mode { 1 } else { 0 };
+    let total = fixed_count + tcp_count + 2 * udp_count + observer_count;
     info!(
-        "parent: waiting for {} listener fds from child ({} bypass-tcp, {} bypass-udp × v4+v6)",
-        total, tcp_count, udp_count
+        "parent: waiting for {} listener fds from child ({} bypass-tcp, {} bypass-udp × v4+v6{})",
+        total, tcp_count, udp_count,
+        if learn_mode { ", +1 learn observer" } else { "" }
     );
     let fds = fdpass::recv_fds(sock_fd, total)
         .context("failed to receive listener fds from child")?;
@@ -631,9 +677,15 @@ fn parent_main_proxied(
     let tcp_start = fixed_count;
     let udp_v4_start = fixed_count + tcp_count;
     let udp_v6_start = udp_v4_start + udp_count;
+    let observer_start = udp_v6_start + udp_count;
     let bypass_tcp_raw_fds: Vec<i32> = fds[tcp_start..udp_v4_start].to_vec();
     let bypass_udp_v4_raw_fds: Vec<i32> = fds[udp_v4_start..udp_v6_start].to_vec();
-    let bypass_udp_v6_raw_fds: Vec<i32> = fds[udp_v6_start..].to_vec();
+    let bypass_udp_v6_raw_fds: Vec<i32> = fds[udp_v6_start..observer_start].to_vec();
+    let learn_observer_raw_fd: Option<i32> = if learn_mode {
+        Some(fds[observer_start])
+    } else {
+        None
+    };
 
     // Wait for child to complete all setup (namespace, nftables, landlock)
     ns_reader.wait()?;
@@ -774,6 +826,28 @@ fn parent_main_proxied(
         bypass_tcp_handles.push((real_port, handle));
     }
 
+    // Learn-mode catch-all observer. Bound to its own listener
+    // fd received from the child. When run mode is in effect this
+    // branch is skipped entirely — no fd was sent, no listener
+    // was bound.
+    let learn_observer_handle = match learn_observer_raw_fd {
+        Some(raw_fd) => {
+            let listener = fd_to_tokio_listener(raw_fd, &rt)
+                .context("learn-mode observer listener setup")?;
+            let cfg = Arc::new(sni_proxy::learn_observer::LearnObserverConfig {
+                dns_cache: Arc::clone(&dns_cache),
+                access_log: access_log.clone(),
+            });
+            let handle = rt.spawn(async move {
+                if let Err(e) = sni_proxy::learn_observer::run(listener, cfg).await {
+                    error!("learn-observer error: {}", e);
+                }
+            });
+            Some(handle)
+        }
+        None => None,
+    };
+
     // Spawn one UDP-bypass relay per (allocation, family). The UDP
     // module takes a raw fd because it does its own
     // `IP[V6]_RECVORIGDSTADDR` setup and cmsg-aware `recvmsg` —
@@ -847,6 +921,13 @@ fn parent_main_proxied(
             tokio::spawn(async move {
                 let r = handle.await;
                 let _ = tx.send((format!("bypass-udp/{label}:{real_port}"), r)).await;
+            });
+        }
+        if let Some(handle) = learn_observer_handle {
+            let tx = name_tx.clone();
+            tokio::spawn(async move {
+                let r = handle.await;
+                let _ = tx.send(("learn-observer".to_string(), r)).await;
             });
         }
         drop(name_tx);

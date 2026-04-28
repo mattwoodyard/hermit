@@ -140,6 +140,7 @@ where
                     hostname: None,
                     method: Some(request.method.clone()),
                     path: Some(request.path.clone()),
+                    port: None,
                     reason: Some("HTTP request without Host header".to_string()),
                 });
                 return Ok(());
@@ -166,6 +167,7 @@ where
                 hostname: Some(hostname.clone()),
                 method: Some(request.method.clone()),
                 path: Some(request.path.clone()),
+                port: None,
                 reason: Some("blocked by access rules".to_string()),
             });
             http::write_403(&mut client, "blocked by hermit policy").await?;
@@ -179,6 +181,7 @@ where
             hostname: Some(hostname.clone()),
             method: Some(request.method.clone()),
             path: Some(request.path.clone()),
+            port: None,
             reason: None,
         });
 
@@ -303,6 +306,7 @@ where
             hostname: Some(host.clone()),
             method: Some("CONNECT".to_string()),
             path: Some(request.path.clone()),
+            port: None,
             reason: Some(format!(
                 "CONNECT to port {port} is not in the HTTPS port allowlist"
             )),
@@ -322,6 +326,7 @@ where
             hostname: Some(host.clone()),
             method: Some("CONNECT".to_string()),
             path: Some(request.path.clone()),
+            port: None,
             reason: Some("blocked by access rules".to_string()),
         });
         // 403 over a CONNECT attempt is what curl/requests expect — the
@@ -342,6 +347,7 @@ where
         hostname: Some(host.clone()),
         method: Some("CONNECT".to_string()),
         path: Some(request.path.clone()),
+        port: None,
         reason: None,
     });
 

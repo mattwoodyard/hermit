@@ -298,6 +298,63 @@ pub fn add_nft_redirect_udp(from_port: u16, to_port: u16) -> Result<()> {
     add_nft_redirect_proto(Protocol::UDP, from_port, to_port)
 }
 
+/// Catch-all TCP DNAT: `meta l4proto tcp` → `127.0.0.1:<to_port>`.
+///
+/// Used by `hermit learn` to install a wildcard observer at the
+/// loopback `to_port` so connections on un-proxied ports don't
+/// vanish into a "no route to host" error — instead the observer
+/// records the (dst_ip, dst_port) for the trace.
+///
+/// **Ordering matters.** Install this *before* the port-specific
+/// rules. nftables evaluates NAT rules in order on the first
+/// packet of a flow, and a later `dnat` overwrites an earlier
+/// one. So the conventional layout is:
+///
+/// ```text
+/// add_nft_redirect_all_tcp(LEARN_OBSERVER_PORT) // catch-all, FIRST
+/// add_nft_redirect(443, MITM_PORT)              // overwrites for :443
+/// add_nft_redirect(80,  HTTP_PROXY_PORT)        // overwrites for :80
+/// ```
+///
+/// With this order a packet for :443 hits the catch-all (DNAT to
+/// observer) and then the specific rule (DNAT to MITM); the second
+/// `dnat` wins. A packet for :22 hits only the catch-all, so it
+/// goes to the observer.
+pub fn add_nft_redirect_all_tcp(to_port: u16) -> Result<()> {
+    info!(
+        "netns: adding catch-all nat rule (tcp -> 127.0.0.1:{}) (via netlink)",
+        to_port
+    );
+    let table = hermit_table();
+    let chain = output_chain(&table);
+
+    let dst_ip: [u8; 4] = [127, 0, 0, 1];
+    let dst_port: [u8; 2] = to_port.to_be_bytes();
+
+    // No `dport` predicate — `protocol(Protocol::TCP)` matches
+    // every TCP packet. Same DNAT register layout as the
+    // port-specific rules in `add_nft_redirect_proto`.
+    let rule = Rule::new(&chain)
+        .context("constructing catch-all nat rule")?
+        .protocol(Protocol::TCP)
+        .with_expr(Immediate::new_data(dst_ip.to_vec(), Register::Reg1))
+        .with_expr(Immediate::new_data(dst_port.to_vec(), Register::Reg2))
+        .with_expr(
+            Nat::default()
+                .with_nat_type(NatType::DNat)
+                .with_family(ProtocolFamily::Ipv4)
+                .with_ip_register(Register::Reg1)
+                .with_port_register(Register::Reg2),
+        );
+
+    let mut batch = Batch::new();
+    batch.add(&rule, MsgType::Add);
+    send_batch(batch).with_context(|| {
+        format!("adding catch-all rule tcp -> :{to_port}")
+    })?;
+    Ok(())
+}
+
 /// IPv6 UDP DNAT: `udp dport <from_port>` → `[::1]:<to_port>`. The
 /// table family is `ip6`, so call [`ensure_nft_nat_table_v6`] first.
 ///
