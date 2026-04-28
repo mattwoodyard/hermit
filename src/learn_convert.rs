@@ -164,9 +164,12 @@ pub(crate) fn render(events: &[TraceEvent], input_path: &Path, with_methods: boo
         let _ = writeln!(out, "# observed: {provenance}");
         let _ = writeln!(out, "[[access_rule]]");
         let _ = writeln!(out, "host = {host:?}");
-        if mechanism != "mitm" {
-            let _ = writeln!(out, "mechanism = {mechanism:?}");
-        }
+        // Emit `mechanism` even when it matches the default
+        // (`mitm`). The scaffold is meant to be edited, and a
+        // reader skimming the file shouldn't have to remember
+        // which fields fall back to which defaults — every rule
+        // should be self-describing.
+        let _ = writeln!(out, "mechanism = {mechanism:?}");
         if with_methods && mechanism == "mitm" && !agg.methods.is_empty() {
             let methods: Vec<String> = agg.methods.iter().map(|m| format!("{m:?}")).collect();
             let _ = writeln!(out, "methods = [{}]", methods.join(", "));
@@ -265,10 +268,13 @@ mod tests {
             ev("https", Some("api.example"), Some("GET")),
         ];
         let out = render(&events, &dummy_path(), false);
-        // mitm is the default and is omitted from the rule body.
+        // Every rule is emitted self-describingly — including the
+        // `mechanism` field even when it equals the default. A
+        // reader of the scaffold shouldn't have to know which
+        // fields fall back to which defaults.
         assert!(out.contains(r#"host = "api.example""#));
-        assert!(!out.contains("mechanism"),
-            "mitm should be implicit (default), not written: {out}");
+        assert!(out.contains(r#"mechanism = "mitm""#),
+            "mitm should be written explicitly, not left implicit: {out}");
     }
 
     #[test]
