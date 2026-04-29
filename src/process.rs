@@ -67,6 +67,110 @@ struct BypassUdpAllocation {
     relay_port: u16,
 }
 
+/// Snapshot of the nftables layout we install before exec, used
+/// for a single human-readable summary log. Order in the vector
+/// matches install order, which is also nftables evaluation order
+/// (first-match-wins for `dnat`). The `from_port = None` form
+/// represents a catch-all (no `dport` predicate).
+#[derive(Debug, Default)]
+struct NftPlan {
+    rows: Vec<NftRow>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NftFamily {
+    /// IPv4 TCP. Includes both port-specific rules and the
+    /// learn-mode catch-all.
+    TcpV4,
+    UdpV4,
+    UdpV6,
+}
+
+#[derive(Debug)]
+struct NftRow {
+    family: NftFamily,
+    /// `Some(port)` for a `dport == port` rule, `None` for a
+    /// catch-all (`meta l4proto tcp` without a port predicate).
+    from_port: Option<u16>,
+    /// Loopback port the rule DNATs to.
+    to_port: u16,
+    /// Short human-friendly description of what the rule routes.
+    label: &'static str,
+}
+
+impl NftPlan {
+    fn push_tcp(&mut self, from_port: Option<u16>, to_port: u16, label: &'static str) {
+        self.rows.push(NftRow { family: NftFamily::TcpV4, from_port, to_port, label });
+    }
+    fn push_udp_v4(&mut self, from_port: u16, to_port: u16, label: &'static str) {
+        self.rows.push(NftRow {
+            family: NftFamily::UdpV4,
+            from_port: Some(from_port),
+            to_port,
+            label,
+        });
+    }
+    fn push_udp_v6(&mut self, from_port: u16, to_port: u16, label: &'static str) {
+        self.rows.push(NftRow {
+            family: NftFamily::UdpV6,
+            from_port: Some(from_port),
+            to_port,
+            label,
+        });
+    }
+
+    /// Render a fixed-width table. Columns: index, family, source
+    /// port (or `*` for catch-all), arrow, dest, label. Index is
+    /// the order packets see — rule 1 is consulted before rule 2.
+    fn render(&self) -> String {
+        use std::fmt::Write as _;
+        if self.rows.is_empty() {
+            return "  (no rules)".to_string();
+        }
+        // Compute the width of the source-port column so the
+        // arrow lines up across rows.
+        let from_w = self
+            .rows
+            .iter()
+            .map(|r| {
+                r.from_port
+                    .map(|p| p.to_string().len())
+                    .unwrap_or(1) // `*`
+            })
+            .max()
+            .unwrap_or(1);
+        let mut out = String::new();
+        for (i, r) in self.rows.iter().enumerate() {
+            let proto = match r.family {
+                NftFamily::TcpV4 => "tcp ",
+                NftFamily::UdpV4 => "udp4",
+                NftFamily::UdpV6 => "udp6",
+            };
+            let from = match r.from_port {
+                Some(p) => format!("{p:>from_w$}"),
+                None => format!("{:>from_w$}", "*"),
+            };
+            let dst_addr = match r.family {
+                NftFamily::UdpV6 => "[::1]",
+                _ => "127.0.0.1",
+            };
+            let _ = writeln!(
+                out,
+                "  [{:>2}] {proto} :{from} -> {dst_addr}:{:<5}  ({})",
+                i + 1,
+                r.to_port,
+                r.label,
+            );
+        }
+        // Trim the trailing newline so callers get a clean
+        // single-block log line.
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+}
+
 fn compute_bypass_tcp_allocations(rules: &RuleSet) -> Vec<BypassTcpAllocation> {
     rules
         .bypass_endpoints()
@@ -468,39 +572,32 @@ fn child_proxied_setup(
     // Set up namespace isolation (user + mount + net)
     setup_namespace(home_path, project_dir, passthrough, home_files, true)?;
 
-    // Network namespace setup
+    // Network namespace setup. Install nft rules in
+    // first-match-wins order: specific port rules first, then any
+    // bypass rules, then the learn-mode catch-all LAST. nftables
+    // NAT terminates chain processing on the first matching `dnat`
+    // (NF_ACCEPT verdict from nft_nat), so a catch-all installed
+    // ahead of the specific rules would gobble all TCP traffic
+    // before the MITM/HTTP/bypass rules ever fire. See
+    // `netns::add_nft_redirect_all_tcp` for the full reasoning.
     netns::bring_up_loopback()?;
     netns::ensure_nft_nat_table()?;
-    // Learn-mode catch-all goes in FIRST. Specific port rules
-    // below get installed after it, and nftables `dnat`
-    // last-match-wins on the first packet of a flow — so a packet
-    // for :443 hits the wildcard (DNAT to observer) and then the
-    // specific rule (DNAT to MITM); the second wins. A packet
-    // for, say, :22 hits only the wildcard and lands on the
-    // observer. See `netns::add_nft_redirect_all_tcp`.
-    if learn_mode {
-        info!("netns: learn mode — installing catch-all observer DNAT");
-        netns::add_nft_redirect_all_tcp(LEARN_OBSERVER_PORT)?;
-    }
+    let mut nft_plan = NftPlan::default();
     netns::add_nft_redirect(HTTPS_PORT, PROXY_LISTEN_PORT)?;
+    nft_plan.push_tcp(Some(HTTPS_PORT), PROXY_LISTEN_PORT, "MITM proxy");
     netns::add_nft_redirect(HTTP_PORT, HTTP_PROXY_LISTEN_PORT)?;
+    nft_plan.push_tcp(Some(HTTP_PORT), HTTP_PROXY_LISTEN_PORT, "HTTP proxy");
     for pf in port_forwards {
-        let dest = match pf.protocol {
-            PortProtocol::Https => PROXY_LISTEN_PORT,
-            PortProtocol::Http => HTTP_PROXY_LISTEN_PORT,
+        let (dest, label) = match pf.protocol {
+            PortProtocol::Https => (PROXY_LISTEN_PORT, "port_forward https → MITM"),
+            PortProtocol::Http => (HTTP_PROXY_LISTEN_PORT, "port_forward http → HTTP proxy"),
         };
-        info!(
-            "netns: extra port_forward {} ({:?}) -> 127.0.0.1:{}",
-            pf.port, pf.protocol, dest
-        );
         netns::add_nft_redirect(pf.port, dest)?;
+        nft_plan.push_tcp(Some(pf.port), dest, label);
     }
     for alloc in bypass_tcp {
-        info!(
-            "netns: bypass-tcp port_forward {} -> 127.0.0.1:{}",
-            alloc.real_port, alloc.relay_port
-        );
         netns::add_nft_redirect(alloc.real_port, alloc.relay_port)?;
+        nft_plan.push_tcp(Some(alloc.real_port), alloc.relay_port, "bypass-tcp");
     }
     // UDP bypass: install both v4 and v6 DNAT rules. Each rule
     // retargets the real port onto our loopback relay port in the
@@ -511,13 +608,18 @@ fn child_proxied_setup(
         netns::ensure_nft_nat_table_v6()?;
     }
     for alloc in bypass_udp {
-        info!(
-            "netns: bypass-udp port_forward {} -> 127.0.0.1:{} + [::1]:{}",
-            alloc.real_port, alloc.relay_port, alloc.relay_port
-        );
         netns::add_nft_redirect_udp(alloc.real_port, alloc.relay_port)?;
+        nft_plan.push_udp_v4(alloc.real_port, alloc.relay_port, "bypass-udp v4");
         netns::add_nft_redirect_udp_v6(alloc.real_port, alloc.relay_port)?;
+        nft_plan.push_udp_v6(alloc.real_port, alloc.relay_port, "bypass-udp v6");
     }
+    // Learn-mode catch-all is the FALLBACK rule — installed last
+    // so it only fires for TCP that didn't match anything above.
+    if learn_mode {
+        netns::add_nft_redirect_all_tcp(LEARN_OBSERVER_PORT)?;
+        nft_plan.push_tcp(None, LEARN_OBSERVER_PORT, "learn-mode observer (catch-all)");
+    }
+    info!("nft layout (first-match-wins):\n{}", nft_plan.render());
 
     // Create listener sockets inside the new network namespace.
     // These will be transferred to the parent via SCM_RIGHTS.
@@ -1131,5 +1233,63 @@ mod tests {
             assert!(v.contains("127.0.0.1"), "NO_PROXY missing 127.0.0.1: {v}");
             assert!(v.contains("localhost"), "NO_PROXY missing localhost: {v}");
         }
+    }
+
+    #[test]
+    fn nft_plan_render_lists_rules_in_install_order() {
+        // The summary lists rules in nft-evaluation order
+        // (first-match-wins) so a reader can scan top-to-bottom
+        // and predict which rule a packet hits.
+        let mut plan = NftPlan::default();
+        plan.push_tcp(Some(443), 1443, "MITM proxy");
+        plan.push_tcp(Some(80), 1080, "HTTP proxy");
+        plan.push_tcp(Some(8443), 1443, "port_forward https → MITM");
+        plan.push_tcp(Some(389), 1090, "bypass-tcp");
+        plan.push_udp_v4(88, 1400, "bypass-udp v4");
+        plan.push_udp_v6(88, 1400, "bypass-udp v6");
+        plan.push_tcp(None, 1500, "learn-mode observer (catch-all)");
+
+        let out = plan.render();
+        // Every label appears.
+        for label in [
+            "MITM proxy", "HTTP proxy", "port_forward https",
+            "bypass-tcp", "bypass-udp v4", "bypass-udp v6",
+            "learn-mode observer",
+        ] {
+            assert!(out.contains(label), "missing {label} in: {out}");
+        }
+        // Catch-all renders with `*` instead of a specific port.
+        // (The exact padding depends on the widest source port
+        // in the plan; here 8443 dictates a 4-char column.)
+        assert!(out.contains(":   * ->"),
+            "catch-all must render with `*` source port: {out}");
+        // Indices are 1-based and ordered.
+        let i_443 = out.find("[ 1]").expect("rule [ 1] missing");
+        let i_obs = out.find("[ 7]").expect("rule [ 7] missing");
+        assert!(i_443 < i_obs, "rule order must be preserved");
+        // IPv6 UDP renders with `[::1]` (not 127.0.0.1).
+        assert!(out.contains("[::1]:1400"), "udp v6 must use [::1]: {out}");
+    }
+
+    #[test]
+    fn nft_plan_render_handles_no_rules() {
+        let plan = NftPlan::default();
+        assert!(plan.render().contains("(no rules)"));
+    }
+
+    #[test]
+    fn nft_plan_aligns_source_port_column() {
+        // Width-aligned source-port column means a one-line
+        // `grep` for `:443 ->` keeps working regardless of how
+        // many other rules are above/below.
+        let mut plan = NftPlan::default();
+        plan.push_tcp(Some(443), 1443, "MITM");
+        plan.push_tcp(Some(80), 1080, "HTTP");
+        plan.push_tcp(Some(50000), 1090, "bypass");
+        let out = plan.render();
+        // Each `:<port>` column should be the same width — the
+        // narrowest port (80) gets padded out to match 50000 (5).
+        assert!(out.contains(":   80 ->"), "80 should be right-padded: {out}");
+        assert!(out.contains(":50000 ->"), "{out}");
     }
 }

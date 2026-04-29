@@ -16,33 +16,83 @@ const SYSTEM_CA_PATHS: &[&str] = &[
     "/etc/ssl/ca-bundle.pem",
 ];
 
-/// Path where we write the hermit CA PEM for tool-specific env vars.
+/// Path where we write the combined CA bundle for tool-specific
+/// env vars.
+///
+/// Lives on the *sandbox* `/tmp` — `setup_namespace` mounts a
+/// fresh tmpfs over `/tmp` inside the new mount namespace before
+/// `install_ca_cert` runs, so this path is mount-isolated from
+/// the host's `/tmp`. The file goes away with the sandbox when
+/// the build exits and is never visible to the host.
 const HERMIT_CA_PATH: &str = "/tmp/.hermit-ca.pem";
 
 /// Install the CA certificate PEM into the sandbox.
 ///
-/// 1. Writes the CA PEM to a temp file.
-/// 2. Finds the system CA bundle, appends our CA, and bind-mounts the
-///    modified bundle over the original.
-/// 3. Sets environment variables that build tools use to find CA certs.
+/// 1. Writes [system bundle + hermit CA] to `HERMIT_CA_PATH` on
+///    the sandbox tmpfs. Tools that exclusively follow the
+///    `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`
+///    style of env-var trust pointer get *both* the hermit CA
+///    (needed for MITM'd HTTPS) and the host's system roots
+///    (needed for bypass-mode connections that splice raw bytes
+///    to a real origin and let the build validate the origin's
+///    cert itself). When no system bundle exists, the file holds
+///    just the hermit CA.
+/// 2. If a system bundle exists, also bind-mounts the
+///    [system + hermit] file over the bundle path so tools that
+///    follow the OS default path (e.g. OpenSSL with no env var)
+///    pick up the hermit CA too.
+/// 3. Sets the env vars that build tools look for.
 ///
-/// Must be called after mount namespace setup and before landlock.
+/// Must be called after mount-namespace setup (so `/tmp` is the
+/// sandbox tmpfs) and before landlock (so `mount` and writes
+/// under `/etc` are still permitted).
 pub fn install_ca_cert(ca_pem: &str) -> Result<()> {
-    // Write standalone CA file for env vars
-    std::fs::write(HERMIT_CA_PATH, ca_pem)
-        .context("failed to write hermit CA PEM")?;
+    let system_bundle = find_system_ca_bundle();
+    // Build the combined bundle once. Both the env-var file and
+    // the bind-mount source share the same bytes.
+    let combined = build_combined_bundle(system_bundle, ca_pem)?;
 
-    // Find and patch the system CA bundle
-    if let Some(bundle_path) = find_system_ca_bundle() {
-        install_into_system_bundle(bundle_path, ca_pem)?;
+    // Write the combined bundle to the sandbox tmpfs path that
+    // env-var-following tools point at.
+    std::fs::write(HERMIT_CA_PATH, combined.as_bytes())
+        .with_context(|| format!("failed to write {} (combined CA bundle)", HERMIT_CA_PATH))?;
+
+    if let Some(bundle_path) = system_bundle {
+        install_into_system_bundle(bundle_path, &combined)?;
     } else {
-        info!("trust: no system CA bundle found, relying on env vars only");
+        info!(
+            "trust: no system CA bundle found at {:?}; \
+             {} holds the hermit CA only",
+            SYSTEM_CA_PATHS, HERMIT_CA_PATH
+        );
     }
 
-    // Set env vars for tools that use them
     set_trust_env_vars();
 
     Ok(())
+}
+
+/// Concatenate the system bundle (when present) with the hermit
+/// CA cert. The hermit CA is appended *after* the system roots so
+/// tools that early-out on the first verifier match still try
+/// the system roots first for bypass-mode TLS, while MITM'd
+/// connections (where only the hermit CA can verify) still fall
+/// through to the appended block.
+fn build_combined_bundle(system_bundle: Option<&str>, ca_pem: &str) -> Result<String> {
+    let mut combined = match system_bundle {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read system CA bundle {}", path))?,
+        None => String::new(),
+    };
+    if !combined.is_empty() && !combined.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str("# hermit ephemeral CA\n");
+    combined.push_str(ca_pem);
+    if !combined.ends_with('\n') {
+        combined.push('\n');
+    }
+    Ok(combined)
 }
 
 /// Find the first existing system CA bundle.
@@ -50,24 +100,17 @@ fn find_system_ca_bundle() -> Option<&'static str> {
     SYSTEM_CA_PATHS.iter().find(|p| Path::new(p).exists()).copied()
 }
 
-/// Append the CA PEM to a copy of the system bundle, then bind-mount it
-/// over the original.
-fn install_into_system_bundle(bundle_path: &str, ca_pem: &str) -> Result<()> {
+/// Bind-mount the already-built combined bundle over the system
+/// bundle path. The source file lives on the sandbox tmpfs;
+/// pid-suffixed so two concurrent hermit children don't collide
+/// on it (tmpfs is per-mount-namespace, but the suffix also
+/// helps a human reading `ls /tmp` from inside the sandbox).
+fn install_into_system_bundle(bundle_path: &str, combined: &str) -> Result<()> {
     info!("trust: patching system CA bundle at {}", bundle_path);
 
-    let original = std::fs::read_to_string(bundle_path)
-        .with_context(|| format!("failed to read {}", bundle_path))?;
-
     let patched_path = format!("/tmp/.hermit-{}-ca-bundle.pem", std::process::id());
-    let mut patched = original;
-    if !patched.ends_with('\n') {
-        patched.push('\n');
-    }
-    patched.push_str("# hermit ephemeral CA\n");
-    patched.push_str(ca_pem);
-
-    std::fs::write(&patched_path, &patched)
-        .context("failed to write patched CA bundle")?;
+    std::fs::write(&patched_path, combined)
+        .with_context(|| format!("failed to write {} (combined bundle)", patched_path))?;
 
     mount(
         Some(patched_path.as_str()),
@@ -129,18 +172,60 @@ mod tests {
     }
 
     #[test]
-    fn patched_bundle_contains_original_and_ca() {
+    fn build_combined_bundle_concats_system_then_hermit() {
+        // env-var-following tools (REQUESTS_CA_BUNDLE,
+        // CURL_CA_BUNDLE, ...) replace system trust with whatever
+        // file we point them at. The combined file must include
+        // BOTH the system roots and the hermit CA so bypass-mode
+        // TLS (which validates against real origin certs) and
+        // MITM'd HTTPS (signed by the hermit CA) both work.
         let dir = tempfile::tempdir().unwrap();
-        let original_path = dir.path().join("original.pem");
-        std::fs::write(&original_path, "ORIGINAL_BUNDLE\n").unwrap();
+        let system = dir.path().join("system.pem");
+        std::fs::write(&system, "ORIGINAL_BUNDLE\n").unwrap();
+        let combined = build_combined_bundle(
+            Some(system.to_str().unwrap()),
+            TEST_PEM,
+        )
+        .unwrap();
 
-        let original = std::fs::read_to_string(&original_path).unwrap();
-        let mut patched = original;
-        patched.push_str("# hermit ephemeral CA\n");
-        patched.push_str(TEST_PEM);
+        assert!(combined.contains("ORIGINAL_BUNDLE"));
+        assert!(combined.contains("# hermit ephemeral CA"));
+        assert!(combined.contains("TESTDATA"));
+        // System bundle comes FIRST so verifiers that early-out
+        // on the first match still hit system roots before the
+        // appended hermit CA.
+        let sys_at = combined.find("ORIGINAL_BUNDLE").unwrap();
+        let hermit_at = combined.find("TESTDATA").unwrap();
+        assert!(sys_at < hermit_at, "hermit CA must follow system bundle");
+    }
 
-        assert!(patched.contains("ORIGINAL_BUNDLE"));
-        assert!(patched.contains("TESTDATA"));
-        assert!(patched.contains("# hermit ephemeral CA"));
+    #[test]
+    fn build_combined_bundle_inserts_separating_newline() {
+        // If the system bundle doesn't end with a newline (some
+        // distros omit it), the appended hermit CA must still
+        // start on its own line.
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system.pem");
+        std::fs::write(&system, "NO_TRAILING_NEWLINE").unwrap();
+        let combined = build_combined_bundle(
+            Some(system.to_str().unwrap()),
+            TEST_PEM,
+        )
+        .unwrap();
+        assert!(
+            combined.contains("NO_TRAILING_NEWLINE\n# hermit"),
+            "must inject newline between bundle and marker: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn build_combined_bundle_works_without_system_bundle() {
+        // Distros without any of SYSTEM_CA_PATHS still need the
+        // hermit CA at HERMIT_CA_PATH (so MITM'd traffic
+        // verifies); the file just lacks the system roots.
+        let combined = build_combined_bundle(None, TEST_PEM).unwrap();
+        assert!(combined.contains("# hermit ephemeral CA"));
+        assert!(combined.contains("TESTDATA"));
+        assert!(!combined.contains("ORIGINAL_BUNDLE"));
     }
 }

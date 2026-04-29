@@ -305,21 +305,23 @@ pub fn add_nft_redirect_udp(from_port: u16, to_port: u16) -> Result<()> {
 /// vanish into a "no route to host" error — instead the observer
 /// records the (dst_ip, dst_port) for the trace.
 ///
-/// **Ordering matters.** Install this *before* the port-specific
-/// rules. nftables evaluates NAT rules in order on the first
-/// packet of a flow, and a later `dnat` overwrites an earlier
-/// one. So the conventional layout is:
+/// **Ordering matters — install this LAST.** nftables NAT
+/// evaluation is *first-match-wins*: the kernel's nft_nat module
+/// returns `NF_ACCEPT` after setting the connection's NAT mapping,
+/// which terminates chain processing for that hook. A subsequent
+/// `dnat` rule never runs on the same packet. So the conventional
+/// layout is:
 ///
 /// ```text
-/// add_nft_redirect_all_tcp(LEARN_OBSERVER_PORT) // catch-all, FIRST
-/// add_nft_redirect(443, MITM_PORT)              // overwrites for :443
-/// add_nft_redirect(80,  HTTP_PROXY_PORT)        // overwrites for :80
+/// add_nft_redirect(443, MITM_PORT)              // specific rules FIRST
+/// add_nft_redirect(80,  HTTP_PROXY_PORT)
+/// add_nft_redirect_all_tcp(LEARN_OBSERVER_PORT) // catch-all LAST
 /// ```
 ///
-/// With this order a packet for :443 hits the catch-all (DNAT to
-/// observer) and then the specific rule (DNAT to MITM); the second
-/// `dnat` wins. A packet for :22 hits only the catch-all, so it
-/// goes to the observer.
+/// A packet for :443 hits the specific rule, gets DNAT'd to the
+/// MITM, and chain processing stops — the catch-all never sees it.
+/// A packet for :22 falls through the specific rules (no port
+/// match), reaches the catch-all, and lands on the observer.
 pub fn add_nft_redirect_all_tcp(to_port: u16) -> Result<()> {
     info!(
         "netns: adding catch-all nat rule (tcp -> 127.0.0.1:{}) (via netlink)",
