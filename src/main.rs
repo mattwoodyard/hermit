@@ -280,11 +280,17 @@ fn proxy_subcommand(args: ProxyArgs) -> Result<i32> {
             allowed_connect_ports.insert(pf.port);
         }
     }
-    let http_config = Arc::new(sni_proxy::http_proxy::HttpProxyConfig {
+    let http_config = Arc::new(sni_proxy::forward::ForwardConfig {
         policy: Arc::clone(&policy),
         connector: Arc::new(sni_proxy::connector::DirectConnector),
         upstream_port: 80,
         allowed_connect_ports,
+        // Hand allowed CONNECTs to the MITM so a curl driven via
+        // `HTTPS_PROXY=http://127.0.0.1:NNNN` actually exercises
+        // the L7 filter — the legacy splice path can't see TLS
+        // payload and would let `path_prefix` / `methods` slip
+        // past silently.
+        mitm: Some(Arc::clone(&mitm_config)),
         block_log: block_log.clone(),
         access_log: access_log.clone(),
     });
@@ -308,12 +314,12 @@ fn proxy_subcommand(args: ProxyArgs) -> Result<i32> {
 
     rt.block_on(async move {
         let mitm = tokio::spawn(async move {
-            if let Err(e) = sni_proxy::mitm::run(https_listener, mitm_config).await {
+            if let Err(e) = sni_proxy::transparent::run(https_listener, mitm_config).await {
                 eprintln!("hermit: mitm proxy error: {e}");
             }
         });
         let http = tokio::spawn(async move {
-            if let Err(e) = sni_proxy::http_proxy::run(http_listener, http_config).await {
+            if let Err(e) = sni_proxy::forward::run(http_listener, http_config).await {
                 eprintln!("hermit: http proxy error: {e}");
             }
         });

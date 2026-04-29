@@ -1,47 +1,49 @@
-//! MITM proxy: terminates client TLS, inspects HTTP, connects upstream.
+//! TLS-terminate + L7-filter engine — the **MITM** half of the matrix.
 //!
-//! Flow per connection:
-//! 1. Read ClientHello, extract SNI hostname
-//! 2. Check hostname-level policy — drop if denied
-//! 3. TLS-accept with per-host cert from CA
-//! 4. Read HTTP request, check request-level policy
-//! 5. Connect upstream with real TLS, forward request + body
-//! 6. Read upstream response, forward to client
-//! 7. Loop for keep-alive
+//! Two callers, one engine:
+//!
+//! * [`crate::transparent`] — for `mechanism = "mitm"` rules. The
+//!   listener has already read the ClientHello to extract SNI,
+//!   so it passes the buffered bytes plus the SNI hostname here
+//!   for replay and certificate minting.
+//! * [`crate::forward`] — for `HTTPS_PROXY` clients after the
+//!   `200 Connection Established` response. The listener
+//!   doesn't peek SNI itself; today it dispatches via
+//!   [`crate::transparent::handle_stream`] which performs the
+//!   SNI peek + mechanism check, then ends up here for MITM-
+//!   mechanism rules.
+//!
+//! What this engine does:
+//! 1. Mint a per-host leaf certificate from `config.ca`.
+//! 2. Build a rustls `ServerConfig` that resolves to that cert.
+//! 3. TLS-accept the client, replaying the buffered ClientHello.
+//! 4. Read each HTTP request from the decrypted client stream.
+//! 5. Run the request-level policy check (`path_prefix`,
+//!    `methods`, etc.). Block + log on deny.
+//! 6. Apply credential injection if a network policy is wired in.
+//! 7. Connect upstream TCP + TLS, forward request + body.
+//! 8. Read upstream response, forward back to the client.
+//! 9. Loop until either side signals close.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-/// Per-connection ID counter — same shape as the one in
-/// `http_proxy`, but kept private here so the two namespaces
-/// (`mitm_conn=…` vs `http_conn=…`) don't collide in a single
-/// trace search.
-static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn next_conn_id() -> u64 {
-    CONN_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tracing::{debug, info, trace, warn, Instrument};
+use tracing::{debug, info, warn};
 
 use crate::block_log::{now_unix_ms, BlockEvent, BlockKind, BlockLogger};
 use crate::ca::CertificateAuthority;
 use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::network_policy::{render_inject_value, NetworkPolicy};
-use crate::policy::{Mechanism, RequestPolicy, Verdict};
-use crate::proxy::{get_original_dst, read_sni_with_buffer, MAX_CONCURRENT_CONNECTIONS};
+use crate::policy::{RequestPolicy, Verdict};
 
-/// Max time to wait for the TLS ClientHello from the client.
-const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max time to wait for a full HTTP request head on an idle keep-alive
 /// connection.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,10 +51,12 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max time for the upstream TLS handshake.
 const UPSTREAM_TLS_TIMEOUT: Duration = Duration::from_secs(15);
-/// Hard cap on close-delimited response body size. See http_proxy.rs.
+/// Hard cap on close-delimited response body size — see forward.rs.
 const MAX_CLOSE_DELIMITED_RESPONSE: u64 = 512 * 1024 * 1024;
 
-/// Configuration for the MITM proxy.
+/// Configuration shared by the MITM engine and the transparent
+/// listener. Both refer to the same `Arc<MitmConfig>` so the CA,
+/// loggers, policy, and connector are guaranteed to match.
 pub struct MitmConfig<P, C> {
     pub policy: Arc<P>,
     pub connector: Arc<C>,
@@ -71,161 +75,42 @@ pub struct MitmConfig<P, C> {
     pub access_log: BlockLogger,
 }
 
-/// Run the MITM proxy accept loop.
-pub async fn run<P, C>(listener: TcpListener, config: Arc<MitmConfig<P, C>>) -> Result<()>
-where
-    P: RequestPolicy + 'static,
-    C: UpstreamConnector + 'static,
-{
-    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                // EMFILE / ECONNABORTED etc. must not kill the listener.
-                warn!(error = %e, "mitm: accept failed; continuing");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-        };
-        let Ok(permit) = Arc::clone(&conn_limit).acquire_owned().await else {
-            warn!(%addr, "mitm: connection semaphore closed; dropping connection");
-            continue;
-        };
-        let config = Arc::clone(&config);
-
-        let conn_id = next_conn_id();
-        let span = tracing::trace_span!("mitm_conn", conn = conn_id, peer = %addr);
-        tokio::spawn(
-            async move {
-                let _permit = permit;
-                debug!(%addr, "mitm: accepted connection");
-                if let Err(e) = handle_connection(stream, addr, &config).await {
-                    // Connection resets and clean closes are noisy at error level
-                    debug!(%addr, error = %e, "mitm: connection ended");
-                }
-                trace!("mitm_conn closed");
-            }
-            .instrument(span),
-        );
-    }
-}
-
-/// Handle a single MITM connection.
-async fn handle_connection<P, C>(
-    mut client_tcp: TcpStream,
+/// Run the MITM engine on a single TCP connection.
+///
+/// `client_hello_buf` is the buffered first slice of the
+/// client's TLS handshake (the listener has already read it to
+/// extract SNI). It's replayed via [`PrefixedStream`] so the
+/// downstream rustls `Acceptor` sees a complete handshake.
+///
+/// `original_dst` is a port hint for the upstream dial. The
+/// transparent path passes the pre-DNAT destination; the
+/// forward path passes a synthetic `Some((_, port))` carrying
+/// the `CONNECT` target's port; `None` falls back to
+/// `config.upstream_port`.
+pub async fn run<P, C>(
+    client_tcp: TcpStream,
     client_addr: SocketAddr,
+    original_dst: Option<SocketAddr>,
+    hostname: &str,
+    client_hello_buf: Vec<u8>,
     config: &MitmConfig<P, C>,
 ) -> Result<()>
 where
     P: RequestPolicy,
     C: UpstreamConnector,
 {
-    let original_dst = get_original_dst(&client_tcp);
-    trace!(
-        original_dst = ?original_dst,
-        "mitm: SO_ORIGINAL_DST lookup (None outside transparent DNAT)"
-    );
-
-    // Step 1: Read ClientHello, extract SNI (with a timeout — a client that
-    // opens a socket and never sends must not park a tokio task forever).
-    trace!("mitm: awaiting ClientHello");
-    let (hostname, client_hello_buf) = match timeout(
-        CLIENT_HELLO_TIMEOUT,
-        read_sni_with_buffer(&mut client_tcp),
-    )
-    .await
-    {
-        Ok(r) => r?,
-        Err(_) => {
-            debug!(%client_addr, "mitm: ClientHello read timed out");
-            return Ok(());
-        }
-    };
-    trace!(
-        hostname = ?hostname,
-        client_hello_bytes = client_hello_buf.len(),
-        "mitm: ClientHello parsed"
-    );
-
-    let hostname = match hostname {
-        Some(h) => h,
-        None => {
-            debug!(%client_addr, "hermit blocked: TLS connection without SNI");
-            config.block_log.log(BlockEvent {
-                time_unix_ms: now_unix_ms(),
-                kind: BlockKind::TlsNoSni,
-                client: Some(client_addr.to_string()),
-                hostname: None,
-                method: None,
-                path: None,
-                port: None,
-                reason: Some("TLS connection without SNI".to_string()),
-            });
-            return Ok(());
-        }
-    };
-
-    // Step 2: Hostname-level policy check
-    let host_verdict = config.policy.check(&hostname);
-    trace!(?host_verdict, %hostname, "mitm: SNI host policy verdict");
-    if host_verdict == Verdict::Deny {
-        debug!(%client_addr, %hostname, "hermit blocked: TLS hostname not in allowlist");
-        config.block_log.log(BlockEvent {
-            time_unix_ms: now_unix_ms(),
-            kind: BlockKind::TlsHostname,
-            client: Some(client_addr.to_string()),
-            hostname: Some(hostname.clone()),
-            method: None,
-            path: None,
-            port: None,
-            reason: Some("hostname not in allowlist".to_string()),
-        });
-        return Ok(());
-    }
-    // Allowed at the hostname level: record an access event so
-    // `hermit learn` users see the SNI even if the connection
-    // never produces an HTTP request (e.g. SNI cut-through path).
-    config.access_log.log(BlockEvent {
-        time_unix_ms: now_unix_ms(),
-        kind: BlockKind::TlsHostname,
-        client: Some(client_addr.to_string()),
-        hostname: Some(hostname.clone()),
-        method: None,
-        path: None,
-        port: None,
-        reason: None,
-    });
-
-    // Step 2b: Mechanism dispatch. If the rule for this host is
-    // `sni`, skip MITM entirely and splice raw bytes — certificate
-    // pinning clients require this. `mitm` continues below.
-    let mechanism = config.policy.mechanism(&hostname);
-    trace!(?mechanism, %hostname, "mitm: mechanism for host");
-    if mechanism == Mechanism::Sni {
-        trace!(%hostname, "mitm: dispatching to SNI cut-through");
-        return splice_sni_cut_through(
-            client_tcp,
-            &client_hello_buf,
-            &hostname,
-            original_dst,
-            config,
-        )
-        .await;
-    }
-
-    // Step 3: TLS-accept with per-host cert
+    // Step 1: mint a per-host leaf cert.
     let certified_key = config
         .ca
-        .cert_for_host(&hostname)
+        .cert_for_host(hostname)
         .context("generating cert for host")?;
 
     let server_config = build_server_config(certified_key)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    // We need to replay the ClientHello that we already consumed.
-    // Create a "prefixed" stream that first yields the buffered bytes,
-    // then reads from the real socket.
+    // Step 2: TLS-accept with the buffered ClientHello replayed
+    // first so the rustls handshake state machine sees a
+    // complete record stream.
     let prefixed = PrefixedStream::new(client_hello_buf, client_tcp);
     let mut client_tls = acceptor
         .accept(prefixed)
@@ -234,9 +119,8 @@ where
 
     debug!(%client_addr, %hostname, "mitm: TLS established with client");
 
-    // Step 4-7: HTTP request/response loop (keep-alive)
+    // Step 3+: HTTP request/response loop (keep-alive).
     loop {
-        // Read HTTP request from the decrypted client stream (with timeout).
         let (mut request, leftover) = match timeout(
             HEADER_READ_TIMEOUT,
             http::read_request(&mut client_tls),
@@ -264,18 +148,19 @@ where
             "mitm: request"
         );
 
-        // Check request-level policy
-        if config.policy.check_request(&hostname, &request.path, &request.method) == Verdict::Deny {
+        // Request-level policy check.
+        if config.policy.check_request(hostname, &request.path, &request.method) == Verdict::Deny {
             debug!(
                 %client_addr, %hostname,
                 method = %request.method, path = %request.path,
-                "hermit blocked: HTTPS request {} https://{}{}", request.method, hostname, request.path
+                "hermit blocked: HTTPS request {} https://{}{}",
+                request.method, hostname, request.path
             );
             config.block_log.log(BlockEvent {
                 time_unix_ms: now_unix_ms(),
                 kind: BlockKind::Https,
                 client: Some(client_addr.to_string()),
-                hostname: Some(hostname.clone()),
+                hostname: Some(hostname.to_string()),
                 method: Some(request.method.clone()),
                 path: Some(request.path.clone()),
                 port: None,
@@ -284,31 +169,29 @@ where
             http::write_403(&mut client_tls, "blocked by hermit policy").await?;
             return Ok(());
         }
-        // Allowed: record the request for learn-mode trace.
-        // Emitted once per request so a multi-request keep-alive
-        // session yields one access event per HTTP exchange.
+        // Allowed — record one access event per HTTP exchange.
         config.access_log.log(BlockEvent {
             time_unix_ms: now_unix_ms(),
             kind: BlockKind::Https,
             client: Some(client_addr.to_string()),
-            hostname: Some(hostname.clone()),
+            hostname: Some(hostname.to_string()),
             method: Some(request.method.clone()),
             path: Some(request.path.clone()),
             port: None,
             reason: None,
         });
 
-        // Credential injection (if a network policy is configured)
+        // Credential injection if a network policy is configured.
         if let Some(np) = &config.network_policy {
-            apply_injection(np, &hostname, &mut request).await;
+            apply_injection(np, hostname, &mut request).await;
         }
 
-        // Connect upstream TCP (with timeout) then run real TLS handshake.
+        // Connect upstream TCP, then real TLS handshake.
         let upstream_tcp = match timeout(
             UPSTREAM_CONNECT_TIMEOUT,
             config
                 .connector
-                .connect(&hostname, config.upstream_port, original_dst),
+                .connect(hostname, config.upstream_port, original_dst),
         )
         .await
         {
@@ -322,7 +205,7 @@ where
 
         let mut upstream_tls = match timeout(
             UPSTREAM_TLS_TIMEOUT,
-            connect_upstream_tls(upstream_tcp, &hostname),
+            connect_upstream_tls(upstream_tcp, hostname),
         )
         .await
         {
@@ -333,14 +216,12 @@ where
             }
         };
 
-        // Forward request headers to upstream
+        // Forward request headers + body.
         upstream_tls
             .write_all(&request.head_bytes)
             .await
             .context("forwarding request headers")?;
 
-        // Forward request body. `leftover` contains any body bytes that
-        // arrived in the same read as the headers — they MUST go first.
         if let Some(len) = request.content_length {
             http::forward_body_content_length(&mut client_tls, &mut upstream_tls, len, &leftover)
                 .await
@@ -371,7 +252,7 @@ where
             }
         };
 
-        // Forward response headers to client
+        // Forward response headers + body.
         client_tls
             .write_all(&response.head_bytes)
             .await
@@ -391,9 +272,9 @@ where
                 .await
                 .context("forwarding chunked response body")?;
         } else {
-            // No content-length, no chunked — body ends at connection close.
-            // That is inherently incompatible with keep-alive: drain (bounded)
-            // and return.
+            // No content-length, no chunked — body ends at connection
+            // close, which is incompatible with keep-alive: drain
+            // (bounded) and return.
             http::forward_until_eof(
                 &mut upstream_tls,
                 &mut client_tls,
@@ -414,61 +295,7 @@ where
     }
 }
 
-/// SNI cut-through: the ClientHello has already been buffered in
-/// `client_hello`. We dial the real upstream, forward the buffered
-/// bytes, and then splice bidirectionally. No TLS termination and no
-/// HTTP inspection happens here — by design, since the whole point of
-/// this mechanism is preserving the client↔origin wire for cert-pinned
-/// clients.
-///
-/// Note: this runs on the MITM listener (the one `HTTPS_PORT` DNAT's
-/// to). We intentionally reuse that listener rather than standing up
-/// a separate port so the SNI/MITM choice is per-rule-per-connection
-/// and requires no additional nft rules.
-async fn splice_sni_cut_through<P, C>(
-    mut client_tcp: TcpStream,
-    client_hello: &[u8],
-    hostname: &str,
-    original_dst: Option<SocketAddr>,
-    config: &MitmConfig<P, C>,
-) -> Result<()>
-where
-    P: RequestPolicy,
-    C: UpstreamConnector,
-{
-    debug!(%hostname, "mitm: sni cut-through");
-    let mut upstream = match timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        config
-            .connector
-            .connect(hostname, config.upstream_port, original_dst),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!(%hostname, error = %e, "mitm: sni cut-through upstream failed");
-            return Ok(());
-        }
-        Err(_) => {
-            warn!(%hostname, "mitm: sni cut-through upstream timed out");
-            return Ok(());
-        }
-    };
-
-    // Forward the buffered ClientHello verbatim so the client's TLS
-    // handshake lands on the real upstream. If this write fails the
-    // upstream already dropped us and there's nothing to salvage.
-    upstream
-        .write_all(client_hello)
-        .await
-        .context("forwarding buffered ClientHello to sni cut-through upstream")?;
-
-    let _ = tokio::io::copy_bidirectional(&mut client_tcp, &mut upstream).await;
-    Ok(())
-}
-
-/// Build a rustls ServerConfig for the MITM handshake with the client.
+/// Build a rustls `ServerConfig` for the MITM handshake with the client.
 fn build_server_config(
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<ServerConfig> {
@@ -480,13 +307,13 @@ fn build_server_config(
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(StaticCertResolver(certified_key)));
 
-    // Force HTTP/1.1 ALPN — we don't support HTTP/2 MITM
+    // Force HTTP/1.1 ALPN — we don't support HTTP/2 MITM.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(config)
 }
 
-/// A cert resolver that always returns the same CertifiedKey.
+/// A cert resolver that always returns the same `CertifiedKey`.
 #[derive(Debug)]
 struct StaticCertResolver(Arc<rustls::sign::CertifiedKey>);
 
@@ -499,15 +326,13 @@ impl rustls::server::ResolvesServerCert for StaticCertResolver {
     }
 }
 
-/// Connect to upstream with real TLS, verifying the server's certificate.
+/// Connect to upstream with real TLS, verifying the server's certificate
+/// against the webpki built-in roots.
 async fn connect_upstream_tls(
     tcp: TcpStream,
     hostname: &str,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut root_store = rustls::RootCertStore::empty();
-
-    // Use webpki built-in roots. In production, you might want
-    // rustls-native-certs, but this avoids an extra dependency.
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -537,7 +362,8 @@ use std::pin::Pin;
 use std::task::{self, Poll};
 
 /// A stream that first yields pre-buffered bytes, then reads from the
-/// underlying stream. Used to replay the ClientHello we already consumed.
+/// underlying stream. Used to replay the ClientHello the listener
+/// already consumed when peeking SNI.
 struct PrefixedStream<S> {
     prefix: Vec<u8>,
     offset: usize,
@@ -562,7 +388,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // First drain the prefix buffer
+        // Drain the prefix buffer first.
         if this.offset < this.prefix.len() {
             let remaining = &this.prefix[this.offset..];
             let to_copy = std::cmp::min(remaining.len(), buf.remaining());
@@ -571,12 +397,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
             return Poll::Ready(Ok(()));
         }
 
-        // Then read from the underlying stream
+        // Then read from the underlying stream.
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
-// PrefixedStream also needs AsyncWrite (TLS handshake writes back to client)
+// PrefixedStream needs AsyncWrite too (TLS handshake writes back to client).
 impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -674,8 +500,8 @@ mod tests {
         let ck = ca.cert_for_host("example.com").unwrap();
         let _resolver = StaticCertResolver(ck.clone());
 
-        // We can't easily construct a ClientHello for testing resolve(),
-        // but we can verify the server config builds without error.
+        // Building the server config exercises the resolver
+        // through rustls' constructor.
         let config = build_server_config(ck).unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
@@ -700,83 +526,5 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"just inner");
-    }
-
-    #[tokio::test]
-    async fn splice_sni_cut_through_forwards_hello_and_bytes() {
-        // The whole point of the Sni mechanism is that the ClientHello
-        // (which the MITM layer already consumed) must reach the real
-        // upstream verbatim — otherwise TLS would have nothing to work
-        // with. This test stands up a mock "upstream" TCP server,
-        // hands splice_sni_cut_through an already-buffered ClientHello,
-        // and asserts the upstream receives those bytes and its reply
-        // flows back to the (fake) client.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_port = upstream.local_addr().unwrap().port();
-        let upstream_task = tokio::spawn(async move {
-            let (mut s, _) = upstream.accept().await.unwrap();
-            let mut got = vec![0u8; 11];
-            s.read_exact(&mut got).await.unwrap();
-            s.write_all(b"UP").await.unwrap();
-            s.shutdown().await.unwrap();
-            got
-        });
-
-        // Build a TcpStream pair to stand in for the post-ClientHello
-        // client socket. We bind a second listener, connect to it,
-        // and use the accepted half as the stream splice operates on.
-        let pair_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pair_addr = pair_listener.local_addr().unwrap();
-        let (accept_res, connect_res) = tokio::join!(
-            pair_listener.accept(),
-            tokio::net::TcpStream::connect(pair_addr),
-        );
-        let (server_side, _) = accept_res.unwrap();
-        let mut client_side = connect_res.unwrap();
-
-        let ca = Arc::new(CertificateAuthority::new().unwrap());
-        let config = MitmConfig {
-            policy: Arc::new(crate::policy::AllowAll),
-            connector: Arc::new(crate::connector::DirectConnector),
-            ca,
-            upstream_port,
-            network_policy: None,
-            block_log: crate::block_log::BlockLogger::disabled(),
-            access_log: crate::block_log::BlockLogger::disabled(),
-        };
-
-        let hello = b"CLIENTHELLO".to_vec();
-
-        // Drive splice and the client side concurrently: splice writes
-        // hello to upstream, upstream writes "UP", splice relays "UP"
-        // to client_side, upstream closes, splice tears down. Dropping
-        // our client handle then unblocks the other half of the copy.
-        let splice_done = tokio::spawn(async move {
-            let _ = splice_sni_cut_through(
-                server_side,
-                &hello,
-                "127.0.0.1",
-                None,
-                &config,
-            )
-            .await;
-        });
-
-        let mut resp = [0u8; 2];
-        client_side.read_exact(&mut resp).await.unwrap();
-        assert_eq!(&resp, b"UP");
-
-        // Close our side so copy_bidirectional can finish.
-        drop(client_side);
-
-        tokio::time::timeout(Duration::from_secs(2), splice_done)
-            .await
-            .expect("splice timed out")
-            .unwrap();
-
-        let received = upstream_task.await.unwrap();
-        assert_eq!(&received, b"CLIENTHELLO");
     }
 }

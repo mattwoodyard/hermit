@@ -41,7 +41,7 @@ pub struct LearnObserverConfig {
 }
 
 /// Run the observer accept loop. Mirrors the structure of
-/// [`crate::http_proxy::run`] / [`crate::mitm::run`]: bounded
+/// [`crate::forward::run`] / [`crate::transparent::run`]: bounded
 /// concurrency via a semaphore, accept-loop survives transient
 /// errors with a short backoff.
 pub async fn run(listener: TcpListener, config: Arc<LearnObserverConfig>) -> Result<()> {

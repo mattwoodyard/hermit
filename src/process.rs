@@ -856,11 +856,18 @@ fn parent_main_proxied(
             allowed_connect_ports.insert(pf.port);
         }
     }
-    let http_config = Arc::new(sni_proxy::http_proxy::HttpProxyConfig {
+    let http_config = Arc::new(sni_proxy::forward::ForwardConfig {
         policy: Arc::clone(&policy),
         connector: Arc::new(sni_proxy::connector::DirectConnector),
         upstream_port: HTTP_PORT,
         allowed_connect_ports,
+        // Hand allowed CONNECTs into the MITM. In the sandbox
+        // path, a build with `HTTPS_PROXY=http://127.0.0.1:1080`
+        // would otherwise tunnel through the splice path and
+        // bypass `path_prefix` / `methods` filtering — the MITM
+        // listener at :1443 only sees transparent-DNAT traffic.
+        // Routing through here unifies the two intercept points.
+        mitm: Some(Arc::clone(&mitm_config)),
         block_log: block_log.clone(),
         access_log: access_log.clone(),
     });
@@ -887,13 +894,13 @@ fn parent_main_proxied(
     // proxy task would silently disable egress filtering while the child
     // kept running against the dead proxy.
     let mitm_handle = rt.spawn(async move {
-        if let Err(e) = sni_proxy::mitm::run(https_listener, mitm_config).await {
+        if let Err(e) = sni_proxy::transparent::run(https_listener, mitm_config).await {
             error!("mitm proxy error: {}", e);
         }
     });
 
     let http_handle = rt.spawn(async move {
-        if let Err(e) = sni_proxy::http_proxy::run(http_listener, http_config).await {
+        if let Err(e) = sni_proxy::forward::run(http_listener, http_config).await {
             error!("http proxy error: {}", e);
         }
     });

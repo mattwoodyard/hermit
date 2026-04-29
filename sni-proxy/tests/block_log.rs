@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use sni_proxy::block_log::BlockLogger;
 use sni_proxy::connector::DirectConnector;
 use sni_proxy::dns::DnsServer;
-use sni_proxy::http_proxy::{self, HttpProxyConfig};
+use sni_proxy::forward::{self, ForwardConfig};
 use sni_proxy::policy::{AccessRule, AllowList, RuleSet};
 
 /// Read the block log file to a vector of parsed JSON objects.
@@ -140,11 +140,12 @@ async fn http_proxy_deny_writes_block_event() {
     // Only "allowed.example" is permitted — a Host: blocked.example
     // request will be denied.
     let rules = vec![AccessRule::host_only("allowed.example")];
-    let config = Arc::new(HttpProxyConfig {
+    let config = Arc::new(ForwardConfig {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
         allowed_connect_ports: BTreeSet::from([443]),
+        mitm: None,
         block_log,
         access_log: BlockLogger::disabled(),
     });
@@ -153,7 +154,7 @@ async fn http_proxy_deny_writes_block_event() {
     let proxy_addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = http_proxy::run(listener, config).await;
+        let _ = forward::run(listener, config).await;
     });
 
     // Send a plain HTTP/1.1 request for a denied host.
@@ -195,11 +196,12 @@ async fn http_proxy_missing_host_emits_block_event() {
     let block_log = BlockLogger::to_file(log_file.path()).await.unwrap();
 
     let rules = vec![AccessRule::host_only("allowed.example")];
-    let config = Arc::new(HttpProxyConfig {
+    let config = Arc::new(ForwardConfig {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
         allowed_connect_ports: BTreeSet::from([443]),
+        mitm: None,
         block_log,
         access_log: BlockLogger::disabled(),
     });
@@ -208,7 +210,7 @@ async fn http_proxy_missing_host_emits_block_event() {
     let proxy_addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = http_proxy::run(listener, config).await;
+        let _ = forward::run(listener, config).await;
     });
 
     // HTTP/1.0 request with no Host header — legal wire-format, but
@@ -235,11 +237,12 @@ async fn disabled_logger_writes_nothing_even_on_block() {
     // every proxy doesn't accidentally impose any disk IO on the default
     // "no file configured" path.
     let rules = vec![AccessRule::host_only("allowed.example")];
-    let config = Arc::new(HttpProxyConfig {
+    let config = Arc::new(ForwardConfig {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
         allowed_connect_ports: BTreeSet::from([443]),
+        mitm: None,
         block_log: BlockLogger::disabled(),
         access_log: BlockLogger::disabled(),
     });
@@ -248,7 +251,7 @@ async fn disabled_logger_writes_nothing_even_on_block() {
     let proxy_addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = http_proxy::run(listener, config).await;
+        let _ = forward::run(listener, config).await;
     });
 
     let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -289,20 +292,21 @@ async fn http_proxy_connect_tunnel_splices_bytes() {
     });
 
     let rules = vec![AccessRule::host_only("127.0.0.1")];
-    let config = Arc::new(HttpProxyConfig {
+    let config = Arc::new(ForwardConfig {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
         // Whitelist the dynamic origin port so the splice path is
         // exercised without tripping the new CONNECT-port guard.
         allowed_connect_ports: BTreeSet::from([origin_addr.port()]),
+        mitm: None,
         block_log: BlockLogger::disabled(),
         access_log: BlockLogger::disabled(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = http_proxy::run(listener, config).await;
+        let _ = forward::run(listener, config).await;
     });
 
     let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -336,18 +340,19 @@ async fn http_proxy_connect_denied_writes_block_event_and_403() {
     // Rule allows only "allowed.example"; CONNECT to blocked.example
     // must be denied *before* we try to open any upstream socket.
     let rules = vec![AccessRule::host_only("allowed.example")];
-    let config = Arc::new(HttpProxyConfig {
+    let config = Arc::new(ForwardConfig {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
         allowed_connect_ports: BTreeSet::from([443]),
+        mitm: None,
         block_log,
         access_log: BlockLogger::disabled(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = http_proxy::run(listener, config).await;
+        let _ = forward::run(listener, config).await;
     });
 
     let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -386,18 +391,19 @@ async fn http_proxy_connect_to_disallowed_port_blocks() {
     let block_log = BlockLogger::to_file(log_file.path()).await.unwrap();
 
     let rules = vec![AccessRule::host_only("allowed.example")];
-    let config = Arc::new(HttpProxyConfig {
+    let config = Arc::new(ForwardConfig {
         policy: Arc::new(RuleSet::new(rules)),
         connector: Arc::new(DirectConnector),
         upstream_port: 80,
         allowed_connect_ports: BTreeSet::from([443]),
+        mitm: None,
         block_log,
         access_log: BlockLogger::disabled(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = http_proxy::run(listener, config).await;
+        let _ = forward::run(listener, config).await;
     });
 
     let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();

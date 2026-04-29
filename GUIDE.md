@@ -128,7 +128,7 @@ hermit learn-convert --with-methods --output my-rules.toml
 The converter aggregates events by hostname (one rule per unique
 host, sorted alphabetically for stable diffs), and guesses the
 mechanism: a host whose TLS handshake never produced an HTTPS
-request is emitted as `mechanism = "sni"` (typical of cert-pinning
+request is emitted as `mechanism = "splice"` (typical of cert-pinning
 clients), everything else is left at the `mitm` default. Each
 rule carries a `# observed: …` comment summarising the trace
 evidence so you can review before signing.
@@ -238,8 +238,9 @@ Empty network namespace plus hermit-managed proxies for:
 - **HTTPS / TLS** on port 443, handled by an SNI-reading MITM proxy
   on `127.0.0.1:1443` (DNAT redirected). Every rule with
   `mechanism = "mitm"` terminates TLS with an ephemeral CA and
-  enforces `path_prefix` / `methods`. `mechanism = "sni"` rules
-  splice bytes after the ClientHello with no interception.
+  enforces `path_prefix` / `methods`. `mechanism = "splice"` rules
+  relay bytes after the ClientHello with no interception (the
+  hostname comes from the SNI peek the listener already did).
 - **HTTP** on port 80, handled on `127.0.0.1:1080`. The proxy
   understands origin-form requests, absolute-form requests (what
   `HTTP_PROXY`-aware clients send), and `CONNECT` tunnels (what
@@ -327,7 +328,7 @@ Top-level sections:
 | `[sandbox]` | Network mode + `passthrough` dirs |
 | `[dns]` | Upstream DNS resolver for allowed queries |
 | `[[home_file]]` | `copy` / `pass` / `read` actions applied to a `$HOME` path |
-| `[[access_rule]]` | Allow a host (or literal IP) through the proxy; choose `mitm`, `sni`, or `bypass` |
+| `[[access_rule]]` | Allow a host (or literal IP) through the proxy; choose `mitm`, `splice`, or `bypass` |
 | `[[port_forward]]` | Extra TCP ports to intercept (`https` → MITM, `http` → HTTP proxy) |
 | `[[rule]]` + `[credential.<name>]` | Credential-injection matcher + credential source |
 | `[signature]` | Detached ed25519 signature over the preceding content |
@@ -354,20 +355,20 @@ DNS query hermit sees.
 
 The `mechanism` field picks the enforcement strategy:
 
-| Mechanism | Listener | What it does | Compatible fields |
+| Mechanism | Engine | What it does | Compatible fields |
 |---|---|---|---|
-| `"mitm"` (default) | HTTPS/HTTP proxy | Terminates TLS with an ephemeral CA, parses HTTP, can inject credentials, enforces `path_prefix` / `methods` | `host`, `path_prefix`, `methods` |
-| `"sni"` | HTTPS proxy | Reads the TLS ClientHello and splices bytes — no termination, no payload visibility. Use for cert-pinning clients | `host` only |
-| `"bypass"` | Dedicated TCP or UDP relay on `(protocol, port)` | SO_ORIGINAL_DST / IP_RECVORIGDSTADDR yields the real destination, the DNS cache (or IP rule) authorizes, then bytes splice | `host` or `ip`; `protocol` and `port` required |
+| `"mitm"` (default) | `mitm`   | Terminates TLS with an ephemeral CA, parses HTTP, can inject credentials, enforces `path_prefix` / `methods` | `host`, `path_prefix`, `methods` |
+| `"splice"`         | `splice` | Relays raw bytes — no TLS termination, no payload visibility. Hostname comes from the SNI peek (transparent path) or the `CONNECT` line (forward path). Use for cert-pinning clients | `host` only |
+| `"bypass"`         | `splice` (per-port listener) | Dedicated TCP or UDP relay on `(protocol, port)`. `SO_ORIGINAL_DST` / `IP_RECVORIGDSTADDR` yields the real destination, the DNS cache (or IP rule) authorizes, then bytes splice | `host` or `ip`; `protocol` and `port` required |
 
 Validation happens at config-load time:
 
-- `path_prefix` / `methods` on `"sni"` or `"bypass"` → rejected
+- `path_prefix` / `methods` on `"splice"` or `"bypass"` → rejected
   (those fields require plaintext visibility).
 - `"bypass"` requires `protocol = "tcp"|"udp"` and `port = <number>`.
 - Bypass `port` 80 or 443 → rejected (those are claimed by the
-  MITM/HTTP proxies; for certificate-pinned HTTPS use `"sni"`).
-- `ip = "…"` with `"mitm"` or `"sni"` → rejected (both strategies
+  MITM/HTTP proxies; for certificate-pinned HTTPS use `"splice"`).
+- `ip = "…"` with `"mitm"` or `"splice"` → rejected (both strategies
   fundamentally key on hostnames).
 
 Examples:
@@ -379,10 +380,10 @@ host = "api.github.com"
 path_prefix = "/repos/"
 methods = ["GET", "POST"]
 
-# SNI cut-through for a certificate-pinning client.
+# Splice (raw byte relay) for a certificate-pinning client.
 [[access_rule]]
 host = "pinned.example"
-mechanism = "sni"
+mechanism = "splice"
 
 # Bypass UDP 88 for Kerberos. A single entry covers both IPv4 and
 # IPv6 — hermit installs parallel nft rules and relay listeners in

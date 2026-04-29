@@ -89,11 +89,17 @@ impl std::error::Error for ParseMethodError {}
 ///   the policy check, and we splice bytes. No interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mechanism {
-    /// Full MITM with plaintext inspection.
+    /// Full MITM with plaintext inspection — TLS terminated with
+    /// the hermit CA, `path_prefix` / `methods` enforced, optional
+    /// credential injection.
     #[default]
     Mitm,
-    /// SNI-only cut-through proxy; no plaintext inspection.
-    Sni,
+    /// Splice raw bytes — no TLS termination, no L7 inspection.
+    /// Hostname comes from the TLS SNI on the transparent path
+    /// or from the `CONNECT` request line on the forward path.
+    /// Use this for cert-pinning clients that would reject the
+    /// hermit-minted leaf.
+    Splice,
     /// Transparent relay on the given (protocol, port). Decisions
     /// happen on hostname — the port identifies which listener this
     /// rule is served from.
@@ -123,7 +129,7 @@ impl fmt::Display for Mechanism {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Mechanism::Mitm => write!(f, "mitm"),
-            Mechanism::Sni => write!(f, "sni"),
+            Mechanism::Splice => write!(f, "splice"),
             Mechanism::Bypass { protocol, port } => write!(f, "bypass({protocol}/{port})"),
         }
     }
@@ -432,34 +438,34 @@ impl RuleSet {
     /// arrived at the MITM listener.
     ///
     /// Bypass rules do not compete for this listener — they get their
-    /// own ports — so they are skipped here. Among Mitm and Sni:
+    /// own ports — so they are skipped here. Among Mitm and Splice:
     ///
     /// - If *any* matching rule requests [`Mechanism::Mitm`], we MITM.
-    ///   A single Mitm rule beats any number of Sni rules because the
+    ///   A single Mitm rule beats any number of Splice rules because the
     ///   Mitm rule's path/method narrowing can only be enforced with
-    ///   plaintext visibility; falling through to Sni would silently
+    ///   plaintext visibility; falling through to Splice would silently
     ///   widen the allowlist.
-    /// - Otherwise, if any rule matches and is [`Mechanism::Sni`], we
+    /// - Otherwise, if any rule matches and is [`Mechanism::Splice`], we
     ///   splice.
-    /// - If no MITM/SNI rule matches, return `None`; the caller
+    /// - If no MITM/Splice rule matches, return `None`; the caller
     ///   interprets that as "this hostname is not served by the MITM
     ///   listener" and denies.
     pub fn mechanism_for(&self, hostname: &str) -> Option<Mechanism> {
         let key = hostname.to_ascii_lowercase();
         let rules = self.by_host.get(&key)?;
-        let mut saw_sni = false;
+        let mut saw_splice = false;
         for r in rules {
             if !r.matches_host(hostname) {
                 continue;
             }
             match r.mechanism {
                 Mechanism::Mitm => return Some(Mechanism::Mitm),
-                Mechanism::Sni => saw_sni = true,
+                Mechanism::Splice => saw_splice = true,
                 Mechanism::Bypass { .. } => {} // handled by the bypass relays
             }
         }
-        if saw_sni {
-            Some(Mechanism::Sni)
+        if saw_splice {
+            Some(Mechanism::Splice)
         } else {
             None
         }
@@ -891,8 +897,8 @@ mod tests {
 
     #[test]
     fn mechanism_for_sni_rule() {
-        let rs = RuleSet::new(vec![rule_with_mech("pinned.example", Mechanism::Sni)]);
-        assert_eq!(rs.mechanism_for("pinned.example"), Some(Mechanism::Sni));
+        let rs = RuleSet::new(vec![rule_with_mech("pinned.example", Mechanism::Splice)]);
+        assert_eq!(rs.mechanism_for("pinned.example"), Some(Mechanism::Splice));
     }
 
     #[test]
@@ -902,7 +908,7 @@ mod tests {
         // Sni-wins rule would silently widen the allowlist by bypassing
         // the path/method check the Mitm rule encoded.
         let rs = RuleSet::new(vec![
-            rule_with_mech("dual.example", Mechanism::Sni),
+            rule_with_mech("dual.example", Mechanism::Splice),
             rule_with_mech("dual.example", Mechanism::Mitm),
         ]);
         assert_eq!(rs.mechanism_for("dual.example"), Some(Mechanism::Mitm));
@@ -910,9 +916,9 @@ mod tests {
 
     #[test]
     fn mechanism_lookup_is_case_insensitive() {
-        let rs = RuleSet::new(vec![rule_with_mech("Mixed.Example", Mechanism::Sni)]);
-        assert_eq!(rs.mechanism_for("mixed.example"), Some(Mechanism::Sni));
-        assert_eq!(rs.mechanism_for("MIXED.EXAMPLE"), Some(Mechanism::Sni));
+        let rs = RuleSet::new(vec![rule_with_mech("Mixed.Example", Mechanism::Splice)]);
+        assert_eq!(rs.mechanism_for("mixed.example"), Some(Mechanism::Splice));
+        assert_eq!(rs.mechanism_for("MIXED.EXAMPLE"), Some(Mechanism::Splice));
     }
 
     // --- Bypass ---

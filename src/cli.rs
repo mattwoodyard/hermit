@@ -56,7 +56,7 @@ pub enum Command {
     Learn(LearnArgs),
     /// Convert a `hermit learn` JSONL trace into a hermit.toml
     /// scaffold — one `[[access_rule]]` per unique hostname,
-    /// with a best-effort mechanism guess (`sni` if the host's TLS
+    /// with a best-effort mechanism guess (`splice` if the host's TLS
     /// handshake never produced an HTTPS request, suggesting a
     /// cert-pinning client; `mitm` otherwise).
     LearnConvert(LearnConvertArgs),
@@ -188,7 +188,7 @@ pub struct AddRuleArgs {
     #[arg(long)]
     pub ip: Option<std::net::IpAddr>,
 
-    /// Enforcement mechanism: `mitm` (default), `sni`, or `bypass`.
+    /// Enforcement mechanism: `mitm` (default), `splice`, or `bypass`.
     #[arg(long, default_value = "mitm")]
     pub mechanism: String,
 
@@ -422,7 +422,7 @@ pub struct ProxyArgs {
     /// body-framing mode, splice start/end. Implies `-vvv` plus
     /// `target=… path:line` in the format so a single connection
     /// can be followed end-to-end. For finer control (e.g. only
-    /// `sni_proxy::http_proxy` at trace), set `RUST_LOG`
+    /// `sni_proxy::forward` at trace), set `RUST_LOG`
     /// directly — that takes precedence over `--trace`.
     #[arg(long)]
     pub trace: bool,

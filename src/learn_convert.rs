@@ -9,10 +9,11 @@
 //! - **mitm** (default) when we saw at least one HTTP/HTTPS request
 //!   for the host. Indicates the MITM handshake worked, so plaintext
 //!   inspection is fine and the user gets full L7 filtering options.
-//! - **sni** when we saw `tls_hostname` allow events but no `https`
-//!   requests. That pattern means hermit's MITM CA wasn't accepted —
-//!   typical for cert-pinning clients. Suggesting `sni` lets the
-//!   user keep the policy strict without breaking the client.
+//! - **splice** when we saw `tls_hostname` allow events but no
+//!   `https` requests. That pattern means hermit's MITM CA wasn't
+//!   accepted — typical for cert-pinning clients. Suggesting
+//!   `splice` lets the user keep the policy strict without
+//!   breaking the client.
 //! - **mitm** when we only saw a DNS query (the host was resolved
 //!   but never connected). Conservative default — the user can
 //!   delete or narrow later.
@@ -67,8 +68,8 @@ struct HostAggregate {
 
 impl HostAggregate {
     /// True iff the host generated any HTTP/TLS/DNS traffic the
-    /// existing mitm/sni mechanism guess can speak to. A host with
-    /// only `tcp_observe` events skips the mitm/sni rule —
+    /// existing mitm/splice mechanism guess can speak to. A host with
+    /// only `tcp_observe` events skips the mitm/splice rule —
     /// emitting one would be meaningless because the build wasn't
     /// using HTTP.
     fn has_web_traffic(&self) -> bool {
@@ -178,7 +179,7 @@ pub(crate) fn render(events: &[TraceEvent], input_path: &Path, with_methods: boo
     let _ = writeln!(out, "# Unique hosts: {}", hosts.len());
     let _ = writeln!(
         out,
-        "# Mechanism guess: `sni` when a host's TLS handshake never \
+        "# Mechanism guess: `splice` when a host's TLS handshake never \
          produced an HTTPS request"
     );
     let _ = writeln!(out, "# (typical of cert-pinning clients); `mitm` otherwise.");
@@ -194,7 +195,7 @@ pub(crate) fn render(events: &[TraceEvent], input_path: &Path, with_methods: boo
         let provenance = describe_provenance(agg);
         let target_key = HostKey::parse(host);
 
-        // Web-shaped traffic gets a single mitm/sni rule. A host
+        // Web-shaped traffic gets a single mitm/splice rule. A host
         // with only tcp_observe events (no DNS/TLS/HTTP) skips
         // this branch entirely.
         if agg.has_web_traffic() {
@@ -281,9 +282,10 @@ impl<'a> HostKey<'a> {
 
 fn guess_mechanism(a: &HostAggregate) -> &'static str {
     // Saw a TLS handshake but never an HTTPS request → MITM
-    // failed (likely cert pinning), so cut-through is what works.
+    // failed (likely cert pinning), so splice (preserve the
+    // client↔origin handshake) is what works.
     if a.saw_tls && !a.saw_https {
-        return "sni";
+        return "splice";
     }
     "mitm"
 }
@@ -390,17 +392,17 @@ mod tests {
     }
 
     #[test]
-    fn render_guesses_sni_when_tls_handshake_did_not_produce_request() {
+    fn render_guesses_splice_when_tls_handshake_did_not_produce_request() {
         // Cert-pinning client: hermit MITM never decrypted, so we
         // saw `tls_hostname` allow events without any subsequent
-        // `https`. Suggest sni so the user gets a working policy.
+        // `https`. Suggest splice so the user gets a working policy.
         let events = vec![
             ev("dns", Some("pinned.example"), None),
             ev("tls_hostname", Some("pinned.example"), None),
         ];
         let out = render(&events, &dummy_path(), false);
-        assert!(out.contains(r#"mechanism = "sni""#),
-            "expected sni guess for TLS-only host: {out}");
+        assert!(out.contains(r#"mechanism = "splice""#),
+            "expected splice guess for TLS-only host: {out}");
     }
 
     #[test]
@@ -424,14 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn render_with_methods_does_not_decorate_sni_rules() {
-        // sni rules don't accept `methods`; emitting one here
+    fn render_with_methods_does_not_decorate_splice_rules() {
+        // splice rules don't accept `methods`; emitting one here
         // would produce a config the runtime rejects.
         let events = vec![ev("tls_hostname", Some("pinned.example"), None)];
         let out = render(&events, &dummy_path(), true);
-        assert!(out.contains(r#"mechanism = "sni""#));
+        assert!(out.contains(r#"mechanism = "splice""#));
         assert!(!out.contains("methods"),
-            "methods must not be emitted for sni rules: {out}");
+            "methods must not be emitted for splice rules: {out}");
     }
 
     #[test]

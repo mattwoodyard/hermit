@@ -43,7 +43,7 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CLOSE_DELIMITED_RESPONSE: u64 = 512 * 1024 * 1024;
 
 /// Configuration for the HTTP proxy.
-pub struct HttpProxyConfig<P, C> {
+pub struct ForwardConfig<P, C> {
     pub policy: Arc<P>,
     pub connector: Arc<C>,
     pub upstream_port: u16,
@@ -54,6 +54,14 @@ pub struct HttpProxyConfig<P, C> {
     /// allow-listed hostname becomes a generic egress to arbitrary
     /// ports (SSH/etc.) on that hostname's IP.
     pub allowed_connect_ports: BTreeSet<u16>,
+    /// When `Some`, an allowed `CONNECT` tunnel is handed off to
+    /// the MITM (TLS terminated locally with the hermit CA, then
+    /// the inner HTTP is filtered) instead of being spliced as
+    /// raw bytes to the origin. Required for L7 enforcement
+    /// (path_prefix, methods) of `HTTPS_PROXY` clients — the
+    /// splice path can't see TLS payload. When `None`, CONNECT
+    /// falls back to the legacy splice behavior.
+    pub mitm: Option<Arc<crate::mitm::MitmConfig<P, C>>>,
     /// Where to record block events. `BlockLogger::disabled()` by default.
     pub block_log: BlockLogger,
     /// Where to record *allowed* access events (learn-mode trace).
@@ -62,7 +70,7 @@ pub struct HttpProxyConfig<P, C> {
 }
 
 /// Run the HTTP proxy accept loop on port 80 traffic.
-pub async fn run<P, C>(listener: TcpListener, config: Arc<HttpProxyConfig<P, C>>) -> Result<()>
+pub async fn run<P, C>(listener: TcpListener, config: Arc<ForwardConfig<P, C>>) -> Result<()>
 where
     P: RequestPolicy + 'static,
     C: UpstreamConnector + 'static,
@@ -109,7 +117,7 @@ where
 async fn handle_connection<P, C>(
     mut client: TcpStream,
     client_addr: SocketAddr,
-    config: &HttpProxyConfig<P, C>,
+    config: &ForwardConfig<P, C>,
 ) -> Result<()>
 where
     P: RequestPolicy,
@@ -336,7 +344,7 @@ async fn handle_connect<P, C>(
     mut client: TcpStream,
     client_addr: SocketAddr,
     request: http::Request,
-    config: &HttpProxyConfig<P, C>,
+    config: &ForwardConfig<P, C>,
 ) -> Result<()>
 where
     P: RequestPolicy,
@@ -422,8 +430,42 @@ where
         reason: None,
     });
 
-    trace!(%host, port, "http: CONNECT dialing upstream");
-    let mut upstream = match timeout(
+    // Branch A — MITM hand-off. When a MitmConfig is wired in,
+    // we 200-OK the CONNECT immediately and then feed the now-
+    // tunnel stream to the MITM, which expects exactly what
+    // follows: a TLS ClientHello. The CONNECT port becomes a
+    // synthetic `original_dst` so the MITM's connector dials the
+    // upstream on the right port (e.g. `CONNECT host:8443` ⇒
+    // dial host:8443, not 443).
+    if let Some(mitm_config) = &config.mitm {
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .context("writing CONNECT 200")?;
+        trace!(%host, port, "http: CONNECT 200 sent, handing off to MITM");
+        // The connector ignores the IP component of original_dst
+        // (only the port matters), so an unspecified address is
+        // fine here and avoids leaking 127.0.0.1 into traces as
+        // if it were the real destination.
+        let synthetic_dst = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port,
+        );
+        return crate::transparent::handle_stream(
+            client,
+            client_addr,
+            Some(synthetic_dst),
+            mitm_config,
+        )
+        .await;
+    }
+
+    // Branch B — legacy splice. Dial the real origin first so we
+    // can return a proper 502 if it fails (the client hasn't
+    // received 200 yet at this point); on success, send 200 and
+    // hand to the byte-relay engine.
+    trace!(%host, port, "http: CONNECT dialing upstream (splice mode)");
+    let upstream = match timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         config.connector.connect(&host, port, None),
     )
@@ -455,9 +497,10 @@ where
         .context("writing CONNECT 200")?;
     trace!("http: CONNECT 200 sent, starting bidirectional splice");
 
-    // Splice bidirectionally. copy_bidirectional returns when either
-    // side closes, which is the expected termination for a tunnel.
-    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+    // No replay bytes here — the client is just about to send
+    // its own first byte after our 200. Forward CONNECT-splice
+    // is the (forward, splice) cell of the matrix.
+    match crate::splice::relay(client, upstream, &[]).await {
         Ok((c2u, u2c)) => trace!(
             client_to_upstream = c2u,
             upstream_to_client = u2c,
@@ -497,11 +540,12 @@ mod tests {
 
     #[test]
     fn config_builds_with_allow_all() {
-        let config = HttpProxyConfig {
+        let config = ForwardConfig {
             policy: Arc::new(AllowAll),
             connector: Arc::new(crate::connector::DirectConnector),
             upstream_port: 80,
             allowed_connect_ports: BTreeSet::from([443]),
+            mitm: None,
             block_log: crate::block_log::BlockLogger::disabled(),
             access_log: crate::block_log::BlockLogger::disabled(),
         };
@@ -511,11 +555,12 @@ mod tests {
     #[test]
     fn config_builds_with_ruleset() {
         let rules = vec![AccessRule::host_only("example.com")];
-        let config = HttpProxyConfig {
+        let config = ForwardConfig {
             policy: Arc::new(RuleSet::new(rules)),
             connector: Arc::new(crate::connector::DirectConnector),
             upstream_port: 80,
             allowed_connect_ports: BTreeSet::from([443]),
+            mitm: None,
             block_log: crate::block_log::BlockLogger::disabled(),
             access_log: crate::block_log::BlockLogger::disabled(),
         };

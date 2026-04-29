@@ -2,7 +2,7 @@
 //!
 //! Exercises the full chain: TOML policy load → match DSL evaluation →
 //! credential source acquisition → header template render → raw-bytes
-//! edit via `mitm::apply_injection`. This is the same code path the MITM
+//! edit via `transparent::apply_injection`. This is the same code path the MITM
 //! loop executes per request; the only piece not exercised here is the
 //! TLS plumbing, which is unchanged by this feature.
 

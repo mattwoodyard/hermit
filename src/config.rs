@@ -259,13 +259,15 @@ pub struct AccessRuleSpec {
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub methods: Option<Vec<String>>,
-    /// How this rule is enforced: `mitm` (default), `sni`, or
+    /// How this rule is enforced: `mitm` (default), `splice`, or
     /// `bypass`.
     ///
-    /// `sni` rules are cut-through: we look up the TLS SNI, match
-    /// against policy, and from there splice bytes without inspecting
-    /// them. `path_prefix`, `methods`, and credential injection cannot
-    /// be honored on an `sni` rule.
+    /// `splice` rules relay raw bytes after a hostname check: on
+    /// the transparent path we peek the TLS SNI, on the forward
+    /// path we read the `CONNECT` target. Either way no payload
+    /// is inspected — `path_prefix`, `methods`, and credential
+    /// injection cannot be honored on a `splice` rule. Use this
+    /// for cert-pinning clients.
     ///
     /// `bypass` rules are plain-relay: the bypass listener on
     /// `(protocol, port)` accepts child traffic, `SO_ORIGINAL_DST` /
@@ -289,14 +291,13 @@ pub struct AccessRuleSpec {
 
 /// TOML surface for [`sni_proxy::policy::Mechanism`]. Kept separate
 /// from the policy enum so we can evolve the user-facing string names
-/// (e.g. alias `sni-passthrough` → `Sni`) without changing the
-/// library type.
+/// without changing the library type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessMechanismSpec {
     #[default]
     Mitm,
-    Sni,
+    Splice,
     Bypass,
 }
 
@@ -540,8 +541,8 @@ fn compile_access_rule(i: usize, ar: &AccessRuleSpec) -> Result<CompiledRule> {
 
     // Resolve + validate the mechanism. L7 narrowing (path_prefix /
     // methods) can only be enforced with plaintext visibility, so
-    // accepting it on `sni` or `bypass` would silently widen the
-    // allowlist. IP-keyed rules are bypass-only because MITM/SNI
+    // accepting it on `splice` or `bypass` would silently widen the
+    // allowlist. IP-keyed rules are bypass-only because mitm/splice
     // fundamentally work on hostnames.
     let mechanism = match ar.mechanism {
         AccessMechanismSpec::Mitm => {
@@ -559,19 +560,19 @@ fn compile_access_rule(i: usize, ar: &AccessRuleSpec) -> Result<CompiledRule> {
             }
             sni_proxy::policy::Mechanism::Mitm
         }
-        AccessMechanismSpec::Sni => {
+        AccessMechanismSpec::Splice => {
             if ar.path_prefix.is_some() {
                 bail!(
-                    "access_rule #{i} ({label}): mechanism = \"sni\" is \
-                     incompatible with path_prefix — the SNI cut-through proxy \
-                     never sees the HTTP path."
+                    "access_rule #{i} ({label}): mechanism = \"splice\" is \
+                     incompatible with path_prefix — the splice engine relays \
+                     raw bytes and never sees the HTTP path."
                 );
             }
             if ar.methods.is_some() {
                 bail!(
-                    "access_rule #{i} ({label}): mechanism = \"sni\" is \
-                     incompatible with methods — the SNI cut-through proxy \
-                     never sees the HTTP method."
+                    "access_rule #{i} ({label}): mechanism = \"splice\" is \
+                     incompatible with methods — the splice engine relays \
+                     raw bytes and never sees the HTTP method."
                 );
             }
             if ar.protocol.is_some() || ar.port.is_some() {
@@ -582,11 +583,11 @@ fn compile_access_rule(i: usize, ar: &AccessRuleSpec) -> Result<CompiledRule> {
             }
             if ar.ip.is_some() {
                 bail!(
-                    "access_rule #{i} ({label}): mechanism = \"sni\" requires a \
+                    "access_rule #{i} ({label}): mechanism = \"splice\" requires a \
                      hostname — IP-keyed rules only support bypass"
                 );
             }
-            sni_proxy::policy::Mechanism::Sni
+            sni_proxy::policy::Mechanism::Splice
         }
         AccessMechanismSpec::Bypass => {
             if ar.path_prefix.is_some() {
@@ -782,22 +783,23 @@ host = "x"
         let toml = r#"
 [[access_rule]]
 host = "pinned.example"
-mechanism = "sni"
+mechanism = "splice"
 "#;
         let c = Config::parse(toml).unwrap();
         let rules = c.access_rules().unwrap();
-        assert_eq!(rules[0].mechanism, sni_proxy::policy::Mechanism::Sni);
+        assert_eq!(rules[0].mechanism, sni_proxy::policy::Mechanism::Splice);
     }
 
     #[test]
-    fn access_rule_sni_with_path_prefix_is_error() {
-        // An `sni` rule splices without inspecting HTTP — silently
-        // ignoring `path_prefix` would widen the allowlist, so parse
-        // must reject it. The error must name the offending field.
+    fn access_rule_splice_with_path_prefix_is_error() {
+        // A `splice` rule relays without inspecting HTTP —
+        // silently ignoring `path_prefix` would widen the
+        // allowlist, so parse must reject it. The error must
+        // name the offending field.
         let toml = r#"
 [[access_rule]]
 host = "pinned.example"
-mechanism = "sni"
+mechanism = "splice"
 path_prefix = "/api/"
 "#;
         let c = Config::parse(toml).unwrap();
@@ -811,7 +813,7 @@ path_prefix = "/api/"
         let toml = r#"
 [[access_rule]]
 host = "pinned.example"
-mechanism = "sni"
+mechanism = "splice"
 methods = ["GET"]
 "#;
         let c = Config::parse(toml).unwrap();
@@ -1005,15 +1007,15 @@ mechanism = "mitm"
     }
 
     #[test]
-    fn access_rule_ip_rejects_sni_mechanism() {
+    fn access_rule_ip_rejects_splice_mechanism() {
         let toml = r#"
 [[access_rule]]
 ip = "10.0.0.5"
-mechanism = "sni"
+mechanism = "splice"
 "#;
         let c = Config::parse(toml).unwrap();
         let err = c.compile_rules().unwrap_err().to_string();
-        assert!(err.contains("sni"));
+        assert!(err.contains("splice"));
     }
 
     #[test]
