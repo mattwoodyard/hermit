@@ -60,6 +60,18 @@ pub enum Command {
     /// handshake never produced an HTTPS request, suggesting a
     /// cert-pinning client; `mitm` otherwise).
     LearnConvert(LearnConvertArgs),
+    /// Run the proxy services (MITM, HTTP, optional DNS) in the
+    /// foreground without forking a sandboxed child. Reads the
+    /// same config as `hermit run` — every `[[access_rule]]` is
+    /// honored — but binds the listeners on the host network
+    /// directly so a client process anywhere on the host can be
+    /// pointed at them via `HTTP_PROXY`/`HTTPS_PROXY`. Useful
+    /// for testing the proxy in isolation, capturing traffic from
+    /// an unsandboxed app, or running the proxy as a service.
+    /// Bypass relays and `[[port_forward]]` entries are skipped
+    /// because they require nft DNAT, which proxy mode doesn't
+    /// install.
+    Proxy(ProxyArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -318,6 +330,83 @@ pub struct KeygenArgs {
     /// Overwrite `--cert` / `--key` if they already exist.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ProxyArgs {
+    /// URL of the config to load. Same shape as `hermit run --config`.
+    /// Every `[[access_rule]]` is enforced (or observed when
+    /// `--permit-all` is set). Bypass / port_forward entries are
+    /// silently skipped — they only function with the nft DNAT
+    /// proxy mode does not install.
+    #[arg(long)]
+    pub config: String,
+
+    /// Skip signature verification on the loaded config(s).
+    #[arg(long)]
+    pub allow_unsigned: bool,
+
+    /// Address the MITM proxy should listen on. Point clients at
+    /// this address as their `HTTPS_PROXY` (proxy mode handles
+    /// the CONNECT tunnel via the HTTP listener — see
+    /// `--listen-http` below — but the MITM listener is also
+    /// reachable for transparent flows when the operator wires
+    /// up DNAT externally).
+    #[arg(long, default_value = "127.0.0.1:1443")]
+    pub listen_https: String,
+
+    /// Address the HTTP proxy should listen on. Set the client's
+    /// `HTTP_PROXY` and `HTTPS_PROXY` to `http://<addr>` to route
+    /// traffic through hermit.
+    #[arg(long, default_value = "127.0.0.1:1080")]
+    pub listen_http: String,
+
+    /// Optional UDP address for the DNS server. When set, hermit
+    /// runs a DNS server that filters allowed hostnames and
+    /// forwards to the upstream resolver in `[dns]`. Most
+    /// `HTTP_PROXY` clients don't need this — the proxy receives
+    /// the hostname directly via CONNECT — so it's off by default.
+    #[arg(long)]
+    pub listen_dns: Option<String>,
+
+    /// Write the ephemeral CA certificate (PEM) here so the
+    /// client can be configured to trust it. Without this the
+    /// PEM is printed to stdout at startup so it can be piped to
+    /// a file or to the system trust store.
+    #[arg(long)]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Disable the rule check — every host is allowed and every
+    /// access is recorded to the access log. Mirrors the
+    /// observation behavior of `hermit learn`, but for an
+    /// arbitrary client driven through `HTTP_PROXY`.
+    #[arg(long)]
+    pub permit_all: bool,
+
+    /// Append JSON-lines block events to this file. Defaults to
+    /// `$XDG_STATE_HOME/hermit/blocks.jsonl`. Pass `--no-block-log`
+    /// to disable.
+    #[arg(long, conflicts_with = "no_block_log")]
+    pub block_log: Option<PathBuf>,
+
+    /// Disable block-event logging entirely.
+    #[arg(long)]
+    pub no_block_log: bool,
+
+    /// Where to write `tcp_observe`/allow events. Useful with
+    /// `--permit-all` to capture a learn-style trace from a
+    /// client that points at the proxy.
+    #[arg(long)]
+    pub access_log: Option<PathBuf>,
+
+    /// Write hermit's own info/warn/debug output to this file
+    /// instead of stderr.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
+
+    /// Verbose output. `-v` info, `-vv` debug, `-vvv` trace.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
 }
 
 #[cfg(test)]
@@ -824,5 +913,86 @@ mod tests {
             }
             _ => panic!("wrong subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_proxy_minimal_uses_defaults() {
+        let cli = Cli::parse_from([
+            "hermit", "proxy", "--config", "file:///tmp/hermit.toml",
+        ]);
+        match cli.command {
+            Command::Proxy(args) => {
+                assert_eq!(args.config, "file:///tmp/hermit.toml");
+                assert_eq!(args.listen_https, "127.0.0.1:1443");
+                assert_eq!(args.listen_http, "127.0.0.1:1080");
+                assert!(args.listen_dns.is_none());
+                assert!(args.ca_cert.is_none());
+                assert!(!args.permit_all);
+                assert!(!args.allow_unsigned);
+                assert!(!args.no_block_log);
+                assert!(args.block_log.is_none());
+                assert!(args.access_log.is_none());
+                assert!(args.log_file.is_none());
+                assert_eq!(args.verbose, 0);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_proxy_requires_config() {
+        // Same shape as `run`: no positional fallback, --config
+        // is the only way to point at a TOML.
+        assert!(Cli::try_parse_from(["hermit", "proxy"]).is_err());
+    }
+
+    #[test]
+    fn parse_proxy_with_all_flags() {
+        let cli = Cli::parse_from([
+            "hermit", "proxy",
+            "--config", "https://example.com/h.toml",
+            "--allow-unsigned",
+            "--listen-https", "0.0.0.0:1443",
+            "--listen-http", "0.0.0.0:1080",
+            "--listen-dns", "127.0.0.1:5353",
+            "--ca-cert", "/tmp/ca.pem",
+            "--permit-all",
+            "--access-log", "/tmp/access.jsonl",
+            "--log-file", "/tmp/proxy.log",
+            "-vv",
+        ]);
+        match cli.command {
+            Command::Proxy(args) => {
+                assert_eq!(args.config, "https://example.com/h.toml");
+                assert!(args.allow_unsigned);
+                assert_eq!(args.listen_https, "0.0.0.0:1443");
+                assert_eq!(args.listen_http, "0.0.0.0:1080");
+                assert_eq!(args.listen_dns.as_deref(), Some("127.0.0.1:5353"));
+                assert_eq!(args.ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
+                assert!(args.permit_all);
+                assert_eq!(args.access_log, Some(PathBuf::from("/tmp/access.jsonl")));
+                assert_eq!(args.log_file, Some(PathBuf::from("/tmp/proxy.log")));
+                assert_eq!(args.verbose, 2);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_proxy_block_log_no_block_log_conflict() {
+        // Same belt-and-suspenders rule as `run`: passing both
+        // is ambiguous so clap rejects it up front.
+        let err = Cli::try_parse_from([
+            "hermit", "proxy",
+            "--config", "file:///x.toml",
+            "--block-log", "/tmp/b.jsonl",
+            "--no-block-log",
+        ])
+        .expect_err("clap must reject --block-log with --no-block-log");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflict"),
+            "expected a conflict error, got: {msg}"
+        );
     }
 }

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use hermit::cli::{
     Cli, Command, EditConfigAction, EditConfigArgs, KeygenArgs, LearnArgs, LearnConvertArgs,
-    RunArgs, SignArgs, VerifyArgs,
+    ProxyArgs, RunArgs, SignArgs, VerifyArgs,
 };
 use hermit::config_loader::TrustPolicy;
 use hermit::sandbox::default_access_log_path;
@@ -34,6 +34,7 @@ fn run() -> Result<i32> {
         Command::EditConfig(args) => edit_config_subcommand(args),
         Command::Learn(args) => learn_subcommand(args),
         Command::LearnConvert(args) => learn_convert_subcommand(args),
+        Command::Proxy(args) => proxy_subcommand(args),
     }
 }
 
@@ -117,6 +118,285 @@ passthrough = ["/"]
 "#,
     )
     .context("building default learn-mode config")
+}
+
+/// Run the proxy services in the foreground without forking a
+/// sandboxed child or installing nft DNAT. Useful for testing the
+/// proxy code path against an external client driven through
+/// `HTTP_PROXY` / `HTTPS_PROXY`, or for capturing what an
+/// unsandboxed app does.
+fn proxy_subcommand(args: ProxyArgs) -> Result<i32> {
+    use std::sync::Arc;
+    use sni_proxy::policy::RuleSet;
+
+    init_logging(args.verbose, args.log_file.as_deref())?;
+    if let Some(p) = &args.log_file {
+        info!("log file: {}", p.display());
+    }
+
+    // Config loading mirrors `hermit run`: signed by default,
+    // unsigned only when explicitly requested. Trust dir
+    // resolution falls back to ~/.hermit/keys / HERMIT_TRUST_DIR.
+    let trust_dir_buf = if args.allow_unsigned {
+        warn!(
+            "--allow-unsigned: skipping signature verification for {} \
+             and any included files",
+            args.config
+        );
+        None
+    } else {
+        Some(default_trust_dir()?)
+    };
+    let trust = match &trust_dir_buf {
+        Some(dir) => TrustPolicy::RequireSigned { trust_dir: dir },
+        None => TrustPolicy::AllowUnsigned,
+    };
+    let config = config_loader::assemble(&args.config, &trust)
+        .with_context(|| format!("loading config from {}", args.config))?;
+
+    let access_rules = config.access_rules()?;
+    let ip_rules = config.ip_rules()?;
+    if !config.port_forwards.is_empty() {
+        warn!(
+            "proxy mode: ignoring {} [[port_forward]] entries — they require \
+             nft DNAT, which proxy mode does not install",
+            config.port_forwards.len()
+        );
+    }
+    let bypass_count = access_rules
+        .iter()
+        .filter(|r| matches!(r.mechanism, sni_proxy::policy::Mechanism::Bypass { .. }))
+        .count()
+        + ip_rules.len();
+    if bypass_count > 0 {
+        warn!(
+            "proxy mode: ignoring {} bypass rule(s) — they need nft DNAT + \
+             SO_ORIGINAL_DST and are unreachable through HTTP_PROXY",
+            bypass_count
+        );
+    }
+
+    let policy = Arc::new(
+        RuleSet::new(access_rules)
+            .with_ip_rules(ip_rules)
+            .with_permit_all(args.permit_all),
+    );
+    if args.permit_all {
+        info!("proxy mode: --permit-all — every host is allowed and recorded");
+    }
+    let network_policy = config.network_policy()?.map(Arc::new);
+
+    // Generate the ephemeral CA. Same shape as the sandbox path,
+    // but the cert must be made available to the *external*
+    // client (we can't bind-mount into its trust store).
+    let ca = Arc::new(
+        sni_proxy::ca::CertificateAuthority::new()
+            .context("failed to generate ephemeral CA")?,
+    );
+    let ca_pem = ca.ca_cert_pem().to_string();
+    if let Some(path) = &args.ca_cert {
+        std::fs::write(path, ca_pem.as_bytes())
+            .with_context(|| format!("writing CA cert to {}", path.display()))?;
+        info!("ca cert: {}", path.display());
+    } else {
+        // No path provided — print to stdout so a caller can pipe
+        // it (`hermit proxy ... | ca-trust install`-style) without
+        // having to scrape a temp file.
+        println!("{}", ca_pem);
+    }
+
+    let dns_upstream = config.dns().upstream_addr()?;
+
+    // Build a tokio runtime and spawn the proxy services.
+    let rt = tokio::runtime::Runtime::new()
+        .context("creating tokio runtime")?;
+
+    let block_log = build_block_log(&rt, &args)?;
+    let access_log = match &args.access_log {
+        Some(p) => {
+            info!("access log: {}", p.display());
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            rt.block_on(async { sni_proxy::block_log::BlockLogger::to_file(p).await })
+                .context("opening access log")?
+        }
+        None => sni_proxy::block_log::BlockLogger::disabled(),
+    };
+
+    // Bind listeners on the *host* network — no namespace switch.
+    // We use `tokio::net::TcpListener::bind` directly; the address
+    // strings are validated by clap-default + here at runtime.
+    let https_listener = rt
+        .block_on(tokio::net::TcpListener::bind(&args.listen_https))
+        .with_context(|| format!("binding HTTPS listener on {}", args.listen_https))?;
+    let http_listener = rt
+        .block_on(tokio::net::TcpListener::bind(&args.listen_http))
+        .with_context(|| format!("binding HTTP listener on {}", args.listen_http))?;
+    let https_addr = https_listener.local_addr().ok();
+    let http_addr = http_listener.local_addr().ok();
+
+    let dns_socket: Option<tokio::net::UdpSocket> = match &args.listen_dns {
+        Some(addr) => Some(
+            rt.block_on(tokio::net::UdpSocket::bind(addr))
+                .with_context(|| format!("binding DNS socket on {addr}"))?,
+        ),
+        None => None,
+    };
+    let dns_addr = dns_socket.as_ref().and_then(|s| s.local_addr().ok());
+
+    // Configs identical to the sandbox path, minus the netns-bound
+    // upstream_port quirks. `upstream_port` is the *default* port
+    // the connector dials when the original-dst lookup yields
+    // nothing — for proxy mode there's no DNAT and SO_ORIGINAL_DST
+    // is always None, so the default carries every CONNECT.
+    let mitm_config = Arc::new(sni_proxy::mitm::MitmConfig {
+        policy: Arc::clone(&policy),
+        connector: Arc::new(sni_proxy::connector::DirectConnector),
+        ca,
+        upstream_port: 443,
+        network_policy,
+        block_log: block_log.clone(),
+        access_log: access_log.clone(),
+    });
+
+    let mut allowed_connect_ports: std::collections::BTreeSet<u16> =
+        std::collections::BTreeSet::new();
+    allowed_connect_ports.insert(443);
+    for pf in &config.port_forwards {
+        if matches!(pf.protocol, hermit::config::PortProtocol::Https) {
+            allowed_connect_ports.insert(pf.port);
+        }
+    }
+    let http_config = Arc::new(sni_proxy::http_proxy::HttpProxyConfig {
+        policy: Arc::clone(&policy),
+        connector: Arc::new(sni_proxy::connector::DirectConnector),
+        upstream_port: 80,
+        allowed_connect_ports,
+        block_log: block_log.clone(),
+        access_log: access_log.clone(),
+    });
+
+    let dns_cache = Arc::new(sni_proxy::dns_cache::DnsCache::new());
+    let dns_server = if dns_socket.is_some() {
+        let forwarder =
+            Arc::new(sni_proxy::dns_forwarder::DnsForwarder::new(dns_upstream));
+        Some(Arc::new(
+            sni_proxy::dns::DnsServer::new(Arc::clone(&policy))
+                .with_block_log(block_log.clone())
+                .with_access_log(access_log.clone())
+                .with_upstream(forwarder)
+                .with_cache(Arc::clone(&dns_cache)),
+        ))
+    } else {
+        None
+    };
+
+    print_ready_banner(https_addr, http_addr, dns_addr, args.ca_cert.as_deref());
+
+    rt.block_on(async move {
+        let mitm = tokio::spawn(async move {
+            if let Err(e) = sni_proxy::mitm::run(https_listener, mitm_config).await {
+                eprintln!("hermit: mitm proxy error: {e}");
+            }
+        });
+        let http = tokio::spawn(async move {
+            if let Err(e) = sni_proxy::http_proxy::run(http_listener, http_config).await {
+                eprintln!("hermit: http proxy error: {e}");
+            }
+        });
+        let dns = match (dns_server, dns_socket) {
+            (Some(server), Some(socket)) => Some(tokio::spawn(async move {
+                if let Err(e) = server.run(socket).await {
+                    eprintln!("hermit: dns server error: {e}");
+                }
+            })),
+            _ => None,
+        };
+
+        // Block until the operator interrupts. SIGINT covers
+        // Ctrl-C; SIGTERM covers `kill <pid>` and supervisord-
+        // style stop signals. Either fires → we drop the
+        // listener tasks and the runtime tears them down.
+        wait_for_signal().await;
+        eprintln!("hermit: shutting down");
+        mitm.abort();
+        http.abort();
+        if let Some(h) = dns {
+            h.abort();
+        }
+    });
+
+    Ok(0)
+}
+
+fn build_block_log(
+    rt: &tokio::runtime::Runtime,
+    args: &ProxyArgs,
+) -> Result<sni_proxy::block_log::BlockLogger> {
+    if args.no_block_log {
+        return Ok(sni_proxy::block_log::BlockLogger::disabled());
+    }
+    let path = args
+        .block_log
+        .clone()
+        .unwrap_or_else(hermit::sandbox::default_block_log_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    info!("block log: {}", path.display());
+    rt.block_on(async { sni_proxy::block_log::BlockLogger::to_file(&path).await })
+        .context("opening block log")
+}
+
+/// Print the listen addresses + a CA hint so the user knows how
+/// to configure their client. Goes to stderr so an operator who
+/// piped stdout to capture the CA PEM still sees it.
+fn print_ready_banner(
+    https: Option<std::net::SocketAddr>,
+    http: Option<std::net::SocketAddr>,
+    dns: Option<std::net::SocketAddr>,
+    ca_path: Option<&Path>,
+) {
+    eprintln!("hermit proxy: listening");
+    if let Some(a) = https {
+        eprintln!("  HTTPS  {a}  (MITM)");
+    }
+    if let Some(a) = http {
+        eprintln!("  HTTP   {a}  (HTTP_PROXY/HTTPS_PROXY entry point)");
+    }
+    if let Some(a) = dns {
+        eprintln!("  DNS    {a}  (UDP)");
+    }
+    match ca_path {
+        Some(p) => eprintln!("  CA cert -> {}", p.display()),
+        None => eprintln!("  CA cert printed above on stdout"),
+    }
+    let http_url = http.map(|a| format!("http://{a}"));
+    if let Some(u) = http_url {
+        eprintln!();
+        eprintln!("Example client setup:");
+        eprintln!("  HTTP_PROXY={u} HTTPS_PROXY={u} <your-command>");
+        eprintln!();
+    }
+    eprintln!("Press Ctrl+C to stop.");
+}
+
+async fn wait_for_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hermit: failed to install SIGTERM handler: {e}");
+            // Falling back to SIGINT-only is still useful.
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }
 
 fn edit_config_subcommand(args: EditConfigArgs) -> Result<i32> {

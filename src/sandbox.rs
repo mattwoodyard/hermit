@@ -250,7 +250,7 @@ fn resolve_block_log(
 /// should persist between application restarts, but ... not important
 /// or portable enough to store in $XDG_DATA_HOME"; logs are listed
 /// explicitly as an example.
-fn default_block_log_path() -> PathBuf {
+pub fn default_block_log_path() -> PathBuf {
     xdg_state_home_from(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
