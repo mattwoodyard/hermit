@@ -130,7 +130,18 @@ fn proxy_subcommand(args: ProxyArgs) -> Result<i32> {
     use std::sync::Arc;
     use sni_proxy::policy::RuleSet;
 
-    init_logging(args.verbose, args.log_file.as_deref())?;
+    // `--trace` is the maximum-detail debugging knob. It pins
+    // verbosity at trace and switches to the long-form format so
+    // a connection can be followed end-to-end via the per-conn
+    // span. Plain `-vvv` still works without --trace; --trace
+    // wins the format choice.
+    let effective_verbose = if args.trace { 3 } else { args.verbose };
+    init_logging_full(effective_verbose, args.log_file.as_deref(), args.trace)?;
+    if args.trace {
+        info!(
+            "proxy: --trace enabled (verbose=3, detailed format with target + path:line + per-conn spans)"
+        );
+    }
     if let Some(p) = &args.log_file {
         info!("log file: {}", p.display());
     }
@@ -410,6 +421,14 @@ fn edit_config_subcommand(args: EditConfigArgs) -> Result<i32> {
 }
 
 fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
+    init_logging_full(verbose, log_file, false)
+}
+
+/// Like [`init_logging`] but lets the caller request the
+/// detailed format (target name + `path:line`) used by
+/// `hermit proxy --trace`. `verbose_format = true` makes a
+/// single connection's events grep-friendly across files.
+fn init_logging_full(verbose: u8, log_file: Option<&Path>, verbose_format: bool) -> Result<()> {
     let level = match verbose {
         0 => log::LevelFilter::Warn,
         1 => log::LevelFilter::Info,
@@ -440,8 +459,16 @@ fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
     };
     env_logger::Builder::new()
         .filter_level(level)
-        .format_target(false)
-        .format_timestamp(None)
+        .format_target(verbose_format)
+        .format_timestamp(if verbose_format {
+            // Millisecond timestamps make the per-connection
+            // ordering legible when interleaving captures from
+            // many sessions; in normal mode we keep the output
+            // tidy.
+            Some(env_logger::TimestampPrecision::Millis)
+        } else {
+            None
+        })
         .target(env_target)
         .init();
 
@@ -462,7 +489,18 @@ fn init_logging(verbose: u8, log_file: Option<&Path>) -> Result<()> {
     // a duplicate-install error isn't actionable at runtime.
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
+        .with_target(verbose_format)
+        .with_file(verbose_format)
+        .with_line_number(verbose_format)
+        // Spans (e.g. per-connection `conn_id` set by
+        // http_proxy) attach to events as fields when format
+        // is detailed; off otherwise to keep the output dense.
+        .with_span_events(if verbose_format {
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE
+        } else {
+            tracing_subscriber::fmt::format::FmtSpan::NONE
+        })
         .without_time();
     match file_handle {
         Some(f) => {

@@ -413,6 +413,19 @@ pub struct ProxyArgs {
     /// Verbose output. `-v` info, `-vv` debug, `-vvv` trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Maximum-detail debugging — each TCP connection gets its
+    /// own tracing span (`conn=<id>`, `peer=<addr>`) and every
+    /// proxy hop emits a trace event: SO_ORIGINAL_DST result,
+    /// HTTP request line, host header, policy verdict, CONNECT
+    /// target parse, port-allowlist check, upstream dial,
+    /// body-framing mode, splice start/end. Implies `-vvv` plus
+    /// `target=… path:line` in the format so a single connection
+    /// can be followed end-to-end. For finer control (e.g. only
+    /// `sni_proxy::http_proxy` at trace), set `RUST_LOG`
+    /// directly — that takes precedence over `--trace`.
+    #[arg(long)]
+    pub trace: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -951,6 +964,7 @@ mod tests {
                 assert!(args.access_log.is_none());
                 assert!(args.log_file.is_none());
                 assert_eq!(args.verbose, 0);
+                assert!(!args.trace);
             }
             _ => panic!("wrong subcommand"),
         }
@@ -977,6 +991,7 @@ mod tests {
             "--access-log", "/tmp/access.jsonl",
             "--log-file", "/tmp/proxy.log",
             "-vv",
+            "--trace",
         ]);
         match cli.command {
             Command::Proxy(args) => {
@@ -990,7 +1005,19 @@ mod tests {
                 assert_eq!(args.access_log, Some(PathBuf::from("/tmp/access.jsonl")));
                 assert_eq!(args.log_file, Some(PathBuf::from("/tmp/proxy.log")));
                 assert_eq!(args.verbose, 2);
+                assert!(args.trace);
             }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_proxy_trace_defaults_off() {
+        let cli = Cli::parse_from([
+            "hermit", "proxy", "--config", "file:///x.toml",
+        ]);
+        match cli.command {
+            Command::Proxy(args) => assert!(!args.trace),
             _ => panic!("wrong subcommand"),
         }
     }

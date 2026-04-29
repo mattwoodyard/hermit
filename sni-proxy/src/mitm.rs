@@ -12,14 +12,25 @@
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Per-connection ID counter — same shape as the one in
+/// `http_proxy`, but kept private here so the two namespaces
+/// (`mitm_conn=…` vs `http_conn=…`) don't collide in a single
+/// trace search.
+static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_conn_id() -> u64 {
+    CONN_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn, Instrument};
 
 use crate::block_log::{now_unix_ms, BlockEvent, BlockKind, BlockLogger};
 use crate::ca::CertificateAuthority;
@@ -83,14 +94,20 @@ where
         };
         let config = Arc::clone(&config);
 
-        tokio::spawn(async move {
-            let _permit = permit;
-            debug!(%addr, "mitm: accepted connection");
-            if let Err(e) = handle_connection(stream, addr, &config).await {
-                // Connection resets and clean closes are noisy at error level
-                debug!(%addr, error = %e, "mitm: connection ended");
+        let conn_id = next_conn_id();
+        let span = tracing::trace_span!("mitm_conn", conn = conn_id, peer = %addr);
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                debug!(%addr, "mitm: accepted connection");
+                if let Err(e) = handle_connection(stream, addr, &config).await {
+                    // Connection resets and clean closes are noisy at error level
+                    debug!(%addr, error = %e, "mitm: connection ended");
+                }
+                trace!("mitm_conn closed");
             }
-        });
+            .instrument(span),
+        );
     }
 }
 
@@ -105,9 +122,14 @@ where
     C: UpstreamConnector,
 {
     let original_dst = get_original_dst(&client_tcp);
+    trace!(
+        original_dst = ?original_dst,
+        "mitm: SO_ORIGINAL_DST lookup (None outside transparent DNAT)"
+    );
 
     // Step 1: Read ClientHello, extract SNI (with a timeout — a client that
     // opens a socket and never sends must not park a tokio task forever).
+    trace!("mitm: awaiting ClientHello");
     let (hostname, client_hello_buf) = match timeout(
         CLIENT_HELLO_TIMEOUT,
         read_sni_with_buffer(&mut client_tcp),
@@ -120,6 +142,11 @@ where
             return Ok(());
         }
     };
+    trace!(
+        hostname = ?hostname,
+        client_hello_bytes = client_hello_buf.len(),
+        "mitm: ClientHello parsed"
+    );
 
     let hostname = match hostname {
         Some(h) => h,
@@ -140,7 +167,9 @@ where
     };
 
     // Step 2: Hostname-level policy check
-    if config.policy.check(&hostname) == Verdict::Deny {
+    let host_verdict = config.policy.check(&hostname);
+    trace!(?host_verdict, %hostname, "mitm: SNI host policy verdict");
+    if host_verdict == Verdict::Deny {
         debug!(%client_addr, %hostname, "hermit blocked: TLS hostname not in allowlist");
         config.block_log.log(BlockEvent {
             time_unix_ms: now_unix_ms(),
@@ -171,7 +200,10 @@ where
     // Step 2b: Mechanism dispatch. If the rule for this host is
     // `sni`, skip MITM entirely and splice raw bytes — certificate
     // pinning clients require this. `mitm` continues below.
-    if config.policy.mechanism(&hostname) == Mechanism::Sni {
+    let mechanism = config.policy.mechanism(&hostname);
+    trace!(?mechanism, %hostname, "mitm: mechanism for host");
+    if mechanism == Mechanism::Sni {
+        trace!(%hostname, "mitm: dispatching to SNI cut-through");
         return splice_sni_cut_through(
             client_tcp,
             &client_hello_buf,

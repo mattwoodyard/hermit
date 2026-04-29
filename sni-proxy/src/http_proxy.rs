@@ -7,19 +7,30 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn, Instrument};
 
 use crate::block_log::{now_unix_ms, BlockEvent, BlockKind, BlockLogger};
 use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::policy::{RequestPolicy, Verdict};
 use crate::proxy::{get_original_dst, MAX_CONCURRENT_CONNECTIONS};
+
+/// Connection counter used to tag every span with a fresh
+/// `conn_id`. Lets an operator chasing a single request grep
+/// `conn=1234` and see only that conversation's events even
+/// when many requests are interleaved.
+static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_conn_id() -> u64 {
+    CONN_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Max time to wait for a full HTTP request head on an idle keep-alive
 /// connection. Keeps slow clients from parking tokio tasks forever.
@@ -78,13 +89,19 @@ where
         };
         let config = Arc::clone(&config);
 
-        tokio::spawn(async move {
-            let _permit = permit; // released on task end
-            debug!(%addr, "http: accepted connection");
-            if let Err(e) = handle_connection(stream, addr, &config).await {
-                debug!(%addr, error = %e, "http: connection ended");
+        let conn_id = next_conn_id();
+        let span = tracing::trace_span!("http_conn", conn = conn_id, peer = %addr);
+        tokio::spawn(
+            async move {
+                let _permit = permit; // released on task end
+                debug!(%addr, "http: accepted connection");
+                if let Err(e) = handle_connection(stream, addr, &config).await {
+                    debug!(%addr, error = %e, "http: connection ended");
+                }
+                trace!("http_conn closed");
             }
-        });
+            .instrument(span),
+        );
     }
 }
 
@@ -102,7 +119,12 @@ where
     // aiming at (e.g. 8080). The connector uses this in preference to
     // `config.upstream_port` so additional port_forward entries work.
     let original_dst = get_original_dst(&client);
+    trace!(
+        original_dst = ?original_dst,
+        "http: SO_ORIGINAL_DST lookup (None in proxy mode without DNAT)"
+    );
     loop {
+        trace!("http: awaiting request head");
         let (request, leftover) = match timeout(
             HEADER_READ_TIMEOUT,
             http::read_request(&mut client),
@@ -110,7 +132,10 @@ where
         .await
         {
             Ok(Ok(Some(pair))) => pair,
-            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(None)) => {
+                trace!("http: client closed cleanly before sending a request");
+                return Ok(());
+            }
             Ok(Err(e)) => {
                 debug!(%client_addr, error = %e, "http: error reading request");
                 return Ok(());
@@ -120,12 +145,24 @@ where
                 return Ok(());
             }
         };
+        trace!(
+            method = %request.method,
+            path = %request.path,
+            host = ?request.host,
+            content_length = ?request.content_length,
+            chunked = request.chunked,
+            connection_close = request.connection_close,
+            head_bytes = request.head_bytes.len(),
+            leftover = leftover.len(),
+            "http: request parsed"
+        );
 
         // Proxy-aware clients send CONNECT when HTTPS_PROXY is set. We
         // terminate the CONNECT here, splice to the named upstream, and
         // return — the client then speaks TLS straight to the origin
         // through the tunnel. No HTTP inspection past this point.
         if request.method.eq_ignore_ascii_case("CONNECT") {
+            trace!("http: dispatching to handle_connect");
             return handle_connect(client, client_addr, request, config).await;
         }
 
@@ -146,6 +183,7 @@ where
                 return Ok(());
             }
         };
+        trace!(%hostname, "http: derived hostname for policy check");
 
         debug!(
             %client_addr, %hostname,
@@ -154,7 +192,9 @@ where
         );
 
         // Check request-level policy
-        if config.policy.check_request(&hostname, &request.path, &request.method) == Verdict::Deny {
+        let verdict = config.policy.check_request(&hostname, &request.path, &request.method);
+        trace!(?verdict, %hostname, path = %request.path, method = %request.method, "http: policy verdict");
+        if verdict == Verdict::Deny {
             debug!(
                 %client_addr, %hostname,
                 method = %request.method, path = %request.path,
@@ -185,6 +225,8 @@ where
             reason: None,
         });
 
+        let upstream_port = original_dst.map(|a| a.port()).unwrap_or(config.upstream_port);
+        trace!(%hostname, upstream_port, "http: dialing upstream");
         let mut upstream = match timeout(
             UPSTREAM_CONNECT_TIMEOUT,
             config
@@ -193,8 +235,14 @@ where
         )
         .await
         {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(e).context("connecting upstream"),
+            Ok(Ok(s)) => {
+                trace!(%hostname, upstream_port, "http: upstream connected");
+                s
+            }
+            Ok(Err(e)) => {
+                trace!(%hostname, upstream_port, error = %e, "http: upstream connect failed");
+                return Err(e).context("connecting upstream");
+            }
             Err(_) => {
                 warn!(%hostname, "http: upstream connect timed out");
                 return Ok(());
@@ -209,32 +257,44 @@ where
 
         // Forward request body (leftover bytes from the header read come first)
         if let Some(len) = request.content_length {
+            trace!(len, "http: forwarding request body (Content-Length)");
             http::forward_body_content_length(&mut client, &mut upstream, len, &leftover)
                 .await
                 .context("forwarding request body")?;
         } else if request.chunked {
+            trace!("http: forwarding request body (chunked)");
             http::forward_chunked_body(&mut client, &mut upstream, &leftover)
                 .await
                 .context("forwarding chunked request body")?;
         } else if !leftover.is_empty() {
             // Non-standard: no length, no chunked, but extra bytes buffered.
             // Safest is to forward what we've got.
+            trace!(leftover = leftover.len(), "http: forwarding leftover bytes (no body framing)");
             upstream.write_all(&leftover).await?;
         }
         upstream.flush().await?;
 
         // Read and forward response
+        trace!("http: awaiting response head");
         let (response, resp_leftover) = http::read_response(&mut upstream).await?;
+        trace!(
+            content_length = ?response.content_length,
+            chunked = response.chunked,
+            head_bytes = response.head_bytes.len(),
+            "http: response head parsed"
+        );
         client
             .write_all(&response.head_bytes)
             .await
             .context("forwarding response headers")?;
 
         if let Some(len) = response.content_length {
+            trace!(len, "http: forwarding response body (Content-Length)");
             http::forward_body_content_length(&mut upstream, &mut client, len, &resp_leftover)
                 .await
                 .context("forwarding response body")?;
         } else if response.chunked {
+            trace!("http: forwarding response body (chunked)");
             http::forward_chunked_body(&mut upstream, &mut client, &resp_leftover)
                 .await
                 .context("forwarding chunked response body")?;
@@ -242,6 +302,7 @@ where
             // No content-length, no chunked — body ends at connection close.
             // That is inherently incompatible with keep-alive, so drain
             // (bounded) and return.
+            trace!("http: forwarding close-delimited response (until EOF)");
             http::forward_until_eof(
                 &mut upstream,
                 &mut client,
@@ -256,8 +317,10 @@ where
         client.flush().await?;
 
         if request.connection_close {
+            trace!("http: client requested Connection: close, ending");
             return Ok(());
         }
+        trace!("http: keep-alive, awaiting next request");
         // Otherwise loop back and read the next request on this connection.
     }
 }
@@ -287,9 +350,15 @@ where
             return Ok(());
         }
     };
+    trace!(%host, port, raw_target = %request.path, "http: parsed CONNECT target");
 
     debug!(%client_addr, %host, %port, "http: CONNECT");
 
+    trace!(
+        port,
+        allowed = ?config.allowed_connect_ports,
+        "http: checking CONNECT port against allowlist"
+    );
     // Port-allowlist check happens *before* the hostname check: an
     // allow-listed host on a non-HTTPS port (e.g. ssh on 22) must
     // be denied. Otherwise a malicious build could exfiltrate via
@@ -317,7 +386,9 @@ where
         return Ok(());
     }
 
-    if config.policy.check(&host) == Verdict::Deny {
+    let conn_verdict = config.policy.check(&host);
+    trace!(?conn_verdict, %host, "http: CONNECT host policy verdict");
+    if conn_verdict == Verdict::Deny {
         debug!(%client_addr, %host, "hermit blocked: CONNECT to {}:{}", host, port);
         config.block_log.log(BlockEvent {
             time_unix_ms: now_unix_ms(),
@@ -351,13 +422,17 @@ where
         reason: None,
     });
 
+    trace!(%host, port, "http: CONNECT dialing upstream");
     let mut upstream = match timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         config.connector.connect(&host, port, None),
     )
     .await
     {
-        Ok(Ok(s)) => s,
+        Ok(Ok(s)) => {
+            trace!(%host, port, "http: CONNECT upstream connected");
+            s
+        }
         Ok(Err(e)) => {
             warn!(%host, port, error = %e, "http: CONNECT upstream failed");
             let _ = client
@@ -378,10 +453,18 @@ where
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .context("writing CONNECT 200")?;
+    trace!("http: CONNECT 200 sent, starting bidirectional splice");
 
     // Splice bidirectionally. copy_bidirectional returns when either
     // side closes, which is the expected termination for a tunnel.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+        Ok((c2u, u2c)) => trace!(
+            client_to_upstream = c2u,
+            upstream_to_client = u2c,
+            "http: CONNECT splice closed"
+        ),
+        Err(e) => trace!(error = %e, "http: CONNECT splice errored"),
+    }
     Ok(())
 }
 
