@@ -6,8 +6,8 @@ use std::process;
 use std::sync::Mutex;
 
 use hermit::cli::{
-    Cli, Command, EditConfigAction, EditConfigArgs, KeygenArgs, LearnArgs, LearnConvertArgs,
-    ProxyArgs, RunArgs, SignArgs, VerifyArgs,
+    Cli, Command, EditConfigAction, EditConfigArgs, InitArgs, KeygenArgs, LearnArgs,
+    LearnConvertArgs, ProxyArgs, RunArgs, SignArgs, VerifyArgs,
 };
 use hermit::config_loader::TrustPolicy;
 use hermit::sandbox::default_access_log_path;
@@ -35,6 +35,7 @@ fn run() -> Result<i32> {
         Command::Learn(args) => learn_subcommand(args),
         Command::LearnConvert(args) => learn_convert_subcommand(args),
         Command::Proxy(args) => proxy_subcommand(args),
+        Command::Init(args) => init_subcommand(args),
     }
 }
 
@@ -717,24 +718,75 @@ fn default_signer_key_path() -> Result<PathBuf> {
 }
 
 fn default_trust_dir() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("HERMIT_TRUST_DIR") {
-        let dir = PathBuf::from(p);
-        if !dir.exists() {
-            bail!(
+    let dir = trust_dir_path()?;
+    if !dir.exists() {
+        // Tailor the error so an operator running on a fresh
+        // machine sees the `hermit init` hint immediately.
+        match std::env::var("HERMIT_TRUST_DIR") {
+            Ok(_) => bail!(
                 "HERMIT_TRUST_DIR={} does not exist",
                 dir.display()
-            );
+            ),
+            Err(_) => bail!(
+                "trust directory {} does not exist; run `hermit init` to create it, \
+                 then drop trusted ed25519 cert .pem files into it",
+                dir.display()
+            ),
         }
-        return Ok(dir);
+    }
+    Ok(dir)
+}
+
+/// Resolve the trust-directory *path* without checking
+/// existence. Used by `init` (which creates the path) and
+/// shared by `default_trust_dir` (which then validates it).
+/// Precedence: `HERMIT_TRUST_DIR` env var → `$HOME/.hermit/keys`.
+fn trust_dir_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("HERMIT_TRUST_DIR") {
+        return Ok(PathBuf::from(p));
     }
     let home = std::env::var("HOME")
         .context("cannot locate trust directory: $HOME is not set")?;
-    let dir = Path::new(&home).join(".hermit/keys");
-    if !dir.exists() {
-        bail!(
-            "trust directory {} does not exist; create it and add trusted ed25519 cert .pem files",
-            dir.display()
-        );
+    Ok(Path::new(&home).join(".hermit/keys"))
+}
+
+fn init_subcommand(args: InitArgs) -> Result<i32> {
+    init_logging(0, None)?;
+
+    let dir = match args.trust_dir {
+        Some(p) => p,
+        None => trust_dir_path()?,
+    };
+
+    // `create_dir_all` is idempotent: `hermit init` re-runs after
+    // the directory exists succeed silently. The mode here is
+    // applied to any directory we create; an existing directory
+    // keeps its current mode (we don't widen permissions on
+    // anything the user already set up).
+    let already_existed = dir.exists();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating trust directory {}", dir.display()))?;
+
+    #[cfg(unix)]
+    if !already_existed {
+        // 0700: only the owner can read/write/list. Anyone with
+        // write access here can drop a `.pem` that hermit will
+        // trust as a config signer, so this is a privacy + a
+        // privilege boundary.
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&dir, perms)
+            .with_context(|| format!("setting mode 0700 on {}", dir.display()))?;
     }
-    Ok(dir)
+
+    if already_existed {
+        println!("trust dir already exists: {}", dir.display());
+    } else {
+        println!("trust dir created: {} (mode 0700)", dir.display());
+    }
+    println!(
+        "next: drop ed25519 cert .pem files into this directory, \
+         then `hermit verify` / `hermit run` will accept configs they signed"
+    );
+    Ok(0)
 }

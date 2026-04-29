@@ -72,6 +72,12 @@ pub enum Command {
     /// because they require nft DNAT, which proxy mode doesn't
     /// install.
     Proxy(ProxyArgs),
+    /// Create an empty trust directory (default `~/.hermit/keys`).
+    /// Run once on a fresh machine before `hermit verify` /
+    /// `hermit run` against signed configs — those subcommands
+    /// expect the directory to already exist. Idempotent: if the
+    /// directory is already there, the call succeeds silently.
+    Init(InitArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -407,6 +413,17 @@ pub struct ProxyArgs {
     /// Verbose output. `-v` info, `-vv` debug, `-vvv` trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+}
+
+#[derive(Parser, Debug)]
+pub struct InitArgs {
+    /// Trust directory to create. Defaults to `$HERMIT_TRUST_DIR`
+    /// when set, otherwise `~/.hermit/keys`. The directory is
+    /// created with mode 0700 since it holds private trust
+    /// anchors — anyone who can write a `.pem` here can sign
+    /// configs that `hermit run` will accept.
+    #[arg(long)]
+    pub trust_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -994,5 +1011,30 @@ mod tests {
             msg.contains("cannot be used with") || msg.contains("conflict"),
             "expected a conflict error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_init_no_args_uses_default_trust_dir() {
+        // `hermit init` with no flags falls back to
+        // $HERMIT_TRUST_DIR / ~/.hermit/keys at runtime; the CLI
+        // layer just records `trust_dir = None`.
+        let cli = Cli::parse_from(["hermit", "init"]);
+        match cli.command {
+            Command::Init(args) => assert!(args.trust_dir.is_none()),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_init_with_explicit_trust_dir() {
+        let cli = Cli::parse_from([
+            "hermit", "init", "--trust-dir", "/etc/hermit-keys",
+        ]);
+        match cli.command {
+            Command::Init(args) => {
+                assert_eq!(args.trust_dir, Some(PathBuf::from("/etc/hermit-keys")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
     }
 }
