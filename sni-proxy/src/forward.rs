@@ -430,19 +430,22 @@ where
         reason: None,
     });
 
-    // Branch A — MITM hand-off. When a MitmConfig is wired in,
-    // we 200-OK the CONNECT immediately and then feed the now-
-    // tunnel stream to the MITM, which expects exactly what
-    // follows: a TLS ClientHello. The CONNECT port becomes a
-    // synthetic `original_dst` so the MITM's connector dials the
-    // upstream on the right port (e.g. `CONNECT host:8443` ⇒
-    // dial host:8443, not 443).
+    // Branch A — hand off to the shared HTTPS dispatcher. When a
+    // MitmConfig is wired in we 200-OK the CONNECT immediately
+    // and feed the now-tunnel stream to `dispatch::https_after_tcp`,
+    // the same entry point the transparent listener uses. The
+    // dispatcher peeks SNI, runs hostname policy, and routes to
+    // the mitm or splice engine — so a `mechanism = "splice"`
+    // rule splices here too, without forward.rs needing to know
+    // anything about that mechanism. The CONNECT port becomes a
+    // synthetic `original_dst` so the upstream dial uses the
+    // right port (e.g. `CONNECT host:8443` ⇒ dial host:8443).
     if let Some(mitm_config) = &config.mitm {
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .context("writing CONNECT 200")?;
-        trace!(%host, port, "http: CONNECT 200 sent, handing off to MITM");
+        trace!(%host, port, "http: CONNECT 200 sent, handing off to dispatch");
         // The connector ignores the IP component of original_dst
         // (only the port matters), so an unspecified address is
         // fine here and avoids leaking 127.0.0.1 into traces as
@@ -451,7 +454,7 @@ where
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             port,
         );
-        return crate::transparent::handle_stream(
+        return crate::dispatch::https_after_tcp(
             client,
             client_addr,
             Some(synthetic_dst),

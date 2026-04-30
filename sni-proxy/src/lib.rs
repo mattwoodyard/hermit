@@ -4,6 +4,7 @@ pub mod bypass_udp;
 pub mod ca;
 pub mod connector;
 pub mod credential;
+pub mod dispatch;
 pub mod dns;
 pub mod dns_cache;
 pub mod dns_forwarder;
