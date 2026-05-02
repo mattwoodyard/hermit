@@ -22,14 +22,26 @@ fn drop_missing_home_files(home_files: Vec<HomeFileDirective>) -> Vec<HomeFileDi
     home_files
         .into_iter()
         .filter(|d| {
+            // For Redirect, the *source* is what must exist on
+            // the host (the namespace `path` is just where the
+            // bind lands — that's allowed to be a stub we
+            // create). For every other action source == path.
             let path = match d {
                 HomeFileDirective::Copy(p)
                 | HomeFileDirective::Pass(p)
-                | HomeFileDirective::Read(p) => p,
+                | HomeFileDirective::Read(p)
+                | HomeFileDirective::Hide(p) => p,
+                HomeFileDirective::Redirect { source, .. } => source,
             };
             if path.symlink_metadata().is_ok() {
                 true
             } else {
+                // Hide of a nonexistent path is a no-op: with no
+                // Pass/Read parent bringing it in, the sandbox
+                // view never has anything at that location to
+                // mask. Filter it here for one clean warning
+                // rather than two (this one + the warn inside
+                // apply_hide_directives at mount time).
                 warn!(
                     "home_file source {} does not exist on host; skipping",
                     path.display()

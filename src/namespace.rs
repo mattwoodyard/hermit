@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{getgid, getuid};
@@ -64,32 +64,51 @@ pub fn setup_namespace(
     home_files: &[HomeFileDirective],
     net_isolate: bool,
 ) -> Result<()> {
-    // Collect all paths that need bind-mount passthrough, with a readonly flag.
-    // (workdir + CLI extras are writable; Pass directives are writable; Read directives are readonly)
-    let mut all_entries: Vec<(&Path, bool)> = vec![(workdir, false)];
+    // Collect all paths that need bind-mount passthrough.
+    // Each entry is `(source, dest, readonly)`; for Pass/Read
+    // and CLI passthroughs source == dest, for Redirect they
+    // differ.
+    //
+    // workdir + CLI extras are writable;
+    // Pass directives are writable; Read directives are
+    // read-only; Redirect is writable (`Pass` shape with
+    // separate source/dest).
+    let mut all_entries: Vec<(&Path, &Path, bool)> = vec![(workdir, workdir, false)];
     for p in passthrough {
-        all_entries.push((p.as_path(), false));
+        all_entries.push((p.as_path(), p.as_path(), false));
     }
     for d in home_files {
         match d {
-            HomeFileDirective::Pass(ref p) => all_entries.push((p.as_path(), false)),
-            HomeFileDirective::Read(ref p) => all_entries.push((p.as_path(), true)),
+            HomeFileDirective::Pass(ref p) => all_entries.push((p.as_path(), p.as_path(), false)),
+            HomeFileDirective::Read(ref p) => all_entries.push((p.as_path(), p.as_path(), true)),
+            HomeFileDirective::Redirect { ref path, ref source } => {
+                all_entries.push((source.as_path(), path.as_path(), false))
+            }
             _ => {}
         }
     }
 
-    // Determine if any passthrough path IS /tmp or $HOME (skip those ephemeral mounts)
-    let skip_tmp = all_entries.iter().any(|(p, _)| *p == Path::new("/tmp"));
-    let skip_home = all_entries.iter().any(|(p, _)| *p == home_dir);
+    // Determine if any passthrough DEST IS /tmp or $HOME (skip those ephemeral mounts).
+    let skip_tmp = all_entries.iter().any(|(_, d, _)| *d == Path::new("/tmp"));
+    let skip_home = all_entries.iter().any(|(_, d, _)| *d == home_dir);
 
     debug!("mount: skip ephemeral /tmp: {}", skip_tmp);
     debug!("mount: skip ephemeral $HOME: {}", skip_home);
-    for (path, readonly) in &all_entries {
-        debug!(
-            "mount: entry {} ({})",
-            path.display(),
-            if *readonly { "read-only" } else { "read-write" }
-        );
+    for (source, dest, readonly) in &all_entries {
+        if source == dest {
+            debug!(
+                "mount: entry {} ({})",
+                dest.display(),
+                if *readonly { "read-only" } else { "read-write" }
+            );
+        } else {
+            debug!(
+                "mount: entry {} -> {} ({})",
+                source.display(),
+                dest.display(),
+                if *readonly { "read-only" } else { "read-write" }
+            );
+        }
     }
 
     enter_namespace(net_isolate)?;
@@ -117,6 +136,88 @@ pub fn setup_namespace(
 
     bind_mount_passthroughs(&saved_fds)?;
 
+    // Hide directives mount last — once Pass/Read have made the
+    // target paths visible in the sandbox view, hide overlays
+    // an empty stub on top so the sandbox sees a 0-byte file
+    // (or empty directory) regardless of what's on the host.
+    apply_hide_directives(home_files)?;
+
+    Ok(())
+}
+
+/// Mount empty stubs over `Hide(_)` paths. Stat each target;
+/// if it's a regular file, bind-mount a zero-byte stub over
+/// it; if it's a directory, bind-mount an empty directory.
+/// Targets that don't exist (because no parent `Pass`/`Read`
+/// brought them into the sandbox) are skipped with a warning
+/// — the hide is a no-op in that case.
+///
+/// The sandbox can write through the stub: writes land in the
+/// `/tmp` tmpfs and never reach the host. The host file
+/// underneath the bind-mount stack is read-protected by the
+/// fact that the bind never resolves to it.
+fn apply_hide_directives(home_files: &[HomeFileDirective]) -> Result<()> {
+    let hides: Vec<&Path> = home_files
+        .iter()
+        .filter_map(|d| match d {
+            HomeFileDirective::Hide(p) => Some(p.as_path()),
+            _ => None,
+        })
+        .collect();
+    if hides.is_empty() {
+        return Ok(());
+    }
+
+    // Two reusable empty stubs in the sandbox tmpfs. One per
+    // kind covers every Hide directive in the config —
+    // bind-mounting the same source over multiple targets is
+    // fine.
+    let stub_file = Path::new("/tmp/.hermit-hide-empty-file");
+    let stub_dir = Path::new("/tmp/.hermit-hide-empty-dir");
+    fs::write(stub_file, b"")
+        .with_context(|| format!("creating hide stub file {}", stub_file.display()))?;
+    fs::create_dir_all(stub_dir)
+        .with_context(|| format!("creating hide stub directory {}", stub_dir.display()))?;
+
+    info!("mount: hiding {} path(s)", hides.len());
+    for target in hides {
+        // `symlink_metadata` so a symlink at the target path
+        // doesn't trip us into mounting over its dereferenced
+        // location. The hide is for *this* path.
+        let meta = match fs::symlink_metadata(target) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    "mount: hide target {} doesn't exist in the sandbox \
+                     (no Pass/Read brought it in); skipping",
+                    target.display()
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to stat hide target {}", target.display())
+                });
+            }
+        };
+        let stub = if meta.is_dir() { stub_dir } else { stub_file };
+        info!(
+            "mount: hide {} (bind {} over {})",
+            target.display(),
+            stub.display(),
+            target.display()
+        );
+        mount(
+            Some(stub),
+            target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .with_context(|| {
+            format!("failed to bind-mount empty stub over {}", target.display())
+        })?;
+    }
     Ok(())
 }
 
@@ -186,26 +287,34 @@ fn enter_namespace(net_isolate: bool) -> Result<()> {
     Ok(())
 }
 
-/// Open fds to passthrough paths that live under $HOME or /tmp, so they survive
-/// ephemeral mounts. Must be called AFTER `enter_namespace` (kernel restriction:
-/// fds must be opened in the same user namespace where bind mounts happen).
+/// Open fds to passthrough sources that live under $HOME or
+/// /tmp on the destination side, so they survive ephemeral
+/// mounts. Must be called AFTER `enter_namespace` (kernel
+/// restriction: fds must be opened in the same user namespace
+/// where bind mounts happen).
 ///
-/// Each entry is `(path, readonly)` — readonly paths are bind-mounted then
-/// remounted read-only in `bind_mount_passthroughs`.
-fn save_passthrough_fds(entries: &[(&Path, bool)], home_dir: &Path) -> Result<Vec<SavedFd>> {
+/// Each entry is `(source, dest, readonly)`. The classification
+/// (under_home / under_tmp / under_entry) is on the **dest** —
+/// that's the namespace path the bind lands at. The fd is
+/// opened on the **source** — that's where the bytes actually
+/// live. For pass/read source == dest; for redirect they differ.
+fn save_passthrough_fds(
+    entries: &[(&Path, &Path, bool)],
+    home_dir: &Path,
+) -> Result<Vec<SavedFd>> {
     let mut saved_fds = Vec::new();
-    for &(path, readonly) in entries {
-        let under_home = path.starts_with(home_dir) && path != home_dir;
+    for &(source, dest, readonly) in entries {
+        let under_home = dest.starts_with(home_dir) && dest != home_dir;
         // If a path is under both $HOME and /tmp (e.g. HOME=/tmp/foo), prefer
         // the home classification — the $HOME overlay handles those stubs.
         let under_tmp =
-            !under_home && path.starts_with("/tmp") && path != Path::new("/tmp");
-        // Check if this path is a descendant of another entry in the list.
+            !under_home && dest.starts_with("/tmp") && dest != Path::new("/tmp");
+        // Check if this dest is a descendant of another entry's dest in the list.
         let under_entry = !under_home
             && !under_tmp
             && entries
                 .iter()
-                .any(|&(other, _)| other != path && path.starts_with(other));
+                .any(|&(_, other_dest, _)| other_dest != dest && dest.starts_with(other_dest));
         let location = if under_home {
             MountLocation::UnderHome
         } else if under_tmp {
@@ -213,10 +322,16 @@ fn save_passthrough_fds(entries: &[(&Path, bool)], home_dir: &Path) -> Result<Ve
         } else if under_entry {
             MountLocation::UnderEntry
         } else {
-            debug!("mount: skipping fd save for {} (not under $HOME or /tmp)", path.display());
+            debug!(
+                "mount: skipping fd save for {} (not under $HOME or /tmp)",
+                dest.display()
+            );
             continue;
         };
-        let kind = if path.is_file() {
+        // Kind comes from the SOURCE (the bytes we're going to bind in).
+        // The stub created at dest needs to match that — a file source
+        // gets a file stub, a dir source gets a dir stub.
+        let kind = if source.is_file() {
             EntryKind::File
         } else {
             EntryKind::Directory
@@ -230,19 +345,31 @@ fn save_passthrough_fds(entries: &[(&Path, bool)], home_dir: &Path) -> Result<Ve
             EntryKind::File => "file",
             EntryKind::Directory => "dir",
         };
-        let fd = open_path_fd(path)
-            .with_context(|| format!("failed to save fd for {}", path.display()))?;
-        debug!(
-            "mount: saved fd {} for {} ({}, {}, {})",
-            fd.raw(),
-            path.display(),
-            loc_label,
-            kind_label,
-            if readonly { "ro" } else { "rw" }
-        );
+        let fd = open_path_fd(source)
+            .with_context(|| format!("failed to save fd for {}", source.display()))?;
+        if source == dest {
+            debug!(
+                "mount: saved fd {} for {} ({}, {}, {})",
+                fd.raw(),
+                dest.display(),
+                loc_label,
+                kind_label,
+                if readonly { "ro" } else { "rw" }
+            );
+        } else {
+            debug!(
+                "mount: saved fd {} for {} -> {} ({}, {}, {})",
+                fd.raw(),
+                source.display(),
+                dest.display(),
+                loc_label,
+                kind_label,
+                if readonly { "ro" } else { "rw" }
+            );
+        }
         saved_fds.push(SavedFd {
             fd,
-            path: path.to_path_buf(),
+            path: dest.to_path_buf(),
             kind,
             location,
             readonly,
@@ -662,7 +789,10 @@ mod tests {
         fs::create_dir_all(&child).unwrap();
 
         let home = Path::new("/nonexistent_home_for_hermit_test");
-        let entries: Vec<(&Path, bool)> = vec![(parent.as_path(), false), (child.as_path(), false)];
+        let entries: Vec<(&Path, &Path, bool)> = vec![
+            (parent.as_path(), parent.as_path(), false),
+            (child.as_path(), child.as_path(), false),
+        ];
         let saved = save_passthrough_fds(&entries, home).unwrap();
 
         // parent is not under $HOME, /tmp, or another entry — skipped.
@@ -681,7 +811,10 @@ mod tests {
         fs::create_dir_all(&subdir).unwrap();
 
         // Pass in reverse order — subdir before project
-        let entries: Vec<(&Path, bool)> = vec![(&subdir, false), (&project, false)];
+        let entries: Vec<(&Path, &Path, bool)> = vec![
+            (&subdir, &subdir, false),
+            (&project, &project, false),
+        ];
         let saved = save_passthrough_fds(&entries, &home).unwrap();
 
         // Both should be saved (under $HOME), and sorted with project before subdir

@@ -222,13 +222,22 @@ impl NetMode {
     }
 }
 
-/// `[[home_file]]` entry. `action` picks among copy/pass/read mirroring
-/// the verbs in the old line-based format.
+/// `[[home_file]]` entry. `action` picks among
+/// copy/pass/read/hide/redirect mirroring the verbs in the
+/// line-based format. `source` is required (and only meaningful)
+/// when `action = "redirect"`; ignored otherwise.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HomeFileSpec {
     pub action: HomeFileAction,
     pub path: String,
+    /// Host-side source path for `action = "redirect"`. The
+    /// sandbox sees the bytes that live here at the namespace
+    /// location given by `path`. Required for redirect, must
+    /// be `None` for any other action (validated when the spec
+    /// is converted to a [`HomeFileDirective`]).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -237,6 +246,14 @@ pub enum HomeFileAction {
     Copy,
     Pass,
     Read,
+    /// Mask a path inside the sandbox. See
+    /// [`crate::home_files::HomeFileDirective::Hide`] for
+    /// semantics — useful for hiding a specific child of a
+    /// `Pass`-mounted parent directory.
+    Hide,
+    /// Bind-mount a host file/dir at a different namespace
+    /// path. Requires the `source` field on `HomeFileSpec`.
+    Redirect,
 }
 
 /// `[[access_rule]]` entry — hostname plus optional path prefix /
@@ -440,11 +457,39 @@ impl Config {
             .map(|(i, hf)| {
                 let expanded = expand_tilde(&hf.path, home_dir);
                 reject_dotdot(&expanded, i)?;
-                Ok(match hf.action {
-                    HomeFileAction::Copy => HomeFileDirective::Copy(expanded),
-                    HomeFileAction::Pass => HomeFileDirective::Pass(expanded),
-                    HomeFileAction::Read => HomeFileDirective::Read(expanded),
-                })
+                // `source` validation: required-and-only-allowed
+                // for redirect. Catching this at config-load time
+                // surfaces the typo "I gave a source on a pass
+                // directive" before any mounts happen.
+                let action_label = match hf.action {
+                    HomeFileAction::Copy => "copy",
+                    HomeFileAction::Pass => "pass",
+                    HomeFileAction::Read => "read",
+                    HomeFileAction::Hide => "hide",
+                    HomeFileAction::Redirect => "redirect",
+                };
+                match hf.action {
+                    HomeFileAction::Redirect => {
+                        let source = hf.source.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "[[home_file]] #{i}: action = \"redirect\" requires a `source` field"
+                            )
+                        })?;
+                        let source_path = expand_tilde(source, home_dir);
+                        Ok(HomeFileDirective::Redirect {
+                            path: expanded,
+                            source: source_path,
+                        })
+                    }
+                    _ if hf.source.is_some() => Err(anyhow::anyhow!(
+                        "[[home_file]] #{i}: `source` is only meaningful with action = \"redirect\" (this entry has action = {:?})",
+                        action_label
+                    )),
+                    HomeFileAction::Copy => Ok(HomeFileDirective::Copy(expanded)),
+                    HomeFileAction::Pass => Ok(HomeFileDirective::Pass(expanded)),
+                    HomeFileAction::Read => Ok(HomeFileDirective::Read(expanded)),
+                    HomeFileAction::Hide => Ok(HomeFileDirective::Hide(expanded)),
+                }
             })
             .collect()
     }
@@ -742,6 +787,104 @@ path = "../escape"
 "#;
         let c = Config::parse(toml).unwrap();
         assert!(c.home_file_directives(Path::new("/home/u")).is_err());
+    }
+
+    #[test]
+    fn home_files_hide_action_round_trips() {
+        // The motivating shape: pass a parent dir but hide a
+        // specific child so the sandbox can't read the host's
+        // credential file even though the parent is bind-mounted.
+        let toml = r#"
+[[home_file]]
+action = "pass"
+path = "~/.claude"
+
+[[home_file]]
+action = "hide"
+path = "~/.claude/.credentials.json"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let dirs = c.home_file_directives(Path::new("/home/u")).unwrap();
+        assert_eq!(
+            dirs,
+            vec![
+                HomeFileDirective::Pass(PathBuf::from("/home/u/.claude")),
+                HomeFileDirective::Hide(PathBuf::from(
+                    "/home/u/.claude/.credentials.json"
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn home_files_unknown_action_rejected() {
+        let toml = r#"
+[[home_file]]
+action = "obliterate"
+path = "~/.foo"
+"#;
+        // serde rejects unknown enum variants at deserialize time.
+        // `{:#}` flattens the anyhow chain so we see the
+        // underlying serde message, not just the top-level
+        // "parsing hermit config TOML" context.
+        let err = format!("{:#}", Config::parse(toml).unwrap_err());
+        for variant in ["hide", "redirect"] {
+            assert!(err.contains(variant), "deserialize chain must list {variant}: {err}");
+        }
+    }
+
+    #[test]
+    fn home_files_redirect_action_round_trips() {
+        let toml = r#"
+[[home_file]]
+action = "redirect"
+path = "~/.aws/credentials"
+source = "/etc/hermit/build-aws"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let dirs = c.home_file_directives(Path::new("/home/u")).unwrap();
+        assert_eq!(
+            dirs,
+            vec![HomeFileDirective::Redirect {
+                path: PathBuf::from("/home/u/.aws/credentials"),
+                source: PathBuf::from("/etc/hermit/build-aws"),
+            }]
+        );
+    }
+
+    #[test]
+    fn home_files_redirect_without_source_errors() {
+        let toml = r#"
+[[home_file]]
+action = "redirect"
+path = "~/.aws/credentials"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c
+            .home_file_directives(Path::new("/home/u"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("source"), "error should mention source: {err}");
+    }
+
+    #[test]
+    fn home_files_source_only_meaningful_with_redirect() {
+        // Catching this at config-load time surfaces the typo
+        // "I gave a source on a pass directive" before any mounts
+        // happen — easier to diagnose than a silently-ignored field.
+        let toml = r#"
+[[home_file]]
+action = "pass"
+path = "~/.foo"
+source = "/etc/something"
+"#;
+        let c = Config::parse(toml).unwrap();
+        let err = c
+            .home_file_directives(Path::new("/home/u"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("source"), "error should mention source: {err}");
+        assert!(err.contains("redirect"), "error should mention redirect: {err}");
     }
 
     #[test]

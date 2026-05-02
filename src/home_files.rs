@@ -11,6 +11,26 @@ pub enum HomeFileDirective {
     Pass(PathBuf),
     /// Bind-mount a file or directory read-only into the sandbox (live, not a snapshot).
     Read(PathBuf),
+    /// Mask the path inside the sandbox: the sandbox sees a
+    /// zero-byte file (if the source is a file) or an empty
+    /// directory (if the source is a directory) at this path,
+    /// regardless of what's there on the host. Useful when a
+    /// `Pass` or `Read` directive bind-mounts a parent
+    /// directory but a *specific* child should not be visible
+    /// — e.g. passing `~/.claude` while hiding
+    /// `~/.claude/.credentials.json` so the sandbox can't
+    /// recover the host's OAuth tokens.
+    Hide(PathBuf),
+    /// Bind-mount a host file/dir to a different path inside
+    /// the sandbox. `path` is the namespace location the
+    /// sandboxed process sees; `source` is where the bytes
+    /// actually live on the host. Read-write — `Pass` shape,
+    /// just with separate source vs destination paths. Use
+    /// when the sandbox should see a credential or config at
+    /// a known location but the host stores it elsewhere
+    /// (e.g. sandbox's `~/.aws/credentials` ↔ host's
+    /// `/etc/hermit/build-aws-creds`).
+    Redirect { path: PathBuf, source: PathBuf },
 }
 
 /// Parse a single `home-files` config file into directives.
@@ -85,25 +105,69 @@ fn parse_home_files_content(
 
         let (verb, rest) = line.split_once(char::is_whitespace).with_context(|| {
             format!(
-                "line {}: expected 'copy|pass|read <path>', got: {}",
+                "line {}: expected '<verb> <path> [<source>]', got: {}",
                 line_num + 1,
                 line
             )
         })?;
-        let raw_path = rest.trim();
-        if raw_path.is_empty() {
+        let rest = rest.trim();
+        if rest.is_empty() {
             bail!("line {}: missing path after '{}'", line_num + 1, verb);
         }
 
-        let expanded = expand_tilde(raw_path, home_dir);
-        reject_dotdot(&expanded, line_num + 1)?;
-
         match verb {
-            "copy" => directives.push(HomeFileDirective::Copy(expanded)),
-            "pass" => directives.push(HomeFileDirective::Pass(expanded)),
-            "read" => directives.push(HomeFileDirective::Read(expanded)),
+            "copy" => {
+                let expanded = expand_tilde(rest, home_dir);
+                reject_dotdot(&expanded, line_num + 1)?;
+                directives.push(HomeFileDirective::Copy(expanded))
+            }
+            "pass" => {
+                let expanded = expand_tilde(rest, home_dir);
+                reject_dotdot(&expanded, line_num + 1)?;
+                directives.push(HomeFileDirective::Pass(expanded))
+            }
+            "read" => {
+                let expanded = expand_tilde(rest, home_dir);
+                reject_dotdot(&expanded, line_num + 1)?;
+                directives.push(HomeFileDirective::Read(expanded))
+            }
+            "hide" => {
+                let expanded = expand_tilde(rest, home_dir);
+                reject_dotdot(&expanded, line_num + 1)?;
+                directives.push(HomeFileDirective::Hide(expanded))
+            }
+            "redirect" => {
+                // `redirect <inside-path> <host-source>` — two
+                // whitespace-separated args. The inside-path
+                // gets tilde-expansion + dotdot rejection like
+                // the other verbs; the host source is taken
+                // verbatim (typically an absolute path the
+                // user controls).
+                let (raw_path, raw_source) = rest
+                    .split_once(char::is_whitespace)
+                    .with_context(|| {
+                        format!(
+                            "line {}: 'redirect' requires two args: <inside-path> <host-source>",
+                            line_num + 1
+                        )
+                    })?;
+                let raw_source = raw_source.trim();
+                if raw_source.is_empty() {
+                    bail!(
+                        "line {}: 'redirect' missing host source after inside-path",
+                        line_num + 1
+                    );
+                }
+                let inside = expand_tilde(raw_path.trim(), home_dir);
+                reject_dotdot(&inside, line_num + 1)?;
+                let source = expand_tilde(raw_source, home_dir);
+                directives.push(HomeFileDirective::Redirect {
+                    path: inside,
+                    source,
+                });
+            }
             other => bail!(
-                "line {}: unknown directive '{}', expected 'copy', 'pass', or 'read'",
+                "line {}: unknown directive '{}', expected 'copy', 'pass', 'read', 'hide', or 'redirect'",
                 line_num + 1,
                 other
             ),
@@ -190,6 +254,92 @@ mod tests {
             vec![HomeFileDirective::Read(PathBuf::from(
                 "/home/user/.config/git"
             ))]
+        );
+    }
+
+    #[test]
+    fn test_parse_hide_directive() {
+        let content = "hide ~/.claude/.credentials.json\n";
+        let result = parse_home_files_content(content, Path::new("/home/user")).unwrap();
+        assert_eq!(
+            result,
+            vec![HomeFileDirective::Hide(PathBuf::from(
+                "/home/user/.claude/.credentials.json"
+            ))]
+        );
+    }
+
+    #[test]
+    fn test_parse_hide_combined_with_pass() {
+        // The motivating shape: pass a parent dir but hide a
+        // specific child so the sandbox can't read the host's
+        // credential file even though the parent is bind-mounted.
+        let content = "pass ~/.claude\nhide ~/.claude/.credentials.json\n";
+        let result = parse_home_files_content(content, Path::new("/home/user")).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                HomeFileDirective::Pass(PathBuf::from("/home/user/.claude")),
+                HomeFileDirective::Hide(PathBuf::from(
+                    "/home/user/.claude/.credentials.json"
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_unknown_directive_error_lists_all_verbs() {
+        // Regression guard: the error message must mention every
+        // supported verb so the user knows what's available.
+        let err = parse_home_files_content("xyz ~/.foo\n", Path::new("/home/user"))
+            .unwrap_err()
+            .to_string();
+        for verb in ["copy", "pass", "read", "hide", "redirect"] {
+            assert!(err.contains(verb), "error should mention {verb}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_redirect_directive() {
+        let content = "redirect ~/.aws/credentials /etc/hermit/build-aws\n";
+        let result = parse_home_files_content(content, Path::new("/home/user")).unwrap();
+        assert_eq!(
+            result,
+            vec![HomeFileDirective::Redirect {
+                path: PathBuf::from("/home/user/.aws/credentials"),
+                source: PathBuf::from("/etc/hermit/build-aws"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_redirect_tilde_expands_in_both_paths() {
+        // Both arguments support tilde expansion. Useful when
+        // the source lives in another part of $HOME (e.g.
+        // mapping ~/.config/foo-build to the sandbox's
+        // ~/.config/foo).
+        let content = "redirect ~/.config/foo ~/.config/foo-build\n";
+        let result = parse_home_files_content(content, Path::new("/home/user")).unwrap();
+        assert_eq!(
+            result,
+            vec![HomeFileDirective::Redirect {
+                path: PathBuf::from("/home/user/.config/foo"),
+                source: PathBuf::from("/home/user/.config/foo-build"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_redirect_missing_source_errors() {
+        let err = parse_home_files_content(
+            "redirect ~/.aws/credentials\n",
+            Path::new("/home/user"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("redirect") && err.contains("two args"),
+            "error should call out the two-arg requirement: {err}"
         );
     }
 

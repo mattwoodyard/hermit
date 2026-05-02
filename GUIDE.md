@@ -210,6 +210,46 @@ read .ssh
 
 # Bind-mount read-write (live, writes persist)
 pass .cargo/registry
+
+# Mask a path: sandbox sees a 0-byte file (or empty directory)
+# regardless of what's on the host. Useful for hiding a child
+# of a `pass`'d parent — e.g. you want ~/.claude in the sandbox
+# but NOT the OAuth credentials file underneath it:
+hide .claude/.credentials.json
+
+# Redirect: bind-mount a host path to a *different* path inside
+# the sandbox. Two arguments — namespace path first, host
+# source second. Useful when the sandbox should see a
+# credential or config at a known location but the host
+# stores it elsewhere:
+redirect .aws/credentials /etc/hermit/build-aws-creds
+```
+
+The five actions:
+
+| Action | Sandbox sees | Writes |
+|---|---|---|
+| `copy`     | snapshot of host file at sandbox-start    | discarded (tmpfs) |
+| `pass`     | live host file/dir                        | persist back to host |
+| `read`     | live host file/dir                        | rejected (read-only) |
+| `hide`     | empty stub (0-byte file or empty dir)     | discarded (tmpfs) |
+| `redirect` | live host file/dir from a *different* path | persist back to the host source |
+
+`hide` runs *after* `pass`/`read` mounts settle, so it can mask
+a specific child whose parent is bind-mounted in. The host file
+underneath the hide stub is never visible to the sandbox.
+
+`redirect` is the `pass` shape with separated source and
+destination. In the line-based config the syntax is
+`redirect <inside-path> <host-source>` (two whitespace-separated
+args). In TOML, `action = "redirect"` requires a `source` field
+in addition to `path`:
+
+```toml
+[[home_file]]
+action = "redirect"
+path = "~/.aws/credentials"          # what the sandbox sees
+source = "/etc/hermit/build-aws-creds" # bytes on the host
 ```
 
 Set `HERMIT_HOME_FILES` to override with a single config file.
@@ -327,7 +367,7 @@ Top-level sections:
 | `include = ["<url>", ...]` | Other configs to merge into this one (see below) |
 | `[sandbox]` | Network mode + `passthrough` dirs |
 | `[dns]` | Upstream DNS resolver for allowed queries |
-| `[[home_file]]` | `copy` / `pass` / `read` actions applied to a `$HOME` path |
+| `[[home_file]]` | `copy` / `pass` / `read` / `hide` / `redirect` actions applied to a path |
 | `[[access_rule]]` | Allow a host (or literal IP) through the proxy; choose `mitm`, `splice`, or `bypass` |
 | `[[port_forward]]` | Extra TCP ports to intercept (`https` → MITM, `http` → HTTP proxy) |
 | `[[rule]]` + `[credential.<name>]` | Credential-injection matcher + credential source |
