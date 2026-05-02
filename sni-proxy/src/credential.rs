@@ -159,12 +159,59 @@ impl CredentialResolver {
     }
 }
 
+/// Environment variables passed through to credential scripts.
+///
+/// We `env_clear()` before invoking so the script does NOT inherit
+/// the parent's env wholesale — hermit may have been launched with
+/// other secrets in the env (`GITHUB_TOKEN`, `AWS_*`, etc.) and a
+/// credential helper for service A should not be able to read
+/// service B's token. Only the variables on this allowlist survive.
+///
+/// The list covers what generic Unix tooling typically needs:
+///   - `PATH` so `Command::new("aws")` can resolve via $PATH
+///     (the alternative — forcing absolute paths in every config —
+///     is hostile)
+///   - `HOME` so tools find their dotfiles (`~/.aws/config`,
+///     `~/.config/gcloud`, `~/.password-store`, ...)
+///   - `USER`, `LOGNAME` for tools that key cache state on user
+///   - `LANG`, `LC_ALL`, `LANGUAGE` so script output isn't
+///     mangled by an unset locale
+///   - `TZ` so timestamp-emitting helpers stay consistent
+///   - `TERM` so a misbehaving helper that touches a terminal
+///     doesn't crash on an unset value
+///
+/// Tool-specific configuration vars (`AWS_PROFILE`, `OP_SESSION_*`,
+/// `CLOUDSDK_*`) are intentionally NOT passed through — wrap the
+/// command in `["sh", "-c", "AWS_PROFILE=foo exec aws ..."]` if
+/// you need them.
+const SCRIPT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+];
+
 async fn run_script(command: &[String], match_host: Option<&str>) -> Result<String> {
     if command.is_empty() {
         bail!("credential script has empty command");
     }
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
+    // Pin the script's environment: clear the parent's, then
+    // re-add only the allowlisted keys (and HERMIT_MATCH_HOST).
+    // This prevents inadvertent leakage of one credential into
+    // another credential's helper script.
+    cmd.env_clear();
+    for key in SCRIPT_ENV_ALLOWLIST {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
     if let Some(host) = match_host {
         cmd.env("HERMIT_MATCH_HOST", host);
     }
@@ -346,5 +393,78 @@ mod tests {
         // call must succeed silently.
         let r = CredentialResolver::new(HashMap::new());
         r.invalidate("missing"); // does not panic
+    }
+
+    #[tokio::test]
+    async fn script_env_is_cleared_to_allowlist() {
+        // The motivating threat: hermit was launched with another
+        // service's secret in the env (e.g. `GITHUB_TOKEN`).
+        // Without env_clear(), every credential script could read
+        // that secret and exfiltrate it. The fix clears the env
+        // and reinstates only an allowlist; this test asserts a
+        // poison var is NOT visible to the child while an
+        // allowlisted one (`HOME`) is.
+        let poison_key = format!("HERMIT_TEST_POISON_{}", std::process::id());
+        // Set both a poison var (must NOT reach the script) and
+        // ensure HOME is set (allowlisted, must reach the script).
+        unsafe {
+            std::env::set_var(&poison_key, "secret-from-parent");
+            if std::env::var("HOME").is_err() {
+                std::env::set_var("HOME", "/tmp");
+            }
+        }
+
+        // Script prints `<HOME>|<POISON>` so we can assert each
+        // independently. `printenv` exits 1 on a missing var, so
+        // we use parameter expansion which yields the empty string.
+        let r = resolver_with(
+            "tok",
+            Source::Script {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        r#"printf '%s|%s' "${{HOME-}}" "${{{}-}}""#,
+                        poison_key
+                    ),
+                ],
+                ttl_secs: 1, // short TTL doesn't matter — single call
+            },
+        );
+        let v = r.resolve("tok", None).await.unwrap();
+        let (home_seen, poison_seen) = v
+            .split_once('|')
+            .expect("script output should be HOME|POISON");
+        assert!(
+            !home_seen.is_empty(),
+            "HOME is on the allowlist and must reach the script (got empty)"
+        );
+        assert_eq!(
+            poison_seen, "",
+            "the parent's poison env var must NOT reach the script (got {poison_seen:?})"
+        );
+
+        unsafe { std::env::remove_var(&poison_key) };
+    }
+
+    #[tokio::test]
+    async fn script_env_passes_match_host() {
+        // The `match_host` arg becomes HERMIT_MATCH_HOST in the
+        // script env — used by helper scripts that branch on
+        // which upstream the credential is for. Must survive the
+        // env_clear().
+        let r = resolver_with(
+            "tok",
+            Source::Script {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s' \"$HERMIT_MATCH_HOST\"".into(),
+                ],
+                ttl_secs: 1,
+            },
+        );
+        let v = r.resolve("tok", Some("api.example.com")).await.unwrap();
+        assert_eq!(v, "api.example.com");
     }
 }
