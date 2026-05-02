@@ -548,6 +548,23 @@ pub async fn write_403<W: AsyncWrite + Unpin>(writer: &mut W, reason: &str) -> R
     Ok(())
 }
 
+/// Write an HTTP 421 Misdirected Request response. Used by the
+/// MITM engine when the inner `Host:` header doesn't match the
+/// SNI hostname the TLS connection was minted for — RFC 7540 §9.1.2
+/// is the closest fit for "this connection isn't authoritative for
+/// the host you asked about."
+pub async fn write_421<W: AsyncWrite + Unpin>(writer: &mut W, reason: &str) -> Result<()> {
+    let body = format!("421 Misdirected Request: {}\r\n", reason);
+    let response = format!(
+        "HTTP/1.1 421 Misdirected Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    writer.write_all(response.as_bytes()).await.context("writing 421 response")?;
+    writer.flush().await.context("flushing 421 response")?;
+    Ok(())
+}
+
 /// Read the full HTTP response headers from upstream, returning the raw
 /// head bytes and parsed content-length/chunked info.
 pub struct Response {
@@ -646,8 +663,15 @@ pub async fn read_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Resp
 /// header with the same name (case-insensitive) is removed; the new
 /// header is inserted just before the terminating blank line.
 ///
-/// Returns an error if the buffer does not contain `\r\n\r\n`.
+/// Returns an error if the buffer does not contain `\r\n\r\n`, or if
+/// `name`/`value` contain bytes that would let an attacker forge
+/// header structure (CR, LF, NUL; `:` or any non-tchar in the name).
+/// Credential values flow into this from `render_inject_value` —
+/// without this check, a script source emitting `\r\n` would be
+/// spliced verbatim into `head_bytes` and become header smuggling.
 pub fn set_header(head: &mut Vec<u8>, name: &str, value: &str) -> Result<()> {
+    validate_header_name(name)?;
+    validate_header_value(value)?;
     let terminator = find_headers_terminator(head)
         .context("head bytes missing terminating CRLF CRLF")?;
 
@@ -674,6 +698,61 @@ pub fn set_header(head: &mut Vec<u8>, name: &str, value: &str) -> Result<()> {
         .context("head bytes missing terminating CRLF CRLF after edits")?;
     let line = format!("{name}: {value}\r\n");
     head.splice(terminator..terminator, line.bytes());
+    Ok(())
+}
+
+/// RFC 7230 token: ALPHA / DIGIT and a fixed punctuation set. We
+/// also forbid empty names and the `:` separator. This is stricter
+/// than necessary for security alone — CR/LF/NUL would suffice —
+/// but rejecting the whole non-tchar set is defence-in-depth and
+/// matches what an upstream parser will accept anyway.
+fn validate_header_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("header name must not be empty");
+    }
+    for &b in name.as_bytes() {
+        let is_tchar = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
+        if !is_tchar {
+            bail!(
+                "header name contains invalid byte 0x{:02x} (must be RFC 7230 tchar)",
+                b
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Header values: forbid CR, LF, and NUL. The first two would let
+/// a credential value carrying `\r\n...` inject extra header lines
+/// when spliced into `head_bytes`; NUL is rejected because some
+/// upstream parsers treat it as a terminator and split the value
+/// in surprising ways.
+fn validate_header_value(value: &str) -> Result<()> {
+    for &b in value.as_bytes() {
+        if b == b'\r' || b == b'\n' || b == 0 {
+            bail!(
+                "header value contains forbidden byte 0x{:02x} (CR/LF/NUL would forge header structure)",
+                b
+            );
+        }
+    }
     Ok(())
 }
 
@@ -964,6 +1043,66 @@ mod tests {
     fn set_header_errors_without_terminator() {
         let mut h = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
         assert!(set_header(&mut h, "X", "y").is_err());
+    }
+
+    #[test]
+    fn set_header_rejects_crlf_in_value() {
+        // The motivating threat: a credential script that emits a
+        // newline (intentionally or by accident) would, without
+        // validation, smuggle a second header into the upstream
+        // request. The value path must reject this.
+        let baseline = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        for poison in [
+            "tok\r\nX-Smuggled: 1",
+            "tok\nX-Smuggled: 1",
+            "tok\rX-Smuggled: 1",
+            "tok\0bad",
+        ] {
+            let mut h = baseline.clone();
+            let err = set_header(&mut h, "Authorization", poison).unwrap_err();
+            assert!(
+                err.to_string().contains("forbidden byte"),
+                "value {poison:?}: expected forbidden-byte error, got {err}"
+            );
+            // The buffer must be left unchanged on rejection — partial
+            // mutation would leak the smuggling attempt half-applied.
+            assert_eq!(h, baseline, "buffer must be unchanged on reject");
+        }
+    }
+
+    #[test]
+    fn set_header_rejects_invalid_chars_in_name() {
+        let baseline = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        for poison in [
+            "Bad Name",        // SP in name (RFC tchar violation)
+            "Bad:Name",        // colon would split field-name/value
+            "Bad\r\nX-Other",  // CRLF in name
+            "Bad\nX",          // bare LF in name
+            "",                // empty name
+        ] {
+            let mut h = baseline.clone();
+            let err = set_header(&mut h, poison, "v").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invalid byte") || msg.contains("must not be empty"),
+                "name {poison:?}: expected validation error, got {err}"
+            );
+            assert_eq!(h, baseline, "buffer must be unchanged on reject");
+        }
+    }
+
+    #[test]
+    fn set_header_accepts_normal_tchar_names_and_printable_values() {
+        // Regression guard: the validators must not accidentally
+        // reject the headers the proxy actually injects in
+        // production (Authorization, X-Api-Key, x-something-with-dashes,
+        // etc.) or values that contain ASCII punctuation.
+        let mut h = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        set_header(&mut h, "Authorization", "Bearer sk-ant_abc.def-ghi/jkl=").unwrap();
+        set_header(&mut h, "X-Api-Key", "key|with~lots!of#tchars").unwrap();
+        let out = std::str::from_utf8(&h).unwrap();
+        assert!(out.contains("Authorization: Bearer sk-ant_abc.def-ghi/jkl=\r\n"));
+        assert!(out.contains("X-Api-Key: key|with~lots!of#tchars\r\n"));
     }
 
     #[tokio::test]
