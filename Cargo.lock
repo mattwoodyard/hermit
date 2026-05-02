@@ -715,6 +715,7 @@ dependencies = [
  "anyhow",
  "ed25519-dalek",
  "hermit",
+ "landlock",
  "libc",
  "log",
  "nix 0.29.0",
