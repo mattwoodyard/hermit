@@ -34,11 +34,7 @@ use crate::connector::UpstreamConnector;
 use crate::dns_cache::DnsCache;
 use crate::policy::{BypassProtocol, RuleSet};
 use crate::proxy::{get_original_dst, MAX_CONCURRENT_CONNECTIONS};
-
-/// Max time we'll wait to establish the upstream TCP connection
-/// before giving up. Same scale as the MITM/HTTP proxies so idle
-/// hosts trip the log line rather than stalling user tasks.
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+use crate::timeouts::UPSTREAM_CONNECT_TIMEOUT;
 
 /// Per-listener configuration. Each bypass `(protocol=tcp, port=N)`
 /// gets its own `BypassTcpConfig` and its own accept loop.

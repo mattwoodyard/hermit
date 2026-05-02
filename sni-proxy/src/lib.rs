@@ -18,4 +18,5 @@ pub mod policy;
 pub mod proxy;
 pub mod sni;
 pub mod splice;
+pub mod timeouts;
 pub mod transparent;

@@ -21,6 +21,7 @@ use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::policy::{RequestPolicy, Verdict};
 use crate::proxy::{get_original_dst, MAX_CONCURRENT_CONNECTIONS};
+use crate::timeouts::{HEADER_READ_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT};
 
 /// Connection counter used to tag every span with a fresh
 /// `conn_id`. Lets an operator chasing a single request grep
@@ -32,11 +33,6 @@ fn next_conn_id() -> u64 {
     CONN_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Max time to wait for a full HTTP request head on an idle keep-alive
-/// connection. Keeps slow clients from parking tokio tasks forever.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Max time for the upstream TCP connect.
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hard cap on response body bytes when upstream omits both Content-Length
 /// and Transfer-Encoding. Without this a trickling upstream could drain
 /// the task forever.

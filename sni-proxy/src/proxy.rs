@@ -13,15 +13,12 @@ use crate::connector::UpstreamConnector;
 use crate::policy::{ConnectionPolicy, Verdict};
 use crate::sni::{self, SniResult};
 use crate::splice;
+use crate::timeouts::{CLIENT_HELLO_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT};
 
 /// Hard cap on ClientHello buffer growth. A real ClientHello fits in one
 /// TLS record (<16KB); anything larger is either garbage or an attempt to
 /// OOM us by streaming junk.
 const MAX_CLIENT_HELLO_BYTES: usize = 16 * 1024;
-/// Max time to wait for the TLS ClientHello.
-const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Max time for the upstream TCP connect.
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max concurrent in-flight connections per listener. Bounds task/fd
 /// accumulation under load so a burst of accepts can't exhaust resources.
 /// Shared across the three proxy flavors.

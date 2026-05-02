@@ -27,7 +27,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
@@ -43,14 +42,8 @@ use crate::connector::UpstreamConnector;
 use crate::http;
 use crate::network_policy::{render_inject_value, NetworkPolicy};
 use crate::policy::{RequestPolicy, Verdict};
+use crate::timeouts::{HEADER_READ_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_TLS_TIMEOUT};
 
-/// Max time to wait for a full HTTP request head on an idle keep-alive
-/// connection.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Max time for the upstream TCP connect (not the TLS handshake).
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Max time for the upstream TLS handshake.
-const UPSTREAM_TLS_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hard cap on close-delimited response body size — see forward.rs.
 const MAX_CLOSE_DELIMITED_RESPONSE: u64 = 512 * 1024 * 1024;
 

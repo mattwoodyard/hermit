@@ -21,6 +21,7 @@
 //! engine calls without an intermediate triangle.
 
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -33,11 +34,7 @@ use crate::connector::UpstreamConnector;
 use crate::mitm::MitmConfig;
 use crate::policy::{Mechanism, RequestPolicy, Verdict};
 use crate::proxy::read_sni_with_buffer;
-
-/// Max time to wait for the TLS ClientHello from the client.
-const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Max time for the upstream TCP connect on the splice path.
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+use crate::timeouts::{CLIENT_HELLO_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT};
 
 /// Read the ClientHello, run hostname policy, dispatch to the
 /// MITM or splice engine.
