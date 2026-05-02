@@ -484,16 +484,48 @@ unsafe fn sockaddr_to_socket_addr(
 /// the given family. Tolerates unknown control messages — if the
 /// requested ORIGDSTADDR variant isn't present we just return
 /// `None` and the caller denies the packet.
+///
+/// **Safety invariant**: before reading the cmsg payload as a
+/// `sockaddr_in`/`sockaddr_in6`, we verify `cmsg_len` covers the
+/// full struct. The kernel shouldn't ever ship a truncated
+/// ORIGDSTADDR cmsg, but a defensive bounds check is one branch
+/// and removes the only `copy_nonoverlapping` in this module
+/// that wasn't size-checked against the source buffer.
 fn extract_orig_dst(msg: &libc::msghdr, family: IpFamily) -> Option<SocketAddr> {
-    let (wanted_level, wanted_type) = match family {
-        IpFamily::V4 => (libc::SOL_IP, libc::IP_ORIGDSTADDR),
-        IpFamily::V6 => (libc::IPPROTO_IPV6, libc::IPV6_ORIGDSTADDR),
+    let (wanted_level, wanted_type, needed_data) = match family {
+        IpFamily::V4 => (
+            libc::SOL_IP,
+            libc::IP_ORIGDSTADDR,
+            std::mem::size_of::<libc::sockaddr_in>(),
+        ),
+        IpFamily::V6 => (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_ORIGDSTADDR,
+            std::mem::size_of::<libc::sockaddr_in6>(),
+        ),
     };
+    // CMSG_LEN(n) is the total cmsg size (header + n bytes of
+    // data, before alignment). cmsg_len < that means the kernel
+    // (or a poisoned mock) gave us a cmsg whose payload is
+    // smaller than what we're about to read — skip it.
+    let needed_total = unsafe { libc::CMSG_LEN(needed_data as u32) } as usize;
 
     let mut cmsg_ptr = unsafe { libc::CMSG_FIRSTHDR(msg) };
     while !cmsg_ptr.is_null() {
         let cmsg = unsafe { &*cmsg_ptr };
         if cmsg.cmsg_level == wanted_level && cmsg.cmsg_type == wanted_type {
+            if (cmsg.cmsg_len as usize) < needed_total {
+                // Truncated — don't read past the cmsg payload.
+                // Skip and keep walking; some other cmsg in the
+                // chain might have the well-formed copy.
+                tracing::warn!(
+                    cmsg_len = cmsg.cmsg_len as usize,
+                    needed = needed_total,
+                    "extract_orig_dst: ORIGDSTADDR cmsg truncated; skipping"
+                );
+                cmsg_ptr = unsafe { libc::CMSG_NXTHDR(msg, cmsg_ptr) };
+                continue;
+            }
             let data_ptr = unsafe { libc::CMSG_DATA(cmsg_ptr) };
             return Some(unsafe {
                 match family {
@@ -962,5 +994,105 @@ mod tests {
         .await;
 
         assert!(sessions.lock().await.is_empty());
+    }
+
+    /// Build a `msghdr` whose control buffer contains a single
+    /// IP_ORIGDSTADDR cmsg. `cmsg_len_override` lets a caller
+    /// inject a deliberately-short cmsg_len to exercise the
+    /// truncation guard. `payload` provides the bytes following
+    /// the cmsghdr; the caller controls how many are valid.
+    fn build_origdstaddr_msg_v4(
+        control_buf: &mut [u8],
+        cmsg_len_override: Option<u32>,
+        payload: &[u8],
+    ) -> libc::msghdr {
+        // Zero the buffer so any unset bytes are deterministic.
+        for b in control_buf.iter_mut() {
+            *b = 0;
+        }
+        let cmsghdr_size = std::mem::size_of::<libc::cmsghdr>();
+        // Default cmsg_len = CMSG_LEN(payload.len()) — a well-formed
+        // entry. Caller can override with a smaller value.
+        let cmsg_len =
+            cmsg_len_override.unwrap_or_else(|| unsafe { libc::CMSG_LEN(payload.len() as u32) });
+        // Lay out the cmsghdr.
+        let hdr = libc::cmsghdr {
+            cmsg_len: cmsg_len as _,
+            cmsg_level: libc::SOL_IP,
+            cmsg_type: libc::IP_ORIGDSTADDR,
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &hdr as *const _ as *const u8,
+                control_buf.as_mut_ptr(),
+                cmsghdr_size,
+            );
+            // Payload sits at CMSG_DATA offset (cmsghdr + alignment
+            // padding). On Linux/glibc this is just `cmsghdr_size`
+            // because cmsghdr is already aligned for the data.
+            let payload_offset = cmsghdr_size;
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                control_buf.as_mut_ptr().add(payload_offset),
+                payload.len().min(control_buf.len() - payload_offset),
+            );
+        }
+
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
+        // controllen is the *buffer* size; the cmsg's own cmsg_len
+        // is what we're testing.
+        msg.msg_controllen = control_buf.len() as _;
+        msg
+    }
+
+    #[test]
+    fn extract_orig_dst_returns_none_when_cmsg_truncated() {
+        // The motivating threat: kernel (or, more realistically, a
+        // mock/test harness or future kernel quirk) ships a cmsg
+        // marked as ORIGDSTADDR but with cmsg_len < sizeof(sockaddr_in)
+        // worth of payload. Without the guard, copy_nonoverlapping
+        // would read past the cmsg into adjacent control-buffer
+        // memory. With the guard, we skip it and return None.
+        let buf_size = unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<libc::sockaddr_in>() as u32)
+        } as usize;
+        let mut control = vec![0u8; buf_size];
+        // Fake a cmsg marked as ORIGDSTADDR but with cmsg_len of
+        // just CMSG_LEN(0) — header only, no payload.
+        let truncated_len = unsafe { libc::CMSG_LEN(0) };
+        let msg = build_origdstaddr_msg_v4(&mut control, Some(truncated_len), &[]);
+        assert_eq!(extract_orig_dst(&msg, IpFamily::V4), None);
+    }
+
+    #[test]
+    fn extract_orig_dst_parses_well_formed_v4_cmsg() {
+        // Companion to the truncation test: with a properly-sized
+        // sockaddr_in payload, the function should return the
+        // address. This locks in the parse so future refactors of
+        // the bounds check don't accidentally break the happy path.
+        let buf_size = unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<libc::sockaddr_in>() as u32)
+        } as usize;
+        let mut control = vec![0u8; buf_size];
+
+        // 192.0.2.42:8443 in network-byte-order sockaddr_in form.
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 8443u16.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(Ipv4Addr::new(192, 0, 2, 42)).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        let payload = unsafe {
+            std::slice::from_raw_parts(
+                &sa as *const _ as *const u8,
+                std::mem::size_of::<libc::sockaddr_in>(),
+            )
+        };
+        let msg = build_origdstaddr_msg_v4(&mut control, None, payload);
+        let parsed = extract_orig_dst(&msg, IpFamily::V4).expect("should parse");
+        assert_eq!(parsed, "192.0.2.42:8443".parse::<SocketAddr>().unwrap());
     }
 }
