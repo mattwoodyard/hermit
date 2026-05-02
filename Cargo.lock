@@ -709,6 +709,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermit-tests"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hermit",
+ "libc",
+ "log",
+ "nix 0.29.0",
+ "rcgen",
+ "rustables",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "url",
+ "which",
+]
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1860,6 +1881,25 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
+]
+
+[[package]]
+name = "sni-proxy-tests"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "http",
+ "httparse",
+ "libc",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "sni-proxy",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

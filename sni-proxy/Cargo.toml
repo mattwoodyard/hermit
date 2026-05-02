@@ -28,3 +28,9 @@ regex = "1"
 [dev-dependencies]
 tempfile = "3"
 httparse = "1"
+
+# Off-by-default feature that re-exports the items the dedicated
+# test crate (`sni-proxy-tests`) needs to exercise private code
+# paths. Production builds never enable this.
+[features]
+__test_internals = []

@@ -1,5 +1,5 @@
 [workspace]
-members = ["sni-proxy"]
+members = ["sni-proxy", "hermit-tests", "sni-proxy-tests"]
 
 [package]
 name = "hermit"
@@ -35,3 +35,10 @@ rcgen = "0.13"
 [dev-dependencies]
 tempfile = "3"
 which = "7"
+
+# Off-by-default feature that re-exports the items the dedicated
+# test crate (`hermit-tests`) needs to exercise private code paths.
+# Production builds never enable this; the test crate flips it on
+# via its `[dependencies]` entry.
+[features]
+__test_internals = []
