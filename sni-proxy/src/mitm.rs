@@ -148,6 +148,36 @@ where
             "mitm: request"
         );
 
+        // SNI/Host cross-check. Without this, a client could
+        // present a permissive SNI (passing the access-control
+        // rule for `hostname`) and then send a different `Host:`
+        // header on the inner HTTP request — `apply_injection`
+        // and any future header-keyed logic match on the Host
+        // header, opening a domain-fronting / rule-mismatch gap
+        // between the access decision and the credential decision.
+        // Reject the mismatch outright with 421.
+        if !host_matches_sni(request.host.as_deref(), hostname) {
+            let host_header = request.host.as_deref().unwrap_or("(missing)");
+            warn!(
+                %client_addr, sni = %hostname, host_header = %host_header,
+                "mitm: rejecting request — Host header does not match SNI"
+            );
+            config.block_log.log(BlockEvent {
+                time_unix_ms: now_unix_ms(),
+                kind: BlockKind::Https,
+                client: Some(client_addr.to_string()),
+                hostname: Some(hostname.to_string()),
+                method: Some(request.method.clone()),
+                path: Some(request.path.clone()),
+                port: None,
+                reason: Some(format!(
+                    "Host/SNI mismatch (sni={hostname}, host={host_header})"
+                )),
+            });
+            http::write_421(&mut client_tls, "Host header does not match SNI").await?;
+            return Ok(());
+        }
+
         // Request-level policy check.
         if config.policy.check_request(hostname, &request.path, &request.method) == Verdict::Deny {
             debug!(
@@ -495,6 +525,29 @@ pub async fn apply_injection(
     }
 }
 
+/// Compare the inner request's `Host:` header against the SNI
+/// hostname the TLS connection was minted for. Returns true if
+/// they refer to the same authority, false otherwise.
+///
+/// Rules:
+/// - A missing Host header is treated as **mismatch**. HTTP/1.1
+///   requires Host, and a request without one shouldn't reach
+///   the MITM engine at all; rejecting is the conservative call.
+/// - The Host header may carry a port (`example.com:8443`); we
+///   strip it before comparing.
+/// - Comparison is case-insensitive (DNS is case-insensitive,
+///   and clients commonly send mixed-case Host).
+/// - We deliberately do NOT compare against `request.path`'s
+///   absolute-form authority (RFC 7230 §5.3.2) — that's a proxy
+///   form the MITM never sees from a TLS-terminated client.
+fn host_matches_sni(host_header: Option<&str>, sni: &str) -> bool {
+    let host = match host_header {
+        Some(h) => http::host_without_port(h),
+        None => return false,
+    };
+    host.eq_ignore_ascii_case(sni)
+}
+
 /// Build an `http::Request<()>` from our parsed request for DSL matching.
 ///
 /// Scheme is hardcoded to `https` (MITM only sees HTTPS); host comes from
@@ -558,5 +611,56 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"just inner");
+    }
+
+    #[test]
+    fn host_matches_sni_exact() {
+        assert!(host_matches_sni(Some("api.example.com"), "api.example.com"));
+    }
+
+    #[test]
+    fn host_matches_sni_case_insensitive() {
+        // DNS is case-insensitive and clients send mixed case.
+        assert!(host_matches_sni(Some("API.Example.COM"), "api.example.com"));
+    }
+
+    #[test]
+    fn host_matches_sni_with_port_strips_port() {
+        assert!(host_matches_sni(Some("api.example.com:8443"), "api.example.com"));
+    }
+
+    #[test]
+    fn host_matches_sni_rejects_different_host() {
+        // The motivating threat: SNI says api.example.com (so the
+        // access-control rule for that host applies) but the inner
+        // request claims to be for evil.example.com — MUST be
+        // rejected so the inject path can't pick a different rule
+        // than the access path checked.
+        assert!(!host_matches_sni(Some("evil.example.com"), "api.example.com"));
+    }
+
+    #[test]
+    fn host_matches_sni_rejects_subdomain_mismatch() {
+        // Subdomain mismatch is still a mismatch — the access
+        // control rule was for the SNI authority, not its parent.
+        assert!(!host_matches_sni(Some("foo.api.example.com"), "api.example.com"));
+        assert!(!host_matches_sni(Some("api.example.com"), "other.example.com"));
+    }
+
+    #[test]
+    fn host_matches_sni_missing_host_is_mismatch() {
+        // HTTP/1.1 requires Host; absence is conservatively treated
+        // as a mismatch so the request is rejected with 421 rather
+        // than silently injecting against the SNI fallback.
+        assert!(!host_matches_sni(None, "api.example.com"));
+    }
+
+    #[test]
+    fn host_matches_sni_ipv6_with_port() {
+        // host_without_port keeps the brackets on bracketed IPv6
+        // and strips a trailing :port. The SNI side is the bare
+        // hostname in our usage — IPv6 SNI is rare but bracketed
+        // and unbracketed forms must compare consistently.
+        assert!(host_matches_sni(Some("[::1]:8443"), "[::1]"));
     }
 }
