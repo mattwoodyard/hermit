@@ -1,0 +1,68 @@
+[package]
+name = "sni-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+[dependencies.sni-proxy]
+path = ".."
+
+# Each target is its own bin so `cargo fuzz run <name>` can pick one.
+# `test = false` / `doc = false` / `bench = false` keep the fuzz binaries
+# out of the regular cargo flows.
+
+[[bin]]
+name = "sni"
+path = "fuzz_targets/sni.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_query"
+path = "fuzz_targets/dns_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_answers"
+path = "fuzz_targets/dns_answers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "set_header"
+path = "fuzz_targets/set_header.rs"
+test = false
+doc = false
+bench = false
+
+# An empty `[workspace]` makes this directory its own cargo workspace,
+# so the parent (`platform/hermit`) workspace doesn't try to compile
+# the fuzz crate during `cargo test --workspace`. This is the layout
+# `cargo fuzz init` produces by default.
+[workspace]
