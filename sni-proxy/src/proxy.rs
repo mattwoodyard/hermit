@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -13,6 +12,7 @@ use crate::block_log::{now_unix_ms, BlockEvent, BlockKind, BlockLogger};
 use crate::connector::UpstreamConnector;
 use crate::policy::{ConnectionPolicy, Verdict};
 use crate::sni::{self, SniResult};
+use crate::splice;
 
 /// Hard cap on ClientHello buffer growth. A real ClientHello fits in one
 /// TLS record (<16KB); anything larger is either garbage or an attempt to
@@ -22,15 +22,6 @@ const MAX_CLIENT_HELLO_BYTES: usize = 16 * 1024;
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max time for the upstream TCP connect.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Max time for each of the write calls that replay the ClientHello and
-/// subsequent bulk traffic. An upstream that TCP-accepts but never drains
-/// the socket must not park the handler forever.
-const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Idle threshold for bidirectional splicing — if neither side makes
-/// progress for this long, tear the connection down. This is an
-/// idle-timer, not a deadline, so long-running legitimate connections
-/// that keep sending bytes don't trip it.
-const COPY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Max concurrent in-flight connections per listener. Bounds task/fd
 /// accumulation under load so a burst of accepts can't exhaust resources.
 /// Shared across the three proxy flavors.
@@ -186,7 +177,7 @@ where
     }
 
     debug!(%client_addr, hostname, "forwarding");
-    let mut upstream = match timeout(
+    let upstream = match timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         config
             .connector
@@ -202,83 +193,15 @@ where
         }
     };
 
-    // A timeout around write_all bounds the case where upstream TCP
-    // accepts but never drains the socket — write_all otherwise stalls
-    // indefinitely waiting for the send window.
-    match timeout(
-        UPSTREAM_WRITE_TIMEOUT,
-        upstream.write_all(&client_hello_buf),
-    )
-    .await
-    {
-        Ok(r) => r.context("replaying ClientHello to upstream")?,
-        Err(_) => {
-            warn!(%hostname, "upstream ClientHello replay timed out");
-            return Ok(());
-        }
-    }
-
-    // Splice bytes with an idle timeout on each side. `copy_bidirectional`
-    // from tokio has no idle detection — a peer that stalls at the TLS
-    // layer or application layer would park this task until the kernel
-    // eventually tears the socket down.
-    if let Err(e) = copy_bidirectional_idle(&mut client, &mut upstream, COPY_IDLE_TIMEOUT).await {
-        // Clean close and idle-timeout are expected terminations, not
-        // failures worth surfacing to the caller.
-        debug!(%hostname, error = %e, "bidirectional copy ended");
+    // Hand to the canonical splice engine: it forwards the buffered
+    // ClientHello to upstream (with a write timeout) and then runs
+    // a bidirectional copy with per-direction idle timeouts. Clean
+    // close and idle-timeout are expected terminations.
+    if let Err(e) = splice::relay(client, upstream, &client_hello_buf).await {
+        debug!(%hostname, error = %e, "splice ended");
     }
 
     Ok(())
-}
-
-/// Copy bytes in both directions between two streams with an idle
-/// timeout on each half. Returns when either side closes or either
-/// half stays idle longer than `idle`.
-///
-/// `tokio::io::copy_bidirectional` is the usual tool here but it has no
-/// notion of "nothing happened for a while" — a peer that stops sending
-/// without closing would park the task. We run the two halves via
-/// [`try_join`] so any error (idle, real I/O error, short write) aborts
-/// both sides together.
-async fn copy_bidirectional_idle(
-    a: &mut TcpStream,
-    b: &mut TcpStream,
-    idle: Duration,
-) -> io::Result<()> {
-    let (mut ar, mut aw) = a.split();
-    let (mut br, mut bw) = b.split();
-    let a_to_b = copy_with_idle(&mut ar, &mut bw, idle);
-    let b_to_a = copy_with_idle(&mut br, &mut aw, idle);
-    tokio::try_join!(a_to_b, b_to_a).map(|_| ())
-}
-
-/// Copy from reader to writer, timing out if no byte arrives within
-/// `idle`. EOF on the reader shuts down the writer so the other half
-/// sees the close.
-async fn copy_with_idle<R, W>(r: &mut R, w: &mut W, idle: Duration) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = match timeout(idle, r.read(&mut buf)).await {
-            Ok(r) => r?,
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "bidirectional copy idle timeout",
-                ))
-            }
-        };
-        if n == 0 {
-            // Propagate EOF by half-closing the writer so the peer
-            // observing the other half sees a clean shutdown.
-            let _ = w.shutdown().await;
-            return Ok(());
-        }
-        w.write_all(&buf[..n]).await?;
-    }
 }
 
 /// Attempt to recover the original destination address from a REDIRECTed socket.
@@ -331,30 +254,5 @@ mod tests {
         });
     }
 
-    #[tokio::test]
-    async fn copy_with_idle_passes_bytes_and_terminates_on_eof() {
-        // Happy path: normal bytes flow through and EOF on the reader
-        // ends the copy cleanly.
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let data = b"hello world";
-        client.write_all(data).await.unwrap();
-        drop(client); // EOF on the read half once the buffer drains
-
-        let mut sink: Vec<u8> = Vec::new();
-        let res = copy_with_idle(&mut server, &mut sink, Duration::from_secs(5)).await;
-        assert!(res.is_ok(), "clean EOF should not return an error: {res:?}");
-        assert_eq!(sink, data);
-    }
-
-    #[tokio::test]
-    async fn copy_with_idle_times_out_when_reader_stalls() {
-        // A reader that never produces a byte must trip the idle timeout
-        // instead of parking forever. We hold `_client` alive so the
-        // server side sees neither data nor EOF.
-        let (_client, mut server) = tokio::io::duplex(4096);
-        let mut sink: Vec<u8> = Vec::new();
-        let res = copy_with_idle(&mut server, &mut sink, Duration::from_millis(100)).await;
-        let err = res.expect_err("stalled reader must trip idle timeout");
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-    }
+    // copy_with_idle tests moved to splice.rs alongside the helper.
 }
