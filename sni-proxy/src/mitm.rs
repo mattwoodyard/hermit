@@ -66,6 +66,18 @@ pub struct MitmConfig<P, C> {
     /// writer machinery as `block_log`; semantic distinction is by
     /// the file path the writer is pointed at.
     pub access_log: BlockLogger,
+    /// Root certs the MITM engine trusts when verifying the upstream
+    /// server's certificate. `None` (production default) uses
+    /// `webpki_roots::TLS_SERVER_ROOTS`. End-to-end tests stand up a
+    /// fake HTTPS upstream signed by a test CA and pass that CA in
+    /// here so the MITM engine accepts the synthetic chain.
+    ///
+    /// Setting this to a custom root store does NOT disable
+    /// verification — it just changes the trust anchor. To trust a
+    /// specific test cert, callers add it to a `RootCertStore` and
+    /// pass that store. There is intentionally no "trust any cert"
+    /// option.
+    pub upstream_roots: Option<Arc<rustls::RootCertStore>>,
 }
 
 /// Run the MITM engine on a single TCP connection.
@@ -233,7 +245,7 @@ where
 
         let mut upstream_tls = match timeout(
             UPSTREAM_TLS_TIMEOUT,
-            connect_upstream_tls(upstream_tcp, hostname),
+            connect_upstream_tls(upstream_tcp, hostname, config.upstream_roots.as_ref()),
         )
         .await
         {
@@ -373,21 +385,31 @@ impl rustls::server::ResolvesServerCert for StaticCertResolver {
     }
 }
 
-/// Connect to upstream with real TLS, verifying the server's certificate
-/// against the webpki built-in roots.
+/// Connect to upstream with real TLS, verifying the server's certificate.
+///
+/// `roots` overrides the default webpki trust anchors when set —
+/// production callers leave it `None` so the standard root list is
+/// used; tests pass a `RootCertStore` containing their fake CA.
 async fn connect_upstream_tls(
     tcp: TcpStream,
     hostname: &str,
+    roots: Option<&Arc<rustls::RootCertStore>>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let root_store = match roots {
+        Some(custom) => Arc::clone(custom),
+        None => {
+            let mut rs = rustls::RootCertStore::empty();
+            rs.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(rs)
+        }
+    };
 
     let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .context("setting protocol versions")?
-    .with_root_certificates(root_store)
+    .with_root_certificates(Arc::unwrap_or_clone(root_store))
     .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(client_config));

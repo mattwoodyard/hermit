@@ -270,6 +270,7 @@ fn proxy_subcommand(args: ProxyArgs) -> Result<i32> {
         network_policy,
         block_log: block_log.clone(),
         access_log: access_log.clone(),
+        upstream_roots: None,
     });
 
     let mut allowed_connect_ports: std::collections::BTreeSet<u16> =

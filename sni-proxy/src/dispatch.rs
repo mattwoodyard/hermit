@@ -242,6 +242,7 @@ mod tests {
             network_policy: None,
             block_log: crate::block_log::BlockLogger::disabled(),
             access_log: crate::block_log::BlockLogger::disabled(),
+            upstream_roots: None,
         };
 
         let hello = b"CLIENTHELLO".to_vec();

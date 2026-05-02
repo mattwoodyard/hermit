@@ -902,6 +902,7 @@ fn parent_main_proxied(
         network_policy: network_policy.clone(),
         block_log: block_log.clone(),
         access_log: access_log.clone(),
+        upstream_roots: None,
     });
 
     // HTTP proxy for port 80 -> 1080. The CONNECT-tunnel port
