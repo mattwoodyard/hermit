@@ -555,6 +555,88 @@ fn proxy_env_vars() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Layout of the listener fds the child binds inside the new network
+/// namespace and ships back to the parent over `SCM_RIGHTS`.
+///
+/// Both sides have to agree on the wire order or the parent will hand
+/// the wrong listener to the wrong service. The pre-refactor code
+/// duplicated the index arithmetic on each side; this struct collapses
+/// it into one canonical serializer and matching parser. Keeping fds
+/// as `i32` matches the rest of the fdpass surface.
+#[derive(Debug)]
+struct FdLayout {
+    https: i32,
+    http: i32,
+    dns: i32,
+    bypass_tcp: Vec<i32>,
+    bypass_udp_v4: Vec<i32>,
+    bypass_udp_v6: Vec<i32>,
+    /// Present only in `hermit learn`; never sent in normal runs.
+    observer: Option<i32>,
+}
+
+impl FdLayout {
+    /// Total fd count for a given (tcp, udp, learn_mode) shape.
+    fn expected_total(tcp_count: usize, udp_count: usize, learn_mode: bool) -> usize {
+        3 + tcp_count + 2 * udp_count + if learn_mode { 1 } else { 0 }
+    }
+
+    /// Canonical wire order: HTTPS, HTTP, DNS, bypass_tcp[..],
+    /// bypass_udp_v4[..], bypass_udp_v6[..], (observer).
+    fn to_vec(&self) -> Vec<i32> {
+        let mut out = Vec::with_capacity(
+            3 + self.bypass_tcp.len() + self.bypass_udp_v4.len() + self.bypass_udp_v6.len()
+                + if self.observer.is_some() { 1 } else { 0 },
+        );
+        out.push(self.https);
+        out.push(self.http);
+        out.push(self.dns);
+        out.extend_from_slice(&self.bypass_tcp);
+        out.extend_from_slice(&self.bypass_udp_v4);
+        out.extend_from_slice(&self.bypass_udp_v6);
+        if let Some(o) = self.observer {
+            out.push(o);
+        }
+        out
+    }
+
+    /// Inverse of [`to_vec`]. Returns `Err` if the buffer length doesn't
+    /// match what `(tcp_count, udp_count, learn_mode)` would produce —
+    /// the parent and child disagree on the layout, which is a bug not
+    /// a recoverable condition.
+    fn from_vec(
+        fds: Vec<i32>,
+        tcp_count: usize,
+        udp_count: usize,
+        learn_mode: bool,
+    ) -> Result<Self> {
+        let expected = Self::expected_total(tcp_count, udp_count, learn_mode);
+        if fds.len() != expected {
+            bail!(
+                "fd layout mismatch: expected {} fds (3 fixed + {} tcp + 2×{} udp{}), got {}",
+                expected,
+                tcp_count,
+                udp_count,
+                if learn_mode { " + 1 observer" } else { "" },
+                fds.len()
+            );
+        }
+        let tcp_start = 3;
+        let udp_v4_start = tcp_start + tcp_count;
+        let udp_v6_start = udp_v4_start + udp_count;
+        let observer_start = udp_v6_start + udp_count;
+        Ok(FdLayout {
+            https: fds[0],
+            http: fds[1],
+            dns: fds[2],
+            bypass_tcp: fds[tcp_start..udp_v4_start].to_vec(),
+            bypass_udp_v4: fds[udp_v4_start..udp_v6_start].to_vec(),
+            bypass_udp_v6: fds[udp_v6_start..observer_start].to_vec(),
+            observer: if learn_mode { Some(fds[observer_start]) } else { None },
+        })
+    }
+}
+
 /// All fallible setup for the proxied child, collected so errors propagate cleanly.
 fn child_proxied_setup(
     sock_fd: i32,
@@ -692,31 +774,20 @@ fn child_proxied_setup(
         bypass_udp_v4.len(),
     );
 
-    // Send the fds to the parent. Order: HTTPS, HTTP, DNS, then
-    // bypass-tcp fds (in allocation order), then bypass-udp-v4
-    // fds, then bypass-udp-v6 fds, then (learn mode only) the
-    // observer fd. The parent recomputes the same allocation
-    // order and splits the received vector by index — it knows
-    // whether to expect the observer fd from the same `learn_mode`
-    // flag that drove the binding here.
-    let mut fds: Vec<i32> = vec![
-        https_listener.as_raw_fd(),
-        http_listener.as_raw_fd(),
-        udp_socket.as_raw_fd(),
-    ];
-    for l in &bypass_tcp_listeners {
-        fds.push(l.as_raw_fd());
-    }
-    for s in &bypass_udp_v4 {
-        fds.push(s.as_raw_fd());
-    }
-    for s in &bypass_udp_v6 {
-        fds.push(s.as_raw_fd());
-    }
-    if let Some(l) = &learn_observer_listener {
-        fds.push(l.as_raw_fd());
-    }
-    fdpass::send_fds(sock_fd, &fds)
+    // Send the fds to the parent. `FdLayout::to_vec` is the single
+    // source of truth for the wire order; the parent reconstructs the
+    // same shape via `FdLayout::from_vec` keyed on `learn_mode` and
+    // the bypass allocation lengths.
+    let layout = FdLayout {
+        https: https_listener.as_raw_fd(),
+        http: http_listener.as_raw_fd(),
+        dns: udp_socket.as_raw_fd(),
+        bypass_tcp: bypass_tcp_listeners.iter().map(|l| l.as_raw_fd()).collect(),
+        bypass_udp_v4: bypass_udp_v4.iter().map(|s| s.as_raw_fd()).collect(),
+        bypass_udp_v6: bypass_udp_v6.iter().map(|s| s.as_raw_fd()).collect(),
+        observer: learn_observer_listener.as_ref().map(|l| l.as_raw_fd()),
+    };
+    fdpass::send_fds(sock_fd, &layout.to_vec())
         .context("failed to send listener fds to parent")?;
     fdpass::close_fd(sock_fd);
 
@@ -754,17 +825,13 @@ fn parent_main_proxied(
 ) -> Result<i32> {
     install_signal_forwarding(child);
 
-    // Receive the listener fds from the child. Layout (must match
-    // `child_proxied_setup`'s send order): HTTPS, HTTP, DNS, then
-    // TCP-bypass fds, then UDP-bypass v4 fds, then UDP-bypass v6
-    // fds, then (only when `learn_mode`) the catch-all observer fd.
-    // Each UDP allocation contributes two fds (one per family) so
-    // the split is `2 × bypass_udp.len()`.
-    let fixed_count = 3usize;
+    // Receive the listener fds from the child. `FdLayout::from_vec` is
+    // the single source of truth for the wire order — the child
+    // serializes via `FdLayout::to_vec` with the same shape keyed on
+    // bypass allocation lengths and `learn_mode`.
     let tcp_count = bypass_tcp.len();
     let udp_count = bypass_udp.len();
-    let observer_count = if learn_mode { 1 } else { 0 };
-    let total = fixed_count + tcp_count + 2 * udp_count + observer_count;
+    let total = FdLayout::expected_total(tcp_count, udp_count, learn_mode);
     info!(
         "parent: waiting for {} listener fds from child ({} bypass-tcp, {} bypass-udp × v4+v6{})",
         total, tcp_count, udp_count,
@@ -773,21 +840,15 @@ fn parent_main_proxied(
     let fds = fdpass::recv_fds(sock_fd, total)
         .context("failed to receive listener fds from child")?;
     fdpass::close_fd(sock_fd);
-    let https_raw_fd = fds[0];
-    let http_raw_fd = fds[1];
-    let udp_raw_fd = fds[2];
-    let tcp_start = fixed_count;
-    let udp_v4_start = fixed_count + tcp_count;
-    let udp_v6_start = udp_v4_start + udp_count;
-    let observer_start = udp_v6_start + udp_count;
-    let bypass_tcp_raw_fds: Vec<i32> = fds[tcp_start..udp_v4_start].to_vec();
-    let bypass_udp_v4_raw_fds: Vec<i32> = fds[udp_v4_start..udp_v6_start].to_vec();
-    let bypass_udp_v6_raw_fds: Vec<i32> = fds[udp_v6_start..observer_start].to_vec();
-    let learn_observer_raw_fd: Option<i32> = if learn_mode {
-        Some(fds[observer_start])
-    } else {
-        None
-    };
+    let layout = FdLayout::from_vec(fds, tcp_count, udp_count, learn_mode)
+        .context("parsing listener fd layout from child")?;
+    let https_raw_fd = layout.https;
+    let http_raw_fd = layout.http;
+    let udp_raw_fd = layout.dns;
+    let bypass_tcp_raw_fds: Vec<i32> = layout.bypass_tcp;
+    let bypass_udp_v4_raw_fds: Vec<i32> = layout.bypass_udp_v4;
+    let bypass_udp_v6_raw_fds: Vec<i32> = layout.bypass_udp_v6;
+    let learn_observer_raw_fd: Option<i32> = layout.observer;
 
     // Wait for child to complete all setup (namespace, nftables, landlock)
     ns_reader.wait()?;
@@ -1298,5 +1359,98 @@ mod tests {
         // narrowest port (80) gets padded out to match 50000 (5).
         assert!(out.contains(":   80 ->"), "80 should be right-padded: {out}");
         assert!(out.contains(":50000 ->"), "{out}");
+    }
+
+    // --- FdLayout round-trip --------------------------------------------
+
+    fn sample_layout(tcp: usize, udp: usize, learn: bool) -> FdLayout {
+        // Use distinct integers per slot so a swapped or off-by-one
+        // assignment is detectable from the values alone, not just
+        // the count.
+        let bypass_tcp: Vec<i32> = (10..10 + tcp as i32).collect();
+        let bypass_udp_v4: Vec<i32> = (100..100 + udp as i32).collect();
+        let bypass_udp_v6: Vec<i32> = (200..200 + udp as i32).collect();
+        FdLayout {
+            https: 3,
+            http: 4,
+            dns: 5,
+            bypass_tcp,
+            bypass_udp_v4,
+            bypass_udp_v6,
+            observer: if learn { Some(999) } else { None },
+        }
+    }
+
+    #[test]
+    fn fd_layout_to_vec_no_bypass_no_learn() {
+        let l = sample_layout(0, 0, false);
+        assert_eq!(l.to_vec(), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn fd_layout_to_vec_includes_bypass_tcp_then_udp_then_observer() {
+        let l = sample_layout(2, 1, true);
+        // 3,4,5 fixed, 10,11 tcp, 100 udp4, 200 udp6, 999 observer
+        assert_eq!(l.to_vec(), vec![3, 4, 5, 10, 11, 100, 200, 999]);
+    }
+
+    #[test]
+    fn fd_layout_round_trip_no_bypass() {
+        let original = sample_layout(0, 0, false);
+        let parsed = FdLayout::from_vec(original.to_vec(), 0, 0, false).unwrap();
+        assert_eq!(parsed.https, original.https);
+        assert_eq!(parsed.http, original.http);
+        assert_eq!(parsed.dns, original.dns);
+        assert!(parsed.bypass_tcp.is_empty());
+        assert!(parsed.bypass_udp_v4.is_empty());
+        assert!(parsed.bypass_udp_v6.is_empty());
+        assert!(parsed.observer.is_none());
+    }
+
+    #[test]
+    fn fd_layout_round_trip_with_bypass_and_learn() {
+        let original = sample_layout(3, 2, true);
+        let parsed = FdLayout::from_vec(original.to_vec(), 3, 2, true).unwrap();
+        assert_eq!(parsed.https, 3);
+        assert_eq!(parsed.bypass_tcp, vec![10, 11, 12]);
+        assert_eq!(parsed.bypass_udp_v4, vec![100, 101]);
+        assert_eq!(parsed.bypass_udp_v6, vec![200, 201]);
+        assert_eq!(parsed.observer, Some(999));
+    }
+
+    #[test]
+    fn fd_layout_from_vec_rejects_short_buffer() {
+        // 3 fixed + 1 tcp + 0 udp + 0 observer = 4; pass only 3 bytes.
+        let err = FdLayout::from_vec(vec![3, 4, 5], 1, 0, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("expected 4"), "got: {msg}");
+        assert!(msg.contains("got 3"), "got: {msg}");
+    }
+
+    #[test]
+    fn fd_layout_from_vec_rejects_long_buffer() {
+        // 3 fixed + 0 tcp + 0 udp + 0 observer = 3; pass 5 fds.
+        let err = FdLayout::from_vec(vec![3, 4, 5, 6, 7], 0, 0, false).unwrap_err();
+        assert!(err.to_string().contains("got 5"));
+    }
+
+    #[test]
+    fn fd_layout_expected_total_matches_to_vec_len() {
+        // The two paths must agree across every shape that the runtime
+        // can actually produce (small finite set).
+        for tcp in 0..4 {
+            for udp in 0..4 {
+                for learn in [false, true] {
+                    let layout = sample_layout(tcp, udp, learn);
+                    let total = FdLayout::expected_total(tcp, udp, learn);
+                    assert_eq!(
+                        layout.to_vec().len(),
+                        total,
+                        "tcp={tcp} udp={udp} learn={learn}: \
+                         expected_total disagrees with to_vec().len()"
+                    );
+                }
+            }
+        }
     }
 }
