@@ -145,6 +145,18 @@ impl CredentialResolver {
             },
         );
     }
+
+    /// Drop the cached value for `name`, if any. The next
+    /// [`resolve`](Self::resolve) call re-runs the source.
+    /// Used for OAuth-style flows where the proxy sees a 401
+    /// from upstream and wants the next request to fetch a
+    /// fresh access token instead of replaying the stale one.
+    /// No-op when the cache had no entry (or only contained an
+    /// already-expired one).
+    pub fn invalidate(&self, name: &str) {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.remove(name);
+    }
 }
 
 async fn run_script(command: &[String], match_host: Option<&str>) -> Result<String> {
@@ -286,5 +298,53 @@ mod tests {
         let r = CredentialResolver::new(HashMap::new());
         let err = r.resolve("missing", None).await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_cached_value_so_next_resolve_reruns_source() {
+        // Use a script whose output changes every invocation so
+        // we can detect whether the cache served the old value
+        // or the source ran fresh.
+        // ttl_secs is huge so the cache wouldn't expire on its own.
+        let path = std::env::temp_dir().join(format!(
+            "hermit-cred-invalidate-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "0").unwrap();
+        let r = resolver_with(
+            "tok",
+            Source::Script {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "n=$(cat {p}); echo -n $n; expr $n + 1 > {p}",
+                        p = path.display()
+                    ),
+                ],
+                ttl_secs: 86_400,
+            },
+        );
+        // First resolve: source runs, returns "0", caches it.
+        let v0 = r.resolve("tok", None).await.unwrap();
+        assert_eq!(v0, "0");
+        // Cached: source must NOT run again.
+        let v0_again = r.resolve("tok", None).await.unwrap();
+        assert_eq!(v0_again, "0", "cache hit must serve the original value");
+        // Invalidate: next resolve re-runs the source.
+        r.invalidate("tok");
+        let v1 = r.resolve("tok", None).await.unwrap();
+        assert_eq!(v1, "1", "after invalidate the source must run again");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn invalidate_unknown_credential_is_a_noop() {
+        // The 401 path may invalidate a credential whose entry
+        // was never cached (it could have been a non-script
+        // source with a one-shot acquisition that failed). The
+        // call must succeed silently.
+        let r = CredentialResolver::new(HashMap::new());
+        r.invalidate("missing"); // does not panic
     }
 }

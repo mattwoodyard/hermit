@@ -554,6 +554,10 @@ pub struct Response {
     pub head_bytes: Vec<u8>,
     pub content_length: Option<u64>,
     pub chunked: bool,
+    /// HTTP status code (e.g. 200, 401, 500). Used by callers
+    /// that act on auth failures — see `CredentialResolver::invalidate`
+    /// in `mitm::run` for the 401-triggered cache invalidation.
+    pub status: u16,
 }
 
 pub async fn read_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Response, Vec<u8>)> {
@@ -608,12 +612,19 @@ pub async fn read_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Resp
 
                 let head_bytes = buf[..head_len].to_vec();
                 let leftover = buf[head_len..].to_vec();
+                // `httparse::Status::Complete` guarantees the
+                // status line was parsed successfully, so
+                // `resp.code` is `Some(_)`. Default to 0 if
+                // somehow not — invalidation logic treats 0 as
+                // "no special handling" and forwards normally.
+                let status = resp.code.unwrap_or(0);
 
                 return Ok((
                     Response {
                         head_bytes,
                         content_length,
                         chunked,
+                        status,
                     },
                     leftover,
                 ));

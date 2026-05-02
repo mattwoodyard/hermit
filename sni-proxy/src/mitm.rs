@@ -182,9 +182,14 @@ where
         });
 
         // Credential injection if a network policy is configured.
-        if let Some(np) = &config.network_policy {
-            apply_injection(np, hostname, &mut request).await;
-        }
+        // Capture which credential (if any) we injected so we can
+        // invalidate it on a 401 — the next request through this
+        // rule will then re-run the source and get a fresh token
+        // instead of replaying the stale one.
+        let injected_credential: Option<String> = match &config.network_policy {
+            Some(np) => apply_injection(np, hostname, &mut request).await,
+            None => None,
+        };
 
         // Connect upstream TCP, then real TLS handshake.
         let upstream_tcp = match timeout(
@@ -251,6 +256,25 @@ where
                 return Ok(());
             }
         };
+
+        // OAuth-style cache invalidation: when the upstream
+        // returns 401 Unauthorized AND we injected a credential
+        // on this request, the cached token is probably stale.
+        // Drop it so the *next* request through this rule
+        // re-runs the credential source. We don't retry the
+        // current request — that'd require buffering its body
+        // for replay, and the simple invalidate-and-let-the-
+        // next-request-fix-it flow is enough for the typical
+        // refresh-token loop.
+        if response.status == 401 {
+            if let (Some(np), Some(cred)) = (&config.network_policy, &injected_credential) {
+                tracing::info!(
+                    %hostname, credential = %cred,
+                    "mitm: upstream 401 — invalidating cached credential"
+                );
+                np.invalidate(cred);
+            }
+        }
 
         // Forward response headers + body.
         client_tls
@@ -423,7 +447,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 /// Match the request against the network policy and, if a rule matches,
 /// acquire the credential and overwrite the configured headers in
-/// `request.head_bytes`.
+/// `request.head_bytes`. Returns the **credential name** that was
+/// injected — the caller passes this to
+/// [`NetworkPolicy::invalidate`](crate::network_policy::NetworkPolicy::invalidate)
+/// when the upstream response carries a 401, so the next request
+/// re-runs the credential source instead of replaying a stale token.
+///
+/// Returns `None` when no rule matched, the credential could not be
+/// acquired, or the rule has no inject actions — in those cases the
+/// request is forwarded unmodified and there's nothing to invalidate.
 ///
 /// Failures (bad URI, credential acquisition error, header edit error)
 /// log a warning and leave the request unmodified — access control is
@@ -432,35 +464,35 @@ pub async fn apply_injection(
     np: &NetworkPolicy,
     hostname: &str,
     request: &mut http::Request,
-) {
-    let req_for_match = match build_match_request(request, hostname) {
-        Some(r) => r,
-        None => return,
-    };
-    let rule = match np.resolve(&req_for_match) {
-        Some(r) => r,
-        None => return,
-    };
+) -> Option<String> {
+    let req_for_match = build_match_request(request, hostname)?;
+    let rule = np.resolve(&req_for_match)?;
     let value = match np.acquire(rule, Some(hostname)).await {
         Ok(v) => v,
         Err(e) => {
             warn!(%hostname, credential = %rule.credential, error = %e,
                 "credential acquisition failed; forwarding without injection");
-            return;
+            return None;
         }
     };
-    let actions = match np.inject_actions(rule) {
-        Some(a) => a,
-        None => return,
-    };
+    let actions = np.inject_actions(rule)?;
+    let mut any_set = false;
     for action in actions {
         let rendered = render_inject_value(&action.value, &value);
-        if let Err(e) = http::set_header(&mut request.head_bytes, &action.header, &rendered) {
-            warn!(%hostname, header = %action.header, error = %e,
-                "failed to set injected header; continuing");
+        match http::set_header(&mut request.head_bytes, &action.header, &rendered) {
+            Ok(()) => any_set = true,
+            Err(e) => {
+                warn!(%hostname, header = %action.header, error = %e,
+                    "failed to set injected header; continuing");
+            }
         }
     }
-    info!(%hostname, credential = %rule.credential, "injected credential");
+    if any_set {
+        info!(%hostname, credential = %rule.credential, "injected credential");
+        Some(rule.credential.clone())
+    } else {
+        None
+    }
 }
 
 /// Build an `http::Request<()>` from our parsed request for DSL matching.

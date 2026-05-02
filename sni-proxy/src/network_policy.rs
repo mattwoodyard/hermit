@@ -106,6 +106,15 @@ impl NetworkPolicy {
     pub async fn acquire(&self, rule: &CompiledRule, match_host: Option<&str>) -> Result<String> {
         self.resolver.resolve(&rule.credential, match_host).await
     }
+
+    /// Drop the cached value for the named credential so the
+    /// next [`acquire`](Self::acquire) re-runs the source.
+    /// Used by the MITM engine on a 401 from upstream — the
+    /// next request gets a fresh access token instead of
+    /// replaying the stale one.
+    pub fn invalidate(&self, name: &str) {
+        self.resolver.invalidate(name);
+    }
 }
 
 /// Apply template substitution: replace `{cred}` with the acquired value.
