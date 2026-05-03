@@ -713,6 +713,7 @@ name = "hermit-tests"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "clap",
  "ed25519-dalek",
  "hermit",
  "landlock",
@@ -722,6 +723,7 @@ dependencies = [
  "rcgen",
  "rustables",
  "serde_json",
+ "sni-proxy",
  "tempfile",
  "tokio",
  "toml",

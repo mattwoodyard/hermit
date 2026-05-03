@@ -18,7 +18,7 @@ use crate::process;
 /// `~/.cargo`, `~/.rustup`, `~/.ssh`, etc., but the user has never
 /// installed some of those tools. Previously hermit would refuse to start;
 /// now we log a warning per missing entry and continue with what exists.
-fn drop_missing_home_files(home_files: Vec<HomeFileDirective>) -> Vec<HomeFileDirective> {
+pub(crate) fn drop_missing_home_files(home_files: Vec<HomeFileDirective>) -> Vec<HomeFileDirective> {
     home_files
         .into_iter()
         .filter(|d| {
@@ -56,7 +56,7 @@ fn drop_missing_home_files(home_files: Vec<HomeFileDirective>) -> Vec<HomeFileDi
 ///
 /// Same spirit as [`drop_missing_home_files`] — paths that mean nothing on
 /// this host get logged and ignored rather than blocking startup.
-fn drop_missing_passthrough(passthrough: Vec<PathBuf>) -> Vec<PathBuf> {
+pub(crate) fn drop_missing_passthrough(passthrough: Vec<PathBuf>) -> Vec<PathBuf> {
     passthrough
         .into_iter()
         .filter(|p| {
@@ -71,7 +71,7 @@ fn drop_missing_passthrough(passthrough: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 /// Build the read-write path list for landlock from the sandbox parameters.
-fn build_rw_paths<'a>(
+pub(crate) fn build_rw_paths<'a>(
     home_path: &'a Path,
     project_dir: &'a Path,
     passthrough: &'a [PathBuf],
@@ -240,7 +240,7 @@ pub fn run_sandboxed(
 /// defaults to `$XDG_STATE_HOME/hermit/blocks.jsonl` (falling back to
 /// `$HOME/.local/state/hermit/blocks.jsonl`). The parent is created
 /// with `create_dir_all` so a first-time run "just works".
-fn resolve_block_log(
+pub(crate) fn resolve_block_log(
     override_path: Option<&Path>,
     disabled: bool,
 ) -> Result<Option<PathBuf>> {
@@ -287,7 +287,7 @@ pub fn default_access_log_path() -> PathBuf {
 /// Pure resolver for `$XDG_STATE_HOME` given the two env vars it
 /// depends on. Relative `XDG_STATE_HOME` values are ignored per spec;
 /// missing `HOME` falls back to `/root`, matching the rest of hermit.
-fn xdg_state_home_from(
+pub(crate) fn xdg_state_home_from(
     xdg_state_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> PathBuf {
@@ -332,158 +332,49 @@ fn run_sandboxed_direct(
     Ok(code)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Wrappers around `sandbox`'s private items for the dedicated
+/// test crate. Off by default; `hermit-tests` flips on the
+/// `__test_internals` feature in its `[dependencies]` entry.
+#[cfg(feature = "__test_internals")]
+#[doc(hidden)]
+pub mod __test_internals {
+    use super::HomeFileDirective;
+    use anyhow::Result;
+    use std::path::{Path, PathBuf};
 
-    #[test]
-    fn test_empty_command_fails() {
-        let config = Config::default();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false, None, false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no command specified"));
+    pub fn drop_missing_home_files(
+        home_files: Vec<HomeFileDirective>,
+    ) -> Vec<HomeFileDirective> {
+        super::drop_missing_home_files(home_files)
     }
 
-    #[test]
-    fn test_empty_command_fails_net_isolate() {
-        let config = Config::parse("[sandbox]\nnet = \"isolate\"\n").unwrap();
-        let result = run_sandboxed(Path::new("/tmp"), &[], &config, None, false, None, false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no command specified"));
+    pub fn drop_missing_passthrough(passthrough: Vec<PathBuf>) -> Vec<PathBuf> {
+        super::drop_missing_passthrough(passthrough)
     }
 
-    #[test]
-    fn resolve_block_log_honors_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let want = dir.path().join("sub").join("custom.jsonl");
-        let got = resolve_block_log(Some(&want), false).unwrap();
-        assert_eq!(got, Some(want.clone()));
-        assert!(want.parent().unwrap().is_dir(),
-            "override path's parent must be created if missing");
+    /// `build_rw_paths` returns `Vec<&'a Path>`. The wrapper keeps
+    /// the same lifetimes so callers can pass borrows of their own
+    /// data and inspect the result without further plumbing.
+    pub fn build_rw_paths<'a>(
+        home_path: &'a Path,
+        project_dir: &'a Path,
+        passthrough: &'a [PathBuf],
+        home_files: &'a [HomeFileDirective],
+    ) -> Vec<&'a Path> {
+        super::build_rw_paths(home_path, project_dir, passthrough, home_files)
     }
 
-    #[test]
-    fn resolve_block_log_disabled_returns_none() {
-        // --no-block-log must short-circuit before any filesystem side
-        // effect. We can't easily assert "no XDG dir was created"
-        // without mutating env vars (racy across tests), so the
-        // side-effect-free guarantee is tested at the pure layer
-        // (default_block_log_path resolution) below.
-        let got = resolve_block_log(None, true).unwrap();
-        assert_eq!(got, None);
+    pub fn resolve_block_log(
+        override_path: Option<&Path>,
+        disabled: bool,
+    ) -> Result<Option<PathBuf>> {
+        super::resolve_block_log(override_path, disabled)
     }
 
-    #[test]
-    fn xdg_state_home_respects_absolute_override() {
-        use std::ffi::OsStr;
-        let got = xdg_state_home_from(
-            Some(OsStr::new("/var/lib/state")),
-            Some(OsStr::new("/home/someone")),
-        );
-        assert_eq!(got, PathBuf::from("/var/lib/state"));
-    }
-
-    #[test]
-    fn xdg_state_home_ignores_relative_override() {
-        use std::ffi::OsStr;
-        // The XDG spec says relative XDG_STATE_HOME values must be
-        // ignored — otherwise a malicious or confused env would land
-        // the block log in CWD.
-        let got = xdg_state_home_from(
-            Some(OsStr::new("relative/path")),
-            Some(OsStr::new("/home/someone")),
-        );
-        assert_eq!(got, PathBuf::from("/home/someone/.local/state"));
-    }
-
-    #[test]
-    fn xdg_state_home_falls_back_to_home() {
-        use std::ffi::OsStr;
-        let got = xdg_state_home_from(None, Some(OsStr::new("/home/someone")));
-        assert_eq!(got, PathBuf::from("/home/someone/.local/state"));
-    }
-
-    #[test]
-    fn xdg_state_home_missing_home_uses_root_default() {
-        // Matches the `HOME` fallback used elsewhere in hermit
-        // (see run_sandboxed's `unwrap_or_else(|| "/root")`).
-        let got = xdg_state_home_from(None, None);
-        assert_eq!(got, PathBuf::from("/root/.local/state"));
-    }
-
-    #[test]
-    fn test_build_rw_paths_includes_defaults() {
-        let home = Path::new("/home/test");
-        let project = Path::new("/tmp/project");
-        let paths = build_rw_paths(home, project, &[], &[]);
-        assert!(paths.contains(&Path::new("/tmp")));
-        assert!(paths.contains(&home));
-        assert!(paths.contains(&project));
-        assert!(paths.contains(&Path::new("/dev/null")));
-    }
-
-    #[test]
-    fn test_build_rw_paths_includes_passthrough() {
-        let home = Path::new("/home/test");
-        let project = Path::new("/tmp/project");
-        let extra = vec![PathBuf::from("/opt/extra")];
-        let paths = build_rw_paths(home, project, &extra, &[]);
-        assert!(paths.contains(&extra[0].as_path()));
-    }
-
-    #[test]
-    fn drop_missing_home_files_keeps_existing_drops_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().join("exists.txt");
-        std::fs::write(&existing, "").unwrap();
-        let absent = dir.path().join("nope.txt");
-
-        let input = vec![
-            HomeFileDirective::Copy(existing.clone()),
-            HomeFileDirective::Pass(absent.clone()),
-            HomeFileDirective::Read(existing.clone()),
-        ];
-        let kept = drop_missing_home_files(input);
-        assert_eq!(kept.len(), 2);
-        assert!(matches!(kept[0], HomeFileDirective::Copy(_)));
-        assert!(matches!(kept[1], HomeFileDirective::Read(_)));
-    }
-
-    #[test]
-    fn drop_missing_home_files_keeps_broken_symlink() {
-        // A dangling symlink still "exists" at the directive level — the
-        // user asked for that path and the sandbox layer will handle it.
-        // We only filter when there's no entry at all.
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("dangling");
-        std::os::unix::fs::symlink("/nonexistent-target-for-hermit-test", &link).unwrap();
-        let kept = drop_missing_home_files(vec![HomeFileDirective::Pass(link.clone())]);
-        assert_eq!(kept.len(), 1);
-    }
-
-    #[test]
-    fn drop_missing_passthrough_keeps_existing_drops_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().to_path_buf();
-        let absent = dir.path().join("nope");
-        let kept = drop_missing_passthrough(vec![existing.clone(), absent]);
-        assert_eq!(kept, vec![existing]);
-    }
-
-    #[test]
-    fn test_build_rw_paths_includes_pass_directives() {
-        let home = Path::new("/home/test");
-        let project = Path::new("/tmp/project");
-        let home_files = vec![
-            HomeFileDirective::Pass(PathBuf::from("/opt/data")),
-            HomeFileDirective::Copy(PathBuf::from("/home/test/.bashrc")),
-            HomeFileDirective::Read(PathBuf::from("/home/test/.config")),
-        ];
-        let paths = build_rw_paths(home, project, &[], &home_files);
-        // Pass directives should be included
-        assert!(paths.contains(&Path::new("/opt/data")));
-        // Copy and Read directives should not grant rw
-        assert!(!paths.contains(&Path::new("/home/test/.bashrc")));
-        assert!(!paths.contains(&Path::new("/home/test/.config")));
+    pub fn xdg_state_home_from(
+        xdg_state_home: Option<&std::ffi::OsStr>,
+        home: Option<&std::ffi::OsStr>,
+    ) -> PathBuf {
+        super::xdg_state_home_from(xdg_state_home, home)
     }
 }

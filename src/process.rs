@@ -21,12 +21,14 @@ use crate::netns;
 
 /// PID of the child process, used by signal handlers.
 /// 0 means no child yet (signals are no-ops).
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+#[doc(hidden)]
+pub static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Port the MITM proxy listens on inside the network namespace (HTTPS).
 const PROXY_LISTEN_PORT: u16 = 1443;
 /// Port the HTTP proxy listens on inside the network namespace.
-const HTTP_PROXY_LISTEN_PORT: u16 = 1080;
+#[doc(hidden)]
+pub const HTTP_PROXY_LISTEN_PORT: u16 = 1080;
 /// Port to redirect (HTTPS) to the MITM proxy.
 const HTTPS_PORT: u16 = 443;
 /// Port to redirect (HTTP) to the HTTP proxy.
@@ -37,13 +39,15 @@ const HTTP_PORT: u16 = 80;
 /// with anything interesting — more than enough for real-world
 /// configs, and the allocation is deterministic so parent + child
 /// agree without side-channel coordination.
-const BYPASS_TCP_BASE_PORT: u16 = 1090;
+#[doc(hidden)]
+pub const BYPASS_TCP_BASE_PORT: u16 = 1090;
 /// First loopback port used for UDP-bypass relay listeners. Kept
 /// disjoint from the TCP range so an operator reading `ss -tulnp`
 /// can tell which listener is which at a glance, and we don't care
 /// about UDP-TCP clashes (they don't share port space) but the
 /// alignment is handy for logs.
-const BYPASS_UDP_BASE_PORT: u16 = 1400;
+#[doc(hidden)]
+pub const BYPASS_UDP_BASE_PORT: u16 = 1400;
 /// Loopback port for the learn-mode catch-all TCP observer. Only
 /// bound + DNAT'd to when `permit_all = true`; the rest of run
 /// mode never opens this socket.
@@ -54,17 +58,19 @@ const LEARN_OBSERVER_PORT: u16 = 1500;
 /// allocation from the shared `RuleSet` so we don't need to send
 /// metadata alongside the SCM_RIGHTS fds.
 #[derive(Debug, Clone, Copy)]
-struct BypassTcpAllocation {
+pub struct BypassTcpAllocation {
     /// The real port the child thinks it's connecting to (e.g. 389).
-    real_port: u16,
+    #[allow(dead_code)]
+    pub real_port: u16,
     /// Loopback port where the relay listens (e.g. 1090).
-    relay_port: u16,
+    pub relay_port: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BypassUdpAllocation {
-    real_port: u16,
-    relay_port: u16,
+pub struct BypassUdpAllocation {
+    #[allow(dead_code)]
+    pub real_port: u16,
+    pub relay_port: u16,
 }
 
 /// Snapshot of the nftables layout we install before exec, used
@@ -73,7 +79,8 @@ struct BypassUdpAllocation {
 /// (first-match-wins for `dnat`). The `from_port = None` form
 /// represents a catch-all (no `dport` predicate).
 #[derive(Debug, Default)]
-struct NftPlan {
+#[doc(hidden)]
+pub struct NftPlan {
     rows: Vec<NftRow>,
 }
 
@@ -99,10 +106,10 @@ struct NftRow {
 }
 
 impl NftPlan {
-    fn push_tcp(&mut self, from_port: Option<u16>, to_port: u16, label: &'static str) {
+    pub fn push_tcp(&mut self, from_port: Option<u16>, to_port: u16, label: &'static str) {
         self.rows.push(NftRow { family: NftFamily::TcpV4, from_port, to_port, label });
     }
-    fn push_udp_v4(&mut self, from_port: u16, to_port: u16, label: &'static str) {
+    pub fn push_udp_v4(&mut self, from_port: u16, to_port: u16, label: &'static str) {
         self.rows.push(NftRow {
             family: NftFamily::UdpV4,
             from_port: Some(from_port),
@@ -110,7 +117,7 @@ impl NftPlan {
             label,
         });
     }
-    fn push_udp_v6(&mut self, from_port: u16, to_port: u16, label: &'static str) {
+    pub fn push_udp_v6(&mut self, from_port: u16, to_port: u16, label: &'static str) {
         self.rows.push(NftRow {
             family: NftFamily::UdpV6,
             from_port: Some(from_port),
@@ -122,7 +129,7 @@ impl NftPlan {
     /// Render a fixed-width table. Columns: index, family, source
     /// port (or `*` for catch-all), arrow, dest, label. Index is
     /// the order packets see — rule 1 is consulted before rule 2.
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
         use std::fmt::Write as _;
         if self.rows.is_empty() {
             return "  (no rules)".to_string();
@@ -171,7 +178,8 @@ impl NftPlan {
     }
 }
 
-fn compute_bypass_tcp_allocations(rules: &RuleSet) -> Vec<BypassTcpAllocation> {
+#[doc(hidden)]
+pub fn compute_bypass_tcp_allocations(rules: &RuleSet) -> Vec<BypassTcpAllocation> {
     rules
         .bypass_endpoints()
         .into_iter()
@@ -184,7 +192,8 @@ fn compute_bypass_tcp_allocations(rules: &RuleSet) -> Vec<BypassTcpAllocation> {
         .collect()
 }
 
-fn compute_bypass_udp_allocations(rules: &RuleSet) -> Vec<BypassUdpAllocation> {
+#[doc(hidden)]
+pub fn compute_bypass_udp_allocations(rules: &RuleSet) -> Vec<BypassUdpAllocation> {
     rules
         .bypass_endpoints()
         .into_iter()
@@ -542,7 +551,8 @@ fn child_main_proxied(
 /// `NO_PROXY` excludes loopback so tools hitting a local service
 /// inside the sandbox don't tunnel through the proxy back to
 /// themselves.
-fn proxy_env_vars() -> Vec<(&'static str, String)> {
+#[doc(hidden)]
+pub fn proxy_env_vars() -> Vec<(&'static str, String)> {
     let url = format!("http://127.0.0.1:{}", HTTP_PROXY_LISTEN_PORT);
     let no_proxy = "localhost,127.0.0.1,::1".to_string();
     vec![
@@ -564,26 +574,27 @@ fn proxy_env_vars() -> Vec<(&'static str, String)> {
 /// it into one canonical serializer and matching parser. Keeping fds
 /// as `i32` matches the rest of the fdpass surface.
 #[derive(Debug)]
-struct FdLayout {
-    https: i32,
-    http: i32,
-    dns: i32,
-    bypass_tcp: Vec<i32>,
-    bypass_udp_v4: Vec<i32>,
-    bypass_udp_v6: Vec<i32>,
+#[doc(hidden)]
+pub struct FdLayout {
+    pub https: i32,
+    pub http: i32,
+    pub dns: i32,
+    pub bypass_tcp: Vec<i32>,
+    pub bypass_udp_v4: Vec<i32>,
+    pub bypass_udp_v6: Vec<i32>,
     /// Present only in `hermit learn`; never sent in normal runs.
-    observer: Option<i32>,
+    pub observer: Option<i32>,
 }
 
 impl FdLayout {
     /// Total fd count for a given (tcp, udp, learn_mode) shape.
-    fn expected_total(tcp_count: usize, udp_count: usize, learn_mode: bool) -> usize {
+    pub fn expected_total(tcp_count: usize, udp_count: usize, learn_mode: bool) -> usize {
         3 + tcp_count + 2 * udp_count + if learn_mode { 1 } else { 0 }
     }
 
     /// Canonical wire order: HTTPS, HTTP, DNS, bypass_tcp[..],
     /// bypass_udp_v4[..], bypass_udp_v6[..], (observer).
-    fn to_vec(&self) -> Vec<i32> {
+    pub fn to_vec(&self) -> Vec<i32> {
         let mut out = Vec::with_capacity(
             3 + self.bypass_tcp.len() + self.bypass_udp_v4.len() + self.bypass_udp_v6.len()
                 + if self.observer.is_some() { 1 } else { 0 },
@@ -604,7 +615,7 @@ impl FdLayout {
     /// match what `(tcp_count, udp_count, learn_mode)` would produce —
     /// the parent and child disagree on the layout, which is a bug not
     /// a recoverable condition.
-    fn from_vec(
+    pub fn from_vec(
         fds: Vec<i32>,
         tcp_count: usize,
         udp_count: usize,
@@ -1167,291 +1178,4 @@ fn fd_to_tokio_udp(
         .context("failed to set UDP socket non-blocking")?;
     rt.block_on(async { tokio::net::UdpSocket::from_std(socket) })
         .context("failed to register UDP socket with tokio")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_readiness_pipe_signal() {
-        let (reader, writer) = readiness_pipe().unwrap();
-        writer.signal();
-        reader.wait().unwrap();
-    }
-
-    #[test]
-    fn test_readiness_pipe_drop_without_signal() {
-        let (reader, writer) = readiness_pipe().unwrap();
-        drop(writer);
-        let result = reader.wait();
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("died before signaling"),
-        );
-    }
-
-    #[test]
-    fn test_child_pid_atomic_default() {
-        // CHILD_PID starts at 0
-        assert_eq!(CHILD_PID.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn bypass_tcp_allocations_give_distinct_relay_ports() {
-        use sni_proxy::policy::{AccessRule, BypassProtocol, Mechanism};
-        let rules = RuleSet::new(vec![
-            AccessRule {
-                hostname: "a.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 389 },
-            },
-            AccessRule {
-                hostname: "b.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 22 },
-            },
-            // UDP rule must not appear in the TCP allocation list.
-            AccessRule {
-                hostname: "c.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
-            },
-        ]);
-        let allocs = compute_bypass_tcp_allocations(&rules);
-        assert_eq!(allocs.len(), 2);
-        // All relay ports distinct, all at or above the base.
-        let relay_ports: std::collections::HashSet<_> =
-            allocs.iter().map(|a| a.relay_port).collect();
-        assert_eq!(relay_ports.len(), 2);
-        for a in &allocs {
-            assert!(a.relay_port >= BYPASS_TCP_BASE_PORT);
-        }
-    }
-
-    #[test]
-    fn bypass_udp_allocations_coexist_with_tcp_on_same_port() {
-        // Kerberos ships UDP/88 and TCP/88 — both should allocate
-        // listeners independently and land in disjoint loopback
-        // port ranges so neither steps on the other.
-        use sni_proxy::policy::{AccessRule, BypassProtocol, Mechanism};
-        let rules = RuleSet::new(vec![
-            AccessRule {
-                hostname: "kdc.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Udp, port: 88 },
-            },
-            AccessRule {
-                hostname: "kdc.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 88 },
-            },
-        ]);
-        let tcp_allocs = compute_bypass_tcp_allocations(&rules);
-        let udp_allocs = compute_bypass_udp_allocations(&rules);
-        assert_eq!(tcp_allocs.len(), 1);
-        assert_eq!(udp_allocs.len(), 1);
-        // They're in separate port ranges so we can tell TCP vs UDP
-        // from the loopback port alone.
-        assert!(tcp_allocs[0].relay_port >= BYPASS_TCP_BASE_PORT);
-        assert!(tcp_allocs[0].relay_port < BYPASS_UDP_BASE_PORT);
-        assert!(udp_allocs[0].relay_port >= BYPASS_UDP_BASE_PORT);
-    }
-
-    #[test]
-    fn bypass_tcp_allocations_deduplicate_same_port_different_hosts() {
-        // Two different hosts both bypassing TCP port 22 — the
-        // relay serves both via a single listener on the same
-        // loopback port, and the port 22 DNAT redirects to it.
-        use sni_proxy::policy::{AccessRule, BypassProtocol, Mechanism};
-        let rules = RuleSet::new(vec![
-            AccessRule {
-                hostname: "a.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 22 },
-            },
-            AccessRule {
-                hostname: "b.example".into(),
-                path_prefix: None,
-                methods: None,
-                mechanism: Mechanism::Bypass { protocol: BypassProtocol::Tcp, port: 22 },
-            },
-        ]);
-        let allocs = compute_bypass_tcp_allocations(&rules);
-        assert_eq!(allocs.len(), 1, "same port must share one relay listener");
-    }
-
-    #[test]
-    fn proxy_env_vars_cover_both_casings_and_no_proxy() {
-        let vars: std::collections::HashMap<_, _> = proxy_env_vars().into_iter().collect();
-        let expected_url = format!("http://127.0.0.1:{}", HTTP_PROXY_LISTEN_PORT);
-        for k in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
-            assert_eq!(vars.get(k).map(|s| s.as_str()), Some(expected_url.as_str()),
-                "missing or wrong value for {k}");
-        }
-        for k in ["NO_PROXY", "no_proxy"] {
-            let v = vars.get(k).expect("missing NO_PROXY casing");
-            // Loopback must be excluded — otherwise local services
-            // tunnel back through the proxy to themselves.
-            assert!(v.contains("127.0.0.1"), "NO_PROXY missing 127.0.0.1: {v}");
-            assert!(v.contains("localhost"), "NO_PROXY missing localhost: {v}");
-        }
-    }
-
-    #[test]
-    fn nft_plan_render_lists_rules_in_install_order() {
-        // The summary lists rules in nft-evaluation order
-        // (first-match-wins) so a reader can scan top-to-bottom
-        // and predict which rule a packet hits.
-        let mut plan = NftPlan::default();
-        plan.push_tcp(Some(443), 1443, "MITM proxy");
-        plan.push_tcp(Some(80), 1080, "HTTP proxy");
-        plan.push_tcp(Some(8443), 1443, "port_forward https → MITM");
-        plan.push_tcp(Some(389), 1090, "bypass-tcp");
-        plan.push_udp_v4(88, 1400, "bypass-udp v4");
-        plan.push_udp_v6(88, 1400, "bypass-udp v6");
-        plan.push_tcp(None, 1500, "learn-mode observer (catch-all)");
-
-        let out = plan.render();
-        // Every label appears.
-        for label in [
-            "MITM proxy", "HTTP proxy", "port_forward https",
-            "bypass-tcp", "bypass-udp v4", "bypass-udp v6",
-            "learn-mode observer",
-        ] {
-            assert!(out.contains(label), "missing {label} in: {out}");
-        }
-        // Catch-all renders with `*` instead of a specific port.
-        // (The exact padding depends on the widest source port
-        // in the plan; here 8443 dictates a 4-char column.)
-        assert!(out.contains(":   * ->"),
-            "catch-all must render with `*` source port: {out}");
-        // Indices are 1-based and ordered.
-        let i_443 = out.find("[ 1]").expect("rule [ 1] missing");
-        let i_obs = out.find("[ 7]").expect("rule [ 7] missing");
-        assert!(i_443 < i_obs, "rule order must be preserved");
-        // IPv6 UDP renders with `[::1]` (not 127.0.0.1).
-        assert!(out.contains("[::1]:1400"), "udp v6 must use [::1]: {out}");
-    }
-
-    #[test]
-    fn nft_plan_render_handles_no_rules() {
-        let plan = NftPlan::default();
-        assert!(plan.render().contains("(no rules)"));
-    }
-
-    #[test]
-    fn nft_plan_aligns_source_port_column() {
-        // Width-aligned source-port column means a one-line
-        // `grep` for `:443 ->` keeps working regardless of how
-        // many other rules are above/below.
-        let mut plan = NftPlan::default();
-        plan.push_tcp(Some(443), 1443, "MITM");
-        plan.push_tcp(Some(80), 1080, "HTTP");
-        plan.push_tcp(Some(50000), 1090, "bypass");
-        let out = plan.render();
-        // Each `:<port>` column should be the same width — the
-        // narrowest port (80) gets padded out to match 50000 (5).
-        assert!(out.contains(":   80 ->"), "80 should be right-padded: {out}");
-        assert!(out.contains(":50000 ->"), "{out}");
-    }
-
-    // --- FdLayout round-trip --------------------------------------------
-
-    fn sample_layout(tcp: usize, udp: usize, learn: bool) -> FdLayout {
-        // Use distinct integers per slot so a swapped or off-by-one
-        // assignment is detectable from the values alone, not just
-        // the count.
-        let bypass_tcp: Vec<i32> = (10..10 + tcp as i32).collect();
-        let bypass_udp_v4: Vec<i32> = (100..100 + udp as i32).collect();
-        let bypass_udp_v6: Vec<i32> = (200..200 + udp as i32).collect();
-        FdLayout {
-            https: 3,
-            http: 4,
-            dns: 5,
-            bypass_tcp,
-            bypass_udp_v4,
-            bypass_udp_v6,
-            observer: if learn { Some(999) } else { None },
-        }
-    }
-
-    #[test]
-    fn fd_layout_to_vec_no_bypass_no_learn() {
-        let l = sample_layout(0, 0, false);
-        assert_eq!(l.to_vec(), vec![3, 4, 5]);
-    }
-
-    #[test]
-    fn fd_layout_to_vec_includes_bypass_tcp_then_udp_then_observer() {
-        let l = sample_layout(2, 1, true);
-        // 3,4,5 fixed, 10,11 tcp, 100 udp4, 200 udp6, 999 observer
-        assert_eq!(l.to_vec(), vec![3, 4, 5, 10, 11, 100, 200, 999]);
-    }
-
-    #[test]
-    fn fd_layout_round_trip_no_bypass() {
-        let original = sample_layout(0, 0, false);
-        let parsed = FdLayout::from_vec(original.to_vec(), 0, 0, false).unwrap();
-        assert_eq!(parsed.https, original.https);
-        assert_eq!(parsed.http, original.http);
-        assert_eq!(parsed.dns, original.dns);
-        assert!(parsed.bypass_tcp.is_empty());
-        assert!(parsed.bypass_udp_v4.is_empty());
-        assert!(parsed.bypass_udp_v6.is_empty());
-        assert!(parsed.observer.is_none());
-    }
-
-    #[test]
-    fn fd_layout_round_trip_with_bypass_and_learn() {
-        let original = sample_layout(3, 2, true);
-        let parsed = FdLayout::from_vec(original.to_vec(), 3, 2, true).unwrap();
-        assert_eq!(parsed.https, 3);
-        assert_eq!(parsed.bypass_tcp, vec![10, 11, 12]);
-        assert_eq!(parsed.bypass_udp_v4, vec![100, 101]);
-        assert_eq!(parsed.bypass_udp_v6, vec![200, 201]);
-        assert_eq!(parsed.observer, Some(999));
-    }
-
-    #[test]
-    fn fd_layout_from_vec_rejects_short_buffer() {
-        // 3 fixed + 1 tcp + 0 udp + 0 observer = 4; pass only 3 bytes.
-        let err = FdLayout::from_vec(vec![3, 4, 5], 1, 0, false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("expected 4"), "got: {msg}");
-        assert!(msg.contains("got 3"), "got: {msg}");
-    }
-
-    #[test]
-    fn fd_layout_from_vec_rejects_long_buffer() {
-        // 3 fixed + 0 tcp + 0 udp + 0 observer = 3; pass 5 fds.
-        let err = FdLayout::from_vec(vec![3, 4, 5, 6, 7], 0, 0, false).unwrap_err();
-        assert!(err.to_string().contains("got 5"));
-    }
-
-    #[test]
-    fn fd_layout_expected_total_matches_to_vec_len() {
-        // The two paths must agree across every shape that the runtime
-        // can actually produce (small finite set).
-        for tcp in 0..4 {
-            for udp in 0..4 {
-                for learn in [false, true] {
-                    let layout = sample_layout(tcp, udp, learn);
-                    let total = FdLayout::expected_total(tcp, udp, learn);
-                    assert_eq!(
-                        layout.to_vec().len(),
-                        total,
-                        "tcp={tcp} udp={udp} learn={learn}: \
-                         expected_total disagrees with to_vec().len()"
-                    );
-                }
-            }
-        }
-    }
 }

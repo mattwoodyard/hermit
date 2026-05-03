@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use crate::home_files::HomeFileDirective;
 
 /// RAII wrapper for a raw file descriptor — closes on drop.
-struct OwnedFd(i32);
+pub struct OwnedFd(i32);
 
 impl OwnedFd {
-    fn raw(&self) -> i32 {
+    pub fn raw(&self) -> i32 {
         self.0
     }
 }
@@ -27,7 +27,7 @@ impl Drop for OwnedFd {
 }
 
 /// Where a passthrough path resides relative to ephemeral mounts.
-enum MountLocation {
+pub enum MountLocation {
     UnderHome,
     UnderTmp,
     /// Descendant of another passthrough entry (not $HOME or /tmp).
@@ -35,17 +35,17 @@ enum MountLocation {
 }
 
 /// Whether a passthrough path is a file or directory.
-enum EntryKind {
+pub enum EntryKind {
     File,
     Directory,
 }
 
 /// A saved fd to a path that needs to be bind-mounted through ephemeral layers.
-struct SavedFd {
+pub struct SavedFd {
     fd: OwnedFd,
-    path: PathBuf,
+    pub path: PathBuf,
     kind: EntryKind,
-    location: MountLocation,
+    pub location: MountLocation,
     readonly: bool,
 }
 
@@ -298,7 +298,7 @@ fn enter_namespace(net_isolate: bool) -> Result<()> {
 /// that's the namespace path the bind lands at. The fd is
 /// opened on the **source** — that's where the bytes actually
 /// live. For pass/read source == dest; for redirect they differ.
-fn save_passthrough_fds(
+pub(crate) fn save_passthrough_fds(
     entries: &[(&Path, &Path, bool)],
     home_dir: &Path,
 ) -> Result<Vec<SavedFd>> {
@@ -559,7 +559,7 @@ fn write_proc_or_skip(path: &str, content: &str, label: &str) -> Result<()> {
 /// link is followed once. The recursive directory walker does the
 /// same on every nested entry, so a symlink-to-directory inside a
 /// `copy` source is materialised as a directory tree.
-fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
     let meta = fs::metadata(src).with_context(|| {
         format!("failed to stat {} (symlink target may not exist)", src.display())
     })?;
@@ -577,7 +577,7 @@ fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Recursively copy a directory tree from `src` to `dest`.
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| {
         format!("failed to create dir {}", dest.display())
     })?;
@@ -592,7 +592,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Create an empty mount-point stub (file or dir) at `path`, including parent dirs.
-fn create_mount_stub(path: &Path, kind: &EntryKind) -> Result<()> {
+pub(crate) fn create_mount_stub(path: &Path, kind: &EntryKind) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!("failed to create parent dirs for stub {}", path.display())
@@ -642,7 +642,7 @@ fn get_locked_mount_flags(path: &Path) -> Result<MsFlags> {
 /// Uses O_PATH so it works for both files and directories. The fd keeps a
 /// reference to the real inode, allowing bind mounts via /proc/self/fd/<n>
 /// after ephemeral mounts cover the original path.
-fn open_path_fd(path: &Path) -> Result<OwnedFd> {
+pub(crate) fn open_path_fd(path: &Path) -> Result<OwnedFd> {
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
         .context("path contains null byte")?;
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
@@ -658,168 +658,36 @@ fn open_path_fd(path: &Path) -> Result<OwnedFd> {
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Wrappers around `namespace`'s private items for the dedicated
+/// test crate. Off by default; `hermit-tests` flips on the
+/// `__test_internals` feature in its `[dependencies]` entry.
+#[cfg(feature = "__test_internals")]
+#[doc(hidden)]
+pub mod __test_internals {
+    use super::{EntryKind, OwnedFd, SavedFd};
+    use anyhow::Result;
+    use std::path::Path;
 
-    #[test]
-    fn test_open_path_fd_directory() {
-        let fd = open_path_fd(Path::new("/tmp")).unwrap();
-        assert!(fd.raw() >= 0);
-        // fd closed automatically on drop
+    pub fn open_path_fd(path: &Path) -> Result<OwnedFd> {
+        super::open_path_fd(path)
     }
 
-    #[test]
-    fn test_open_path_fd_file() {
-        // /etc/hostname should exist on most Linux systems
-        let fd = open_path_fd(Path::new("/etc/hostname")).unwrap();
-        assert!(fd.raw() >= 0);
-        // fd closed automatically on drop
+    pub fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
+        super::copy_entry(src, dest)
     }
 
-    #[test]
-    fn test_open_path_fd_invalid_path() {
-        let result = open_path_fd(Path::new("/nonexistent_path_for_hermit_test"));
-        assert!(result.is_err());
+    pub fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+        super::copy_dir_recursive(src, dest)
     }
 
-    #[test]
-    fn test_workdir_relationship_detection() {
-        let home = Path::new("/home/user");
-        let under_home = Path::new("/home/user/project");
-        let is_home = Path::new("/home/user");
-        let unrelated = Path::new("/opt/build");
-
-        assert!(under_home.starts_with(home) && under_home != home);
-        assert!(!(is_home.starts_with(home) && is_home != home));
-        assert!(!unrelated.starts_with(home));
+    pub fn create_mount_stub(path: &Path, kind: &EntryKind) -> Result<()> {
+        super::create_mount_stub(path, kind)
     }
 
-    #[test]
-    fn test_copy_entry_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("source.txt");
-        let dest = dir.path().join("dest.txt");
-        fs::write(&src, "hello").unwrap();
-        copy_entry(&src, &dest).unwrap();
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
-    }
-
-    #[test]
-    fn test_copy_entry_dereferences_symlink() {
-        // Symlinks at `src` get dereferenced: the destination is a
-        // regular file holding the target's bytes, not another
-        // symlink. The host's symlink target may not exist inside
-        // the sandbox, so preserving the link would produce a
-        // dangling reference at the destination.
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target.txt");
-        let link = dir.path().join("link.txt");
-        let dest = dir.path().join("dest_link.txt");
-        fs::write(&target, "data").unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        copy_entry(&link, &dest).unwrap();
-
-        let meta = fs::symlink_metadata(&dest).unwrap();
-        assert!(!meta.is_symlink(), "destination must not preserve the symlink");
-        assert!(meta.is_file());
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "data");
-    }
-
-    #[test]
-    fn test_copy_entry_dangling_symlink_errors() {
-        // A symlink whose target was already deleted must not
-        // silently produce an empty file at the destination — the
-        // user gets a clear error so they can fix their `copy`
-        // directive instead of debugging mysterious empty files
-        // inside the sandbox.
-        let dir = tempfile::tempdir().unwrap();
-        let dangling = dir.path().join("dangling.txt");
-        let dest = dir.path().join("dest.txt");
-        std::os::unix::fs::symlink(dir.path().join("nope"), &dangling).unwrap();
-
-        let err = copy_entry(&dangling, &dest).unwrap_err();
-        assert!(
-            err.to_string().contains("failed to stat")
-                || err.to_string().contains("symlink target may not exist"),
-            "expected stat-failure context, got: {err:#}"
-        );
-        assert!(!dest.exists());
-    }
-
-    #[test]
-    fn test_copy_dir_recursive() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("srcdir");
-        let dest = dir.path().join("destdir");
-        fs::create_dir_all(src.join("sub")).unwrap();
-        fs::write(src.join("a.txt"), "aaa").unwrap();
-        fs::write(src.join("sub/b.txt"), "bbb").unwrap();
-
-        copy_dir_recursive(&src, &dest).unwrap();
-        assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "aaa");
-        assert_eq!(fs::read_to_string(dest.join("sub/b.txt")).unwrap(), "bbb");
-    }
-
-    #[test]
-    fn test_create_mount_stub_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("deep/nested/stub.txt");
-        create_mount_stub(&stub, &EntryKind::File).unwrap();
-        assert!(stub.is_file());
-        assert_eq!(fs::read_to_string(&stub).unwrap(), "");
-    }
-
-    #[test]
-    fn test_create_mount_stub_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("deep/nested/subdir");
-        create_mount_stub(&stub, &EntryKind::Directory).unwrap();
-        assert!(stub.is_dir());
-    }
-
-    #[test]
-    fn test_save_fds_descendant_of_another_entry() {
-        // When a path is a descendant of another entry (and not under $HOME or /tmp),
-        // it should still get an fd saved with UnderEntry location.
-        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
-        let parent = dir.path().to_path_buf();
-        let child = parent.join("child");
-        fs::create_dir_all(&child).unwrap();
-
-        let home = Path::new("/nonexistent_home_for_hermit_test");
-        let entries: Vec<(&Path, &Path, bool)> = vec![
-            (parent.as_path(), parent.as_path(), false),
-            (child.as_path(), child.as_path(), false),
-        ];
-        let saved = save_passthrough_fds(&entries, home).unwrap();
-
-        // parent is not under $HOME, /tmp, or another entry — skipped.
-        // child is a descendant of parent — saved as UnderEntry.
-        assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].path, child);
-        assert!(matches!(saved[0].location, MountLocation::UnderEntry));
-    }
-
-    #[test]
-    fn test_save_fds_sorted_ancestors_before_descendants() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let project = home.join("project");
-        let subdir = home.join("project/sub");
-        fs::create_dir_all(&subdir).unwrap();
-
-        // Pass in reverse order — subdir before project
-        let entries: Vec<(&Path, &Path, bool)> = vec![
-            (&subdir, &subdir, false),
-            (&project, &project, false),
-        ];
-        let saved = save_passthrough_fds(&entries, &home).unwrap();
-
-        // Both should be saved (under $HOME), and sorted with project before subdir
-        assert_eq!(saved.len(), 2);
-        assert_eq!(saved[0].path, project);
-        assert_eq!(saved[1].path, subdir);
+    pub fn save_passthrough_fds(
+        entries: &[(&Path, &Path, bool)],
+        home_dir: &Path,
+    ) -> Result<Vec<SavedFd>> {
+        super::save_passthrough_fds(entries, home_dir)
     }
 }

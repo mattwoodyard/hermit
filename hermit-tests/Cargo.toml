@@ -31,3 +31,5 @@ which = "7"
 tokio = { version = "1", features = ["full"] }
 rustables = "0.8"
 landlock = "0.4"
+clap = { version = "4", features = ["derive"] }
+sni-proxy = { path = "../sni-proxy" }
