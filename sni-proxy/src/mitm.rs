@@ -355,7 +355,7 @@ where
 }
 
 /// Build a rustls `ServerConfig` for the MITM handshake with the client.
-fn build_server_config(
+pub(crate) fn build_server_config(
     certified_key: Arc<rustls::sign::CertifiedKey>,
 ) -> Result<ServerConfig> {
     let mut config = ServerConfig::builder_with_provider(Arc::new(
@@ -433,14 +433,14 @@ use std::task::{self, Poll};
 /// A stream that first yields pre-buffered bytes, then reads from the
 /// underlying stream. Used to replay the ClientHello the listener
 /// already consumed when peeking SNI.
-struct PrefixedStream<S> {
+pub(crate) struct PrefixedStream<S> {
     prefix: Vec<u8>,
     offset: usize,
     inner: S,
 }
 
 impl<S> PrefixedStream<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self {
             prefix,
             offset: 0,
@@ -555,7 +555,7 @@ pub async fn apply_injection(
 /// - We deliberately do NOT compare against `request.path`'s
 ///   absolute-form authority (RFC 7230 §5.3.2) — that's a proxy
 ///   form the MITM never sees from a TLS-terminated client.
-fn host_matches_sni(host_header: Option<&str>, sni: &str) -> bool {
+pub(crate) fn host_matches_sni(host_header: Option<&str>, sni: &str) -> bool {
     let host = match host_header {
         Some(h) => http::host_without_port(h),
         None => return false,
@@ -588,94 +588,40 @@ fn build_match_request(
     builder.body(()).ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncReadExt;
+#[cfg(feature = "__test_internals")]
+#[doc(hidden)]
+pub mod __test_internals {
+    use super::{build_server_config, host_matches_sni, PrefixedStream, StaticCertResolver};
+    use anyhow::Result;
+    use rustls::sign::CertifiedKey;
+    use rustls::ServerConfig;
+    use std::sync::Arc;
+    use tokio::io::AsyncRead;
 
-    #[test]
-    fn static_cert_resolver_returns_cert() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let ca = CertificateAuthority::new().unwrap();
-        let ck = ca.cert_for_host("example.com").unwrap();
-        let _resolver = StaticCertResolver(ck.clone());
-
-        // Building the server config exercises the resolver
-        // through rustls' constructor.
-        let config = build_server_config(ck).unwrap();
-        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    pub fn build_server_config_for_test(ck: Arc<CertifiedKey>) -> Result<ServerConfig> {
+        build_server_config(ck)
     }
 
-    #[tokio::test]
-    async fn prefixed_stream_replays_then_reads() {
-        let prefix = b"hello ".to_vec();
-        let inner: &[u8] = b"world";
-        let mut stream = PrefixedStream::new(prefix, inner);
-
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"hello world");
+    pub fn host_matches_sni_for_test(host_header: Option<&str>, sni: &str) -> bool {
+        host_matches_sni(host_header, sni)
     }
 
-    #[tokio::test]
-    async fn prefixed_stream_empty_prefix() {
-        let prefix = Vec::new();
-        let inner: &[u8] = b"just inner";
-        let mut stream = PrefixedStream::new(prefix, inner);
-
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"just inner");
+    /// Wrap `inner` in a `PrefixedStream` that replays `prefix` first.
+    /// Returns `impl AsyncRead + Unpin` so callers don't need to name
+    /// the generic; a `'static` bound on `S` keeps the returned stream
+    /// usable across `await` points without extra lifetimes.
+    pub fn prefixed_stream<S>(prefix: Vec<u8>, inner: S) -> impl AsyncRead + Unpin + 'static
+    where
+        S: AsyncRead + Unpin + 'static,
+    {
+        PrefixedStream::new(prefix, inner)
     }
 
-    #[test]
-    fn host_matches_sni_exact() {
-        assert!(host_matches_sni(Some("api.example.com"), "api.example.com"));
-    }
-
-    #[test]
-    fn host_matches_sni_case_insensitive() {
-        // DNS is case-insensitive and clients send mixed case.
-        assert!(host_matches_sni(Some("API.Example.COM"), "api.example.com"));
-    }
-
-    #[test]
-    fn host_matches_sni_with_port_strips_port() {
-        assert!(host_matches_sni(Some("api.example.com:8443"), "api.example.com"));
-    }
-
-    #[test]
-    fn host_matches_sni_rejects_different_host() {
-        // The motivating threat: SNI says api.example.com (so the
-        // access-control rule for that host applies) but the inner
-        // request claims to be for evil.example.com — MUST be
-        // rejected so the inject path can't pick a different rule
-        // than the access path checked.
-        assert!(!host_matches_sni(Some("evil.example.com"), "api.example.com"));
-    }
-
-    #[test]
-    fn host_matches_sni_rejects_subdomain_mismatch() {
-        // Subdomain mismatch is still a mismatch — the access
-        // control rule was for the SNI authority, not its parent.
-        assert!(!host_matches_sni(Some("foo.api.example.com"), "api.example.com"));
-        assert!(!host_matches_sni(Some("api.example.com"), "other.example.com"));
-    }
-
-    #[test]
-    fn host_matches_sni_missing_host_is_mismatch() {
-        // HTTP/1.1 requires Host; absence is conservatively treated
-        // as a mismatch so the request is rejected with 421 rather
-        // than silently injecting against the SNI fallback.
-        assert!(!host_matches_sni(None, "api.example.com"));
-    }
-
-    #[test]
-    fn host_matches_sni_ipv6_with_port() {
-        // host_without_port keeps the brackets on bracketed IPv6
-        // and strips a trailing :port. The SNI side is the bare
-        // hostname in our usage — IPv6 SNI is rare but bracketed
-        // and unbracketed forms must compare consistently.
-        assert!(host_matches_sni(Some("[::1]:8443"), "[::1]"));
+    /// Construct a `StaticCertResolver` and immediately drop it —
+    /// exercises that the type's constructor is reachable for the
+    /// `static_cert_resolver_returns_cert` test which only needs to
+    /// witness that the type exists.
+    pub fn touch_static_cert_resolver(ck: Arc<CertifiedKey>) {
+        let _ = StaticCertResolver(ck);
     }
 }

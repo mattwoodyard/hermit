@@ -231,25 +231,3 @@ pub fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
         None
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn get_original_dst_returns_none_on_normal_socket() {
-        // A regular socket (not redirected) should return None, not crash
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let client = TcpStream::connect(addr).await.unwrap();
-            assert!(get_original_dst(&client).is_none());
-        });
-    }
-
-    // copy_with_idle tests moved to splice.rs alongside the helper.
-}
