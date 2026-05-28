@@ -674,6 +674,12 @@ fn child_proxied_setup(
     // before the MITM/HTTP/bypass rules ever fire. See
     // `netns::add_nft_redirect_all_tcp` for the full reasoning.
     netns::bring_up_loopback()?;
+    // A `default dev lo` route in both families is the precondition
+    // for OUTPUT NAT to fire — without it the kernel's initial route
+    // lookup for `sendto(<real-ip>:NNNN)` returns ENETUNREACH and the
+    // nft DNAT rules below never get a chance to rewrite. See the
+    // docstring on `netns::add_default_route_via_lo`.
+    netns::add_default_route_via_lo()?;
     netns::ensure_nft_nat_table()?;
     let mut nft_plan = NftPlan::default();
     netns::add_nft_redirect(HTTPS_PORT, PROXY_LISTEN_PORT)?;

@@ -5,7 +5,8 @@
 //! `__test_internals` feature).
 
 use hermit::netns::__test_internals::{
-    check_netlink_acks, hermit_table, output_chain, set_interface_up, TABLE_NAME,
+    build_default_route_msg, check_netlink_acks, hermit_table, output_chain,
+    set_interface_up, TABLE_NAME,
 };
 use rustables::{
     expr::{Immediate, Nat, NatType, Register},
@@ -121,7 +122,7 @@ fn check_netlink_acks_returns_error_for_negative_errno() {
     let buf = nlmsgerr(-(libc::EEXIST));
     let err = check_netlink_acks(&buf).expect_err("nonzero errno must fail");
     let msg = err.to_string();
-    assert!(msg.contains("nftables netlink error"), "got: {msg}");
+    assert!(msg.contains("netlink error"), "got: {msg}");
     // The os_error formatting for EEXIST mentions "exists".
     assert!(msg.to_lowercase().contains("exist"), "got: {msg}");
 }
@@ -134,7 +135,7 @@ fn check_netlink_acks_walks_multipart_to_first_error() {
     buf.extend(nlmsgerr(-(libc::EINVAL)));
     let err = check_netlink_acks(&buf)
         .expect_err("error in third position must surface");
-    assert!(err.to_string().contains("nftables netlink error"));
+    assert!(err.to_string().contains("netlink error"));
 }
 
 #[test]
@@ -192,7 +193,85 @@ fn check_netlink_acks_aligns_message_offsets_to_4_bytes() {
     buf.extend(nlmsgerr(-(libc::EPERM)));
     let err = check_netlink_acks(&buf)
         .expect_err("error after misaligned message must still surface");
-    assert!(err.to_string().contains("nftables netlink error"));
+    assert!(err.to_string().contains("netlink error"));
+}
+
+// --- build_default_route_msg layout tests ----------------------------
+//
+// The kernel parses these bytes as rtnetlink expects: native byte
+// order, 4-byte alignment, fixed offsets for nlmsghdr / rtmsg, then
+// a sequence of rtattr TLVs. We verify each offset independently so
+// a regression in the layout fails on a specific field, not on a
+// 36-byte hex dump diff.
+
+#[test]
+fn default_route_msg_is_36_bytes() {
+    let buf = build_default_route_msg(libc::AF_INET as u8, 1);
+    assert_eq!(buf.len(), 36);
+    // Header advertises the full length.
+    let advertised = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+    assert_eq!(advertised, 36);
+}
+
+#[test]
+fn default_route_msg_header_has_request_create_ack_flags() {
+    let buf = build_default_route_msg(libc::AF_INET as u8, 1);
+    let msg_type = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+    let flags = u16::from_ne_bytes(buf[6..8].try_into().unwrap());
+    assert_eq!(msg_type, libc::RTM_NEWROUTE);
+    let expected: u16 =
+        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16;
+    assert_eq!(
+        flags, expected,
+        "RTM_NEWROUTE must carry REQUEST|CREATE|ACK; got 0x{flags:04x}"
+    );
+}
+
+#[test]
+fn default_route_msg_rtmsg_is_default_unicast_via_device() {
+    let buf = build_default_route_msg(libc::AF_INET as u8, 42);
+    assert_eq!(buf[16], libc::AF_INET as u8, "rtm_family");
+    assert_eq!(buf[17], 0, "rtm_dst_len = 0 — this is the default route");
+    assert_eq!(buf[18], 0, "rtm_src_len");
+    assert_eq!(buf[19], 0, "rtm_tos");
+    assert_eq!(buf[20], libc::RT_TABLE_MAIN, "rtm_table");
+    assert_eq!(buf[21], libc::RTPROT_BOOT, "rtm_protocol");
+    assert_eq!(
+        buf[22],
+        libc::RT_SCOPE_LINK,
+        "rtm_scope=LINK — on-link via device, no gateway"
+    );
+    assert_eq!(buf[23], libc::RTN_UNICAST, "rtm_type");
+    assert_eq!(&buf[24..28], &0u32.to_ne_bytes(), "rtm_flags = 0");
+}
+
+#[test]
+fn default_route_msg_v6_family_byte_changes() {
+    let v4 = build_default_route_msg(libc::AF_INET as u8, 1);
+    let v6 = build_default_route_msg(libc::AF_INET6 as u8, 1);
+    assert_eq!(v4[16], libc::AF_INET as u8);
+    assert_eq!(v6[16], libc::AF_INET6 as u8);
+    // Every other byte should match — the message is otherwise family-agnostic.
+    let mut v4_no_family = v4;
+    let mut v6_no_family = v6;
+    v4_no_family[16] = 0;
+    v6_no_family[16] = 0;
+    assert_eq!(
+        v4_no_family, v6_no_family,
+        "only rtm_family should differ between v4 and v6 messages"
+    );
+}
+
+#[test]
+fn default_route_msg_carries_rta_oif_with_ifindex() {
+    let buf = build_default_route_msg(libc::AF_INET as u8, 0xdead_beef);
+    // RTA_OIF attribute starts at offset 28.
+    let rta_len = u16::from_ne_bytes(buf[28..30].try_into().unwrap());
+    let rta_type = u16::from_ne_bytes(buf[30..32].try_into().unwrap());
+    let payload = u32::from_ne_bytes(buf[32..36].try_into().unwrap());
+    assert_eq!(rta_len, 8, "rtattr len = 4-byte header + 4-byte u32 payload");
+    assert_eq!(rta_type, libc::RTA_OIF, "attribute type");
+    assert_eq!(payload, 0xdead_beef, "ifindex round-trips through the message");
 }
 
 #[test]

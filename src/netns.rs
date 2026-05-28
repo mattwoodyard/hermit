@@ -5,13 +5,16 @@
 //!
 //! nftables rules are programmed directly via netlink (the `rustables`
 //! crate). There is no dependency on an external `nft` binary — hermit
-//! talks to the kernel's netfilter subsystem itself.
+//! talks to the kernel's netfilter subsystem itself. Routes are added
+//! the same way, via raw rtnetlink messages over an `AF_NETLINK` /
+//! `NETLINK_ROUTE` socket.
 //!
 //! Each function does one thing and can be composed in the caller:
 //!
 //! ```no_run
 //! # use hermit::netns;
 //! netns::bring_up_loopback()?;
+//! netns::add_default_route_via_lo()?;
 //! netns::add_nft_redirect(443, 1443)?;
 //! netns::add_nft_redirect(80, 1080)?;
 //! # Ok::<(), anyhow::Error>(())
@@ -105,6 +108,154 @@ pub(crate) fn set_interface_up(sock: i32, ifname: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Routing — programmed via rtnetlink, not the iproute2 binary
+// ---------------------------------------------------------------------------
+
+/// Add an IPv4 and IPv6 default route via `lo` in the current network
+/// namespace.
+///
+/// **Why this is load-bearing.** A freshly-created netns has no
+/// non-loopback routes. For a locally-generated packet to *any*
+/// non-loopback destination, the kernel's initial route lookup runs
+/// *before* the OUTPUT NAT chain — so `sendto(<real-ip>:NNNN)` fails
+/// with ENETUNREACH at the route-lookup stage, and the nft DNAT
+/// rules installed by [`add_nft_redirect`] / [`add_nft_redirect_udp`]
+/// never get a chance to rewrite the destination to a loopback
+/// address. The rules sit installed but silently dead.
+///
+/// Installing a `default dev lo` route makes that initial lookup
+/// succeed — egress goes to `lo` — at which point OUTPUT NAT runs,
+/// DNAT rewrites the destination to `127.0.0.1:<relay_port>`, and
+/// `ip_route_me_harder` re-routes to the now-local destination.
+///
+/// Without DNAT (i.e. for destinations no rule matches), packets
+/// still go to `lo` with their original destination address; nobody
+/// is listening on those names so the kernel drops them or sends an
+/// ICMP unreachable back to the sender — which is the desired
+/// sandbox-deny behavior anyway.
+///
+/// Call after [`bring_up_loopback`] and before any nft setup.
+pub fn add_default_route_via_lo() -> Result<()> {
+    info!("netns: adding default routes via lo (v4 + v6)");
+    let ifindex = lo_ifindex().context("looking up lo ifindex")?;
+    debug!("netns: lo ifindex = {}", ifindex);
+    add_default_unicast_route(libc::AF_INET as u8, ifindex)
+        .context("adding IPv4 default route via lo")?;
+    add_default_unicast_route(libc::AF_INET6 as u8, ifindex)
+        .context("adding IPv6 default route via lo")?;
+    Ok(())
+}
+
+/// Resolve the kernel's interface index for `lo`. In a fresh netns
+/// `lo` is always present and conventionally index 1, but we look it
+/// up rather than hard-code it so a kernel that ever shuffles
+/// indexes (or names) doesn't silently produce a misaligned route.
+fn lo_ifindex() -> Result<u32> {
+    let cname = std::ffi::CString::new("lo").expect("lo has no nul bytes");
+    let ix = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if ix == 0 {
+        bail!(
+            "if_nametoindex(lo) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(ix)
+}
+
+/// Send one RTM_NEWROUTE for a default unicast route via the given
+/// ifindex in `family` (`AF_INET` or `AF_INET6`).
+fn add_default_unicast_route(family: u8, ifindex: u32) -> Result<()> {
+    use nix::sys::socket::{
+        self, AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType,
+    };
+
+    let msg = build_default_route_msg(family, ifindex);
+
+    let sock = socket::socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::empty(),
+        SockProtocol::NetlinkRoute,
+    )
+    .context("opening rtnetlink socket")?;
+    socket::bind(sock.as_raw_fd(), &NetlinkAddr::new(0, 0))
+        .context("binding rtnetlink socket")?;
+
+    // Same 5s ceiling as `send_batch` so a missing reply can't hang us.
+    let timeout = nix::sys::time::TimeVal::new(5, 0);
+    socket::setsockopt(&sock, nix::sys::socket::sockopt::ReceiveTimeout, &timeout)
+        .context("setting SO_RCVTIMEO on rtnetlink socket")?;
+
+    let mut sent = 0;
+    while sent < msg.len() {
+        let n = socket::send(sock.as_raw_fd(), &msg[sent..], MsgFlags::empty())
+            .context("rtnetlink send")?;
+        if n == 0 {
+            bail!("rtnetlink send returned 0 bytes");
+        }
+        sent += n;
+    }
+
+    // NLM_F_ACK is set in `build_default_route_msg`, so the kernel
+    // sends exactly one `nlmsgerr` (error=0 on success). One blocking
+    // recv is enough — we don't need the drain loop `send_batch` uses
+    // for multi-message batches.
+    let mut buf = [0u8; 4096];
+    let n = socket::recv(sock.as_raw_fd(), &mut buf, MsgFlags::empty())
+        .context("rtnetlink recv (ack)")?;
+    check_netlink_acks(&buf[..n]).context("ack from rtnetlink RTM_NEWROUTE")?;
+    Ok(())
+}
+
+/// Serialize an RTM_NEWROUTE message for `default via <ifindex>` in
+/// `family` (`AF_INET` or `AF_INET6`). Pure function — split out so
+/// the layout can be unit-tested without holding CAP_NET_ADMIN.
+///
+/// Wire layout (36 bytes, all multi-byte fields in native byte order
+/// per netlink convention):
+///
+/// ```text
+///   0..16   nlmsghdr      len=36, type=RTM_NEWROUTE,
+///                         flags=REQUEST|CREATE|ACK
+///  16..28   rtmsg         family, dst_len=0 (default), src_len=0,
+///                         tos=0, table=MAIN, protocol=BOOT,
+///                         scope=LINK (device-only, no gateway),
+///                         type=UNICAST, flags=0
+///  28..36   rtattr RTA_OIF  len=8, type=4, payload=ifindex (u32)
+/// ```
+pub(crate) fn build_default_route_msg(family: u8, ifindex: u32) -> [u8; 36] {
+    const TOTAL_LEN: u32 = 36;
+    let mut buf = [0u8; 36];
+
+    // --- nlmsghdr ---
+    buf[0..4].copy_from_slice(&TOTAL_LEN.to_ne_bytes());
+    buf[4..6].copy_from_slice(&libc::RTM_NEWROUTE.to_ne_bytes());
+    let flags: u16 =
+        (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16;
+    buf[6..8].copy_from_slice(&flags.to_ne_bytes());
+    // seq + pid stay zero — kernel doesn't validate them for non-dump requests.
+
+    // --- rtmsg (starts at offset 16) ---
+    buf[16] = family; // rtm_family
+    buf[17] = 0; // rtm_dst_len  — 0 = default route
+    buf[18] = 0; // rtm_src_len
+    buf[19] = 0; // rtm_tos
+    buf[20] = libc::RT_TABLE_MAIN; // rtm_table
+    buf[21] = libc::RTPROT_BOOT; // rtm_protocol
+    buf[22] = libc::RT_SCOPE_LINK; // rtm_scope — on-link via device
+    buf[23] = libc::RTN_UNICAST; // rtm_type
+    // rtm_flags (24..28) stays zero.
+
+    // --- rtattr RTA_OIF (starts at offset 28) ---
+    let rta_len: u16 = 8;
+    buf[28..30].copy_from_slice(&rta_len.to_ne_bytes());
+    buf[30..32].copy_from_slice(&libc::RTA_OIF.to_ne_bytes());
+    buf[32..36].copy_from_slice(&ifindex.to_ne_bytes());
+
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +386,7 @@ pub(crate) fn check_netlink_acks(buf: &[u8]) -> Result<()> {
                 // Kernel reports negative errno; flip the sign for the os_error.
                 let errno = -err;
                 bail!(
-                    "nftables netlink error: {}",
+                    "netlink error: {}",
                     std::io::Error::from_raw_os_error(errno)
                 );
             }
@@ -559,6 +710,10 @@ pub mod __test_internals {
 
     pub fn check_netlink_acks(buf: &[u8]) -> Result<()> {
         super::check_netlink_acks(buf)
+    }
+
+    pub fn build_default_route_msg(family: u8, ifindex: u32) -> [u8; 36] {
+        super::build_default_route_msg(family, ifindex)
     }
 }
 
