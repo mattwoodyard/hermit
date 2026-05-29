@@ -365,6 +365,89 @@ async fn full_relay_round_trips_v6() {
 }
 
 #[tokio::test]
+async fn two_concurrent_first_packets_coalesce_to_one_session() {
+    // Race regression: two datagrams from the same src arriving
+    // back-to-back used to both find no session, both bind a
+    // fresh outbound, both insert — with the second clobbering
+    // the first and orphaning its outbound + reader. After the
+    // fix the second caller waits on the sessions lock, takes
+    // the fast path on the entry the first one installed, and
+    // both packets egress from the *same* upstream-side source
+    // port.
+    let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    enable_recv_orig_dst(listener.as_raw_fd(), IpFamily::V4).unwrap();
+    let listener_fd = listener.as_raw_fd();
+
+    let cache = Arc::new(DnsCache::new());
+    cache.insert(
+        "localhost",
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Duration::from_secs(60),
+    );
+    let config = Arc::new(sample_config(
+        upstream_addr.port(),
+        Arc::clone(&cache),
+        single_bypass_ruleset("localhost", upstream_addr.port()),
+    ));
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+
+    // We never read from this socket, but it has to exist so the
+    // src address in the RecvPackets is a real bindable endpoint
+    // (matches what a real recvmsg would surface).
+    let child = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let child_addr = child.local_addr().unwrap();
+
+    let p1 = RecvPacket {
+        data: b"a".to_vec(),
+        src: child_addr,
+        orig_dst: Some(upstream_addr),
+    };
+    let p2 = RecvPacket {
+        data: b"b".to_vec(),
+        src: child_addr,
+        orig_dst: Some(upstream_addr),
+    };
+
+    tokio::join!(
+        handle_datagram(
+            listener_fd,
+            IpFamily::V4,
+            p1,
+            Arc::clone(&config),
+            Arc::clone(&sessions),
+        ),
+        handle_datagram(
+            listener_fd,
+            IpFamily::V4,
+            p2,
+            Arc::clone(&config),
+            Arc::clone(&sessions),
+        ),
+    );
+
+    // Both packets must have reached upstream from the same
+    // outbound socket — i.e. the same source port.
+    let mut buf = [0u8; 64];
+    let (_, from1) = tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut buf))
+        .await
+        .expect("first packet never reached upstream")
+        .unwrap();
+    let (_, from2) = tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut buf))
+        .await
+        .expect("second packet never reached upstream")
+        .unwrap();
+    assert_eq!(
+        from1, from2,
+        "concurrent first-packets must share one outbound socket"
+    );
+    assert_eq!(sessions.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn denied_packet_does_not_create_a_session() {
     // Policy denies (empty cache) → no outbound socket, no
     // session-table entry.

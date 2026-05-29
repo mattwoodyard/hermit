@@ -190,25 +190,40 @@ pub async fn handle_datagram(
         return;
     };
 
+    // Hold the sessions lock through the whole slow path. Two
+    // datagrams from the same src arriving back-to-back used to
+    // both find no session, both bind a fresh outbound, both insert
+    // — with the second clobbering the first, leaking its outbound
+    // and reader. Serializing here means the second caller waits
+    // for the first to finish creating the entry, then takes the
+    // fast path. authorize / bind / send are all sub-millisecond,
+    // so cross-src contention is negligible.
+    let mut table = sessions.lock().await;
+
     // Fast path: already have a session for this (src) → just send.
-    // Updating `last_activity` under the lock keeps eviction honest.
-    {
-        let mut table = sessions.lock().await;
-        if let Some(sess) = table.get_mut(&pkt.src) {
-            sess.last_activity = Instant::now();
-            trace!(src = ?pkt.src, ?orig_dst, bytes = pkt.data.len(),
-                "bypass-udp: session hit; forwarding on existing outbound");
-            if let Err(e) = sess.outbound.send_to(&pkt.data, orig_dst).await {
-                warn!(?pkt.src, ?orig_dst, error = %e,
-                    "bypass-udp: upstream send on existing session failed");
-            }
-            return;
+    if let Some(sess) = table.get_mut(&pkt.src) {
+        sess.last_activity = Instant::now();
+        let outbound = Arc::clone(&sess.outbound);
+        drop(table); // don't hold the lock across the upstream send
+        trace!(src = ?pkt.src, ?orig_dst, bytes = pkt.data.len(),
+            "bypass-udp: session hit; forwarding on existing outbound");
+        if let Err(e) = outbound.send_to(&pkt.data, orig_dst).await {
+            warn!(?pkt.src, ?orig_dst, error = %e,
+                "bypass-udp: upstream send on existing session failed");
         }
+        return;
     }
+
+    // Slow path. Enforce the cap up front so an over-cap drop
+    // doesn't leak an initial upstream send + bound outbound.
+    if table.len() >= MAX_SESSIONS {
+        warn!(session_count = table.len(),
+            "bypass-udp: session cap reached; dropping new flow");
+        return;
+    }
+
     debug!(src = ?pkt.src, ?orig_dst, port = config.port,
         "bypass-udp: session miss; authorizing new flow");
-
-    // Miss: authorize this flow before spending a socket on it.
     if !authorize(&config, &pkt.src, orig_dst).await {
         return;
     }
@@ -233,28 +248,18 @@ pub async fn handle_datagram(
         return;
     }
 
-    // Register the session *before* spawning the reader so a rapid
-    // second datagram from the same src uses the same outbound
-    // socket. Enforces the session cap too.
     let outbound_local = outbound.local_addr().ok();
-    {
-        let mut table = sessions.lock().await;
-        if table.len() >= MAX_SESSIONS {
-            warn!(session_count = table.len(),
-                "bypass-udp: session cap reached; dropping new flow");
-            return;
-        }
-        table.insert(
-            pkt.src,
-            Session {
-                outbound: Arc::clone(&outbound),
-                last_activity: Instant::now(),
-            },
-        );
-        debug!(src = ?pkt.src, ?orig_dst, ?outbound_local,
-            total_sessions = table.len(),
-            "bypass-udp: session created");
-    }
+    table.insert(
+        pkt.src,
+        Session {
+            outbound: Arc::clone(&outbound),
+            last_activity: Instant::now(),
+        },
+    );
+    debug!(src = ?pkt.src, ?orig_dst, ?outbound_local,
+        total_sessions = table.len(),
+        "bypass-udp: session created");
+    drop(table); // release before spawning so other srcs can proceed
 
     // Spawn the upstream-reader task. It lives until the session
     // idles out; on exit it removes its entry from the table.
