@@ -350,6 +350,77 @@ async fn write_counter_is_zero_when_no_writes_attempted() {
 }
 
 #[tokio::test]
+async fn relay_does_not_hang_when_upstream_rsts() {
+    // Smoke test for the close-forwarding path: when upstream
+    // forcibly RSTs, the relay must finish promptly. This won't
+    // catch the FIN-vs-RST distinction (see the
+    // shutdown(SHUT_RDWR) fix and its commit message for the
+    // kernel-level reasoning), but it does catch the
+    // worst-case regression where copy_bidirectional's error
+    // path stalls indefinitely instead of returning.
+    use std::os::fd::AsRawFd;
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let upstream_task = tokio::spawn(async move {
+        let (s, _) = upstream.accept().await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        // SO_LINGER 0 + drop forces RST on the wire.
+        let std_s = s.into_std().unwrap();
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        unsafe {
+            libc::setsockopt(
+                std_s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const _,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            );
+        }
+        drop(std_s);
+    });
+
+    let pair = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pair_addr = pair.local_addr().unwrap();
+    let (accept_res, connect_res) =
+        tokio::join!(pair.accept(), TcpStream::connect(pair_addr));
+    let (server_side, _) = accept_res.unwrap();
+    let _client_side = connect_res.unwrap();
+
+    let cache = Arc::new(DnsCache::new());
+    cache.insert(
+        "localhost",
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        StdDuration::from_secs(60),
+    );
+    let config = BypassTcpConfig {
+        port: upstream_port,
+        rules: single_bypass_ruleset("localhost", BypassProtocol::Tcp, upstream_port),
+        cache,
+        connector: Arc::new(DirectConnector),
+        block_log: BlockLogger::disabled(),
+    };
+
+    let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    let relay = tokio::spawn(async move {
+        let _ = handle_connection_at(
+            server_side,
+            client_addr,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            upstream_port,
+            &config,
+        )
+        .await;
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(2), relay)
+        .await
+        .expect("relay must return promptly after upstream RSTs")
+        .unwrap();
+    let _ = upstream_task.await;
+}
+
+#[tokio::test]
 async fn tcp_info_reports_established_on_live_loopback_pair() {
     // Surface check for the diagnostic helper used to enrich the
     // splice-end / splice-error log line. The shape we care about:

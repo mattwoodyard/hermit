@@ -267,6 +267,27 @@ where
             upstream_retrans = tcp_info_field(&ui, |i| i.tcpi_total_retrans),
             "bypass-tcp: splice error"),
     }
+
+    // Belt-and-suspenders close. `copy_bidirectional` only calls
+    // shutdown(SHUT_WR) on a side when the *other* side returned a
+    // clean EOF; on the error path (upstream RST mid-stream, etc.)
+    // it propagates the first failing direction's Err and skips
+    // the unrelated side entirely. The peer that wasn't told then
+    // sits in CLOSE_WAIT until handle_connection_at returns and
+    // Drop closes the fd — and if any unread bytes remain in the
+    // recv buffer at that moment, the kernel's close path emits
+    // RST instead of FIN. The child app sees "connection reset by
+    // peer" instead of a clean EOF.
+    //
+    // shutdown(SHUT_RDWR) cleanly resolves both: it emits FIN if
+    // not already sent, and discards the recv buffer so the later
+    // close() on drop has nothing to RST about. Idempotent /
+    // harmless on a side that's already fully closed; we ignore
+    // the return code on purpose (EBADF / ENOTCONN are both fine).
+    unsafe {
+        libc::shutdown(client_fd, libc::SHUT_RDWR);
+        libc::shutdown(upstream_fd, libc::SHUT_RDWR);
+    }
     Ok(())
 }
 
