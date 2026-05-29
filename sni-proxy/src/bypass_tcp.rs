@@ -19,11 +19,14 @@
 //! were resolved through hermit DNS.
 
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -176,7 +179,7 @@ where
     debug!(%client_addr, dial_target = %dial_target, %dst_ip, port = dst_port,
         "bypass-tcp: dialing upstream");
 
-    let mut upstream = match timeout(
+    let upstream = match timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         config.connector.connect(&dial_target, dst_port, None),
     )
@@ -203,17 +206,115 @@ where
     // data transfer — not the request/response pattern typical of
     // LDAP/SSH/Kerberos. Swap to a splice-based implementation if
     // throughput ever shows up in a profile.
+    //
+    // The streams are wrapped in `WriteCounter` so we can log how
+    // many bytes flowed in each direction *even when the splice
+    // returns Err* — `copy_bidirectional` discards its partial
+    // counts on error, which is exactly when knowing "did anything
+    // flow before the RST?" matters most for debugging.
+    let c2u_counter = Arc::new(AtomicU64::new(0));
+    let u2c_counter = Arc::new(AtomicU64::new(0));
+    let mut client_wrapped = WriteCounter::new(client, Arc::clone(&u2c_counter));
+    let mut upstream_wrapped = WriteCounter::new(upstream, Arc::clone(&c2u_counter));
+
     let splice_start = std::time::Instant::now();
     debug!(%client_addr, %dial_target, port = dst_port,
         "bypass-tcp: splice begin");
-    let splice = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    let splice =
+        tokio::io::copy_bidirectional(&mut client_wrapped, &mut upstream_wrapped).await;
     let elapsed_ms = splice_start.elapsed().as_millis();
+    let c2u = c2u_counter.load(Ordering::Relaxed);
+    let u2c = u2c_counter.load(Ordering::Relaxed);
     match splice {
-        Ok((c2u, u2c)) => debug!(%client_addr, %dial_target, port = dst_port,
+        Ok(_) => debug!(%client_addr, %dial_target, port = dst_port,
             client_to_upstream_bytes = c2u, upstream_to_client_bytes = u2c,
             elapsed_ms, "bypass-tcp: splice end"),
         Err(ref e) => debug!(%client_addr, %dial_target, port = dst_port,
+            client_to_upstream_bytes = c2u, upstream_to_client_bytes = u2c,
             elapsed_ms, error = %e, "bypass-tcp: splice error"),
     }
     Ok(())
+}
+
+/// `AsyncRead + AsyncWrite` adapter that ticks a shared counter on
+/// every successful `poll_write`. Reads pass through untouched.
+///
+/// Used to surface partial byte counts on the bypass-tcp splice
+/// error path — `tokio::io::copy_bidirectional` only returns counts
+/// on success, but the symptom we most often want to diagnose
+/// ("relay started, then RST mid-stream") happens on the error
+/// branch. Wrapping both sides of the splice with a `WriteCounter`
+/// pointed at the *other* side's accounting variable gives us
+/// per-direction byte totals regardless of how the splice ended.
+struct WriteCounter<S> {
+    inner: S,
+    bytes_written: Arc<AtomicU64>,
+}
+
+impl<S> WriteCounter<S> {
+    fn new(inner: S, bytes_written: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes_written }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteCounter<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteCounter<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            self.bytes_written.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Test-only wrappers around `bypass_tcp`'s private items.
+/// Off by default; `sni-proxy-tests` flips on `__test_internals`.
+#[cfg(feature = "__test_internals")]
+#[doc(hidden)]
+pub mod __test_internals {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    /// Construct the private `WriteCounter` wrapper for tests. Returns
+    /// it as an opaque `AsyncRead + AsyncWrite` so the struct itself
+    /// stays unexported — tests exercise it through the trait surface,
+    /// which is what real callers use too.
+    pub fn write_counter<S>(
+        inner: S,
+        bytes: Arc<AtomicU64>,
+    ) -> impl AsyncRead + AsyncWrite + Unpin
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        super::WriteCounter::new(inner, bytes)
+    }
 }

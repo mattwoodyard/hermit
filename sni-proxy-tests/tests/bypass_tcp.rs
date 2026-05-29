@@ -1,14 +1,16 @@
 //! Tests for `sni_proxy::bypass_tcp`. `BypassTcpConfig`,
 //! `handle_connection_at`, and the `RuleSet`/`IpRule`/`AccessRule`
-//! types are all part of the public API — no `__test_internals`
-//! wrappers needed.
+//! types are all part of the public API. The private `WriteCounter`
+//! adapter is reached through `__test_internals::write_counter`.
 
 use sni_proxy::block_log::BlockLogger;
+use sni_proxy::bypass_tcp::__test_internals::write_counter;
 use sni_proxy::bypass_tcp::{handle_connection_at, BypassTcpConfig};
 use sni_proxy::connector::DirectConnector;
 use sni_proxy::dns_cache::DnsCache;
 use sni_proxy::policy::{AccessRule, BypassProtocol, IpRule, Mechanism, RuleSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -276,4 +278,100 @@ async fn udp_rule_does_not_match_tcp_listener() {
     )
     .await;
     assert!(result.is_ok());
+}
+
+// --- WriteCounter tests ----------------------------------------------
+//
+// Surface check for the adapter used to log per-direction byte
+// totals on the splice path even when `copy_bidirectional` returns
+// an error. We exercise it through the public AsyncRead/AsyncWrite
+// surface so the test matches how the real callers use it.
+
+#[tokio::test]
+async fn write_counter_ticks_on_successful_writes() {
+    // duplex(64) is an in-memory pair that's both AsyncRead +
+    // AsyncWrite, matching the trait bound the real call site
+    // (TcpStream) carries. We drain the peer in a task so the
+    // 64-byte buffer never back-pressures and our writes complete
+    // synchronously.
+    let (a, b) = tokio::io::duplex(64);
+    let drain = tokio::spawn(async move {
+        let mut sink = a;
+        let mut buf = [0u8; 32];
+        let mut total = 0usize;
+        while let Ok(n) = sink.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        total
+    });
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let mut wc = write_counter(b, Arc::clone(&counter));
+    wc.write_all(&[1, 2, 3, 4]).await.unwrap();
+    wc.write_all(&[5, 6]).await.unwrap();
+    wc.shutdown().await.unwrap();
+    drop(wc);
+    assert_eq!(drain.await.unwrap(), 6);
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        6,
+        "every byte that completes a poll_write must be counted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn write_counter_does_not_count_reads() {
+    // Reads must leave the write counter alone — the splice direction
+    // accounting only tracks egress through this wrapper.
+    let (mut a, b) = tokio::io::duplex(64);
+    let counter = Arc::new(AtomicU64::new(0));
+    let mut wc = write_counter(b, Arc::clone(&counter));
+
+    a.write_all(&[9, 9, 9]).await.unwrap();
+    let mut buf = [0u8; 8];
+    let n = wc.read(&mut buf).await.unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        0,
+        "reads through the wrapper must not increment the write counter"
+    );
+}
+
+#[tokio::test]
+async fn write_counter_is_zero_when_no_writes_attempted() {
+    let (_a, b) = tokio::io::duplex(8);
+    let counter = Arc::new(AtomicU64::new(0));
+    let _wc = write_counter(b, Arc::clone(&counter));
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn write_counter_accumulates_across_many_short_writes() {
+    // Diagnostic value lives in seeing partial bytes-before-RST,
+    // so the count must accumulate across multiple separate
+    // poll_writes rather than being reset per call.
+    let (a, b) = tokio::io::duplex(1024);
+    let drain = tokio::spawn(async move {
+        let mut sink = a;
+        let mut buf = [0u8; 256];
+        while let Ok(n) = sink.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let mut wc = write_counter(b, Arc::clone(&counter));
+    for _ in 0..100 {
+        wc.write_all(&[42u8]).await.unwrap();
+    }
+    wc.shutdown().await.unwrap();
+    drop(wc);
+    drain.await.unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 100);
 }
