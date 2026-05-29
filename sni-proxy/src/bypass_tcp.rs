@@ -19,6 +19,7 @@
 //! were resolved through hermit DNS.
 
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -214,6 +215,12 @@ where
     // flow before the RST?" matters most for debugging.
     let c2u_counter = Arc::new(AtomicU64::new(0));
     let u2c_counter = Arc::new(AtomicU64::new(0));
+    // Snapshot raw fds *before* the move into WriteCounter. We need
+    // them at splice end for getsockopt(TCP_INFO); the underlying
+    // sockets live until the wrappers drop, which happens after the
+    // log lines below, so the fds stay valid.
+    let client_fd = client.as_raw_fd();
+    let upstream_fd = upstream.as_raw_fd();
     let mut client_wrapped = WriteCounter::new(client, Arc::clone(&u2c_counter));
     let mut upstream_wrapped = WriteCounter::new(upstream, Arc::clone(&c2u_counter));
 
@@ -225,15 +232,93 @@ where
     let elapsed_ms = splice_start.elapsed().as_millis();
     let c2u = c2u_counter.load(Ordering::Relaxed);
     let u2c = u2c_counter.load(Ordering::Relaxed);
+    // Per-side TCP_INFO at splice end so the debug log explains
+    // "30s silent then RST"-style stalls without needing tcpdump or
+    // root: kernel-reported state (CLOSE_WAIT / FIN_WAIT_2 /
+    // LAST_ACK / ESTABLISHED…) plus per-side last-data ages and
+    // retransmit counters tell us *which* side stopped talking and
+    // whether the kernel saw a FIN, an RST, or just silence.
+    let ci = tcp_info_snapshot(client_fd);
+    let ui = tcp_info_snapshot(upstream_fd);
+    let cs = tcp_info_state_name(&ci);
+    let us = tcp_info_state_name(&ui);
     match splice {
         Ok(_) => debug!(%client_addr, %dial_target, port = dst_port,
             client_to_upstream_bytes = c2u, upstream_to_client_bytes = u2c,
-            elapsed_ms, "bypass-tcp: splice end"),
+            elapsed_ms,
+            client_state = cs, upstream_state = us,
+            client_last_recv_ms = tcp_info_field(&ci, |i| i.tcpi_last_data_recv),
+            upstream_last_recv_ms = tcp_info_field(&ui, |i| i.tcpi_last_data_recv),
+            client_last_send_ms = tcp_info_field(&ci, |i| i.tcpi_last_data_sent),
+            upstream_last_send_ms = tcp_info_field(&ui, |i| i.tcpi_last_data_sent),
+            client_retrans = tcp_info_field(&ci, |i| i.tcpi_total_retrans),
+            upstream_retrans = tcp_info_field(&ui, |i| i.tcpi_total_retrans),
+            "bypass-tcp: splice end"),
         Err(ref e) => debug!(%client_addr, %dial_target, port = dst_port,
             client_to_upstream_bytes = c2u, upstream_to_client_bytes = u2c,
-            elapsed_ms, error = %e, "bypass-tcp: splice error"),
+            elapsed_ms,
+            error = %e, errno = e.raw_os_error().unwrap_or(0),
+            client_state = cs, upstream_state = us,
+            client_last_recv_ms = tcp_info_field(&ci, |i| i.tcpi_last_data_recv),
+            upstream_last_recv_ms = tcp_info_field(&ui, |i| i.tcpi_last_data_recv),
+            client_last_send_ms = tcp_info_field(&ci, |i| i.tcpi_last_data_sent),
+            upstream_last_send_ms = tcp_info_field(&ui, |i| i.tcpi_last_data_sent),
+            client_retrans = tcp_info_field(&ci, |i| i.tcpi_total_retrans),
+            upstream_retrans = tcp_info_field(&ui, |i| i.tcpi_total_retrans),
+            "bypass-tcp: splice error"),
     }
     Ok(())
+}
+
+/// `getsockopt(TCP_INFO)` on `fd`. Returns `None` if the call fails
+/// (socket closed, not TCP, etc.) — caller logs "unavailable" rather
+/// than guessing. Unprivileged: works for any user that owns the fd.
+fn tcp_info_snapshot(fd: i32) -> Option<libc::tcp_info> {
+    let mut info: std::mem::MaybeUninit<libc::tcp_info> = std::mem::MaybeUninit::zeroed();
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr() as *mut _,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(unsafe { info.assume_init() })
+}
+
+/// Human label for `tcpi_state` so the splice-end log is readable
+/// without a `tcp_states.h` reference. Returns the literal "?" when
+/// the snapshot is missing so the log field width stays predictable.
+fn tcp_info_state_name(info: &Option<libc::tcp_info>) -> &'static str {
+    let Some(i) = info else { return "?" };
+    match i.tcpi_state {
+        1 => "ESTABLISHED",
+        2 => "SYN_SENT",
+        3 => "SYN_RECV",
+        4 => "FIN_WAIT1",
+        5 => "FIN_WAIT2",
+        6 => "TIME_WAIT",
+        7 => "CLOSE",
+        8 => "CLOSE_WAIT",
+        9 => "LAST_ACK",
+        10 => "LISTEN",
+        11 => "CLOSING",
+        12 => "NEW_SYN_RECV",
+        _ => "unknown",
+    }
+}
+
+/// Project a single `u32` field out of an optional snapshot.
+/// `u32::MAX` is a sentinel for "no snapshot" — chosen because
+/// real `tcpi_*_ms` fields cap out much lower (milliseconds since
+/// a recent event) and any reader can spot the marker immediately.
+fn tcp_info_field(info: &Option<libc::tcp_info>, f: impl Fn(&libc::tcp_info) -> u32) -> u32 {
+    info.as_ref().map(f).unwrap_or(u32::MAX)
 }
 
 /// `AsyncRead + AsyncWrite` adapter that ticks a shared counter on
@@ -316,5 +401,14 @@ pub mod __test_internals {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         super::WriteCounter::new(inner, bytes)
+    }
+
+    /// `(state_name, last_data_recv_ms)` projected from
+    /// `getsockopt(TCP_INFO)` on `fd`. `None` if the call failed.
+    /// Test-only: exposes just enough of the snapshot to verify the
+    /// diagnostic plumbing without re-exporting `libc::tcp_info`.
+    pub fn tcp_info_for_test(fd: i32) -> Option<(&'static str, u32)> {
+        let info = super::tcp_info_snapshot(fd)?;
+        Some((super::tcp_info_state_name(&Some(info)), info.tcpi_last_data_recv))
     }
 }

@@ -4,7 +4,7 @@
 //! adapter is reached through `__test_internals::write_counter`.
 
 use sni_proxy::block_log::BlockLogger;
-use sni_proxy::bypass_tcp::__test_internals::write_counter;
+use sni_proxy::bypass_tcp::__test_internals::{tcp_info_for_test, write_counter};
 use sni_proxy::bypass_tcp::{handle_connection_at, BypassTcpConfig};
 use sni_proxy::connector::DirectConnector;
 use sni_proxy::dns_cache::DnsCache;
@@ -347,6 +347,54 @@ async fn write_counter_is_zero_when_no_writes_attempted() {
     let counter = Arc::new(AtomicU64::new(0));
     let _wc = write_counter(b, Arc::clone(&counter));
     assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn tcp_info_reports_established_on_live_loopback_pair() {
+    // Surface check for the diagnostic helper used to enrich the
+    // splice-end / splice-error log line. The shape we care about:
+    //  - returns Some on a live TCP fd (any user can call it — no
+    //    root needed)
+    //  - state is ESTABLISHED while the peer is still connected
+    //  - last_data_recv is small (we just received bytes)
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        s.write_all(b"hi").await.unwrap();
+        // Keep the connection open so TCP_INFO on the client side
+        // still sees ESTABLISHED when we read it below.
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 2];
+    client.read_exact(&mut buf).await.unwrap();
+
+    use std::os::fd::AsRawFd;
+    let (state, last_recv_ms) =
+        tcp_info_for_test(client.as_raw_fd()).expect("TCP_INFO must work on a live TCP fd");
+    assert_eq!(state, "ESTABLISHED");
+    assert!(
+        last_recv_ms < 1000,
+        "we just read bytes; tcpi_last_data_recv ({last_recv_ms}ms) should be small"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_info_returns_none_on_non_tcp_fd() {
+    // Helper must degrade gracefully when handed a non-TCP fd —
+    // the splice-end log path tolerates None and substitutes "?" /
+    // u32::MAX rather than crashing.
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open("/dev/null").unwrap();
+    assert!(
+        tcp_info_for_test(f.as_raw_fd()).is_none(),
+        "TCP_INFO on a non-TCP fd must return None"
+    );
 }
 
 #[tokio::test]
