@@ -219,9 +219,10 @@ fn proxy_subcommand(args: ProxyArgs) -> Result<i32> {
 
     let dns_upstream = config.dns().upstream_addr()?;
 
-    // Build a tokio runtime and spawn the proxy services.
-    let rt = tokio::runtime::Runtime::new()
-        .context("creating tokio runtime")?;
+    // Build a tokio runtime and spawn the proxy services. Thread
+    // count configurable via HERMIT_PROXY_WORKER_THREADS — see
+    // `hermit::process::build_proxy_runtime`.
+    let rt = hermit::process::build_proxy_runtime()?;
 
     let block_log = build_block_log(&rt, &args)?;
     let access_log = match &args.access_log {

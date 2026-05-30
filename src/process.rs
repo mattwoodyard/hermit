@@ -405,6 +405,39 @@ fn parent_main(
 // Proxied fork (SNI proxy + fake DNS in parent, nftables in child)
 // =========================================================================
 
+/// Build the tokio runtime used by hermit's proxy services. Reads
+/// `HERMIT_PROXY_WORKER_THREADS` for an explicit thread count; when
+/// unset, falls back to tokio's default of one worker per logical
+/// CPU. Either choice is logged at info so a misconfigured value
+/// surfaces in the same place users look for "is the proxy alive".
+///
+/// `enable_all()` switches on both IO and time drivers — both are
+/// load-bearing (TcpListener / UdpSocket need IO; timeouts and the
+/// bypass-tcp idle watchdog need time).
+pub fn build_proxy_runtime() -> Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    match std::env::var("HERMIT_PROXY_WORKER_THREADS") {
+        Ok(s) => {
+            let n: usize = s.parse().with_context(|| {
+                format!("HERMIT_PROXY_WORKER_THREADS={s:?} is not a positive integer")
+            })?;
+            if n == 0 {
+                bail!("HERMIT_PROXY_WORKER_THREADS must be > 0, got 0");
+            }
+            builder.worker_threads(n);
+            info!("proxy runtime: {n} worker threads (HERMIT_PROXY_WORKER_THREADS)");
+        }
+        Err(_) => {
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            info!("proxy runtime: {n} worker threads (default; per logical CPU)");
+        }
+    }
+    builder.build().context("creating tokio runtime")
+}
+
 /// Run a sandboxed command with SNI proxy and fake DNS.
 ///
 /// Architecture:
@@ -901,9 +934,10 @@ fn parent_main_proxied(
     ns_reader.wait()?;
     info!("parent: child namespace ready, starting proxy services");
 
-    // Build a tokio runtime for the proxy services
-    let rt = tokio::runtime::Runtime::new()
-        .context("failed to create tokio runtime")?;
+    // Build a tokio runtime for the proxy services. Thread count is
+    // configurable via HERMIT_PROXY_WORKER_THREADS; see
+    // `build_proxy_runtime` for the default.
+    let rt = build_proxy_runtime()?;
 
     // Convert raw fds to tokio types
     let https_listener = fd_to_tokio_listener(https_raw_fd, &rt)
