@@ -4,7 +4,9 @@
 //! adapter is reached through `__test_internals::write_counter`.
 
 use sni_proxy::block_log::BlockLogger;
-use sni_proxy::bypass_tcp::__test_internals::{tcp_info_for_test, write_counter};
+use sni_proxy::bypass_tcp::__test_internals::{
+    tcp_info_for_test, watch_idle_splice, write_counter,
+};
 use sni_proxy::bypass_tcp::{handle_connection_at, BypassTcpConfig};
 use sni_proxy::connector::DirectConnector;
 use sni_proxy::dns_cache::DnsCache;
@@ -453,6 +455,64 @@ async fn tcp_info_reports_established_on_live_loopback_pair() {
 
     drop(client);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn watch_idle_splice_returns_timeout_when_no_traffic_ever() {
+    // Counters never advance → watchdog must surface a TimedOut
+    // io::Error within ~idle_timeout + one poll_interval. We bound
+    // the test on the outer side with a generous 1s deadline so a
+    // regression that wedges the future fails fast instead of
+    // hanging CI.
+    use sni_proxy::bypass_tcp::__test_internals::watch_idle_splice as wis;
+    let c2u = Arc::new(AtomicU64::new(0));
+    let u2c = Arc::new(AtomicU64::new(0));
+    let err = tokio::time::timeout(
+        StdDuration::from_millis(1000),
+        wis(c2u, u2c, StdDuration::from_millis(50), StdDuration::from_millis(10)),
+    )
+    .await
+    .expect("watchdog should fire within the outer 1s window");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[tokio::test]
+async fn watch_idle_splice_does_not_fire_while_traffic_is_moving() {
+    // Bump one counter every poll interval; the watchdog must
+    // never fire as long as either counter is advancing. We let
+    // it run for several idle-timeouts to make sure it isn't just
+    // "delayed" — then cancel the watchdog via the outer
+    // timeout (the watchdog has no Ok return path, so a non-fire
+    // surfaces as our outer Elapsed).
+    let c2u = Arc::new(AtomicU64::new(0));
+    let u2c = Arc::new(AtomicU64::new(0));
+    let bumper_c2u = Arc::clone(&c2u);
+    let bumper = tokio::spawn(async move {
+        for _ in 0..40 {
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+            bumper_c2u.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let outcome = tokio::time::timeout(
+        StdDuration::from_millis(300),
+        watch_idle_splice(
+            Arc::clone(&c2u),
+            Arc::clone(&u2c),
+            StdDuration::from_millis(50),  // idle_timeout — much smaller than the 300ms outer
+            StdDuration::from_millis(10),
+        ),
+    )
+    .await;
+    bumper.await.unwrap();
+    // The outer timeout firing (Err(Elapsed)) is what we want — it
+    // means the watchdog future was still polling and not
+    // returning. The unwanted outcome is Ok(io::Error) which
+    // would mean the watchdog declared "idle" while we were
+    // demonstrably making progress.
+    assert!(
+        outcome.is_err(),
+        "watchdog fired while traffic was advancing: {outcome:?}"
+    );
 }
 
 #[tokio::test]

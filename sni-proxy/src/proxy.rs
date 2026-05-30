@@ -201,18 +201,29 @@ where
     Ok(())
 }
 
-/// Attempt to recover the original destination address from a REDIRECTed socket.
+/// Attempt to recover the original destination address from a
+/// DNAT'd (REDIRECTed) socket. Probes the socket's local-address
+/// family to pick the right `getsockopt` ABI; returns `None` if
+/// the call fails (typically because no DNAT was in the path).
 ///
-/// Returns `None` if the getsockopt fails (e.g. not a redirected connection).
+/// IPv4: `getsockopt(SOL_IP, SO_ORIGINAL_DST=80, sockaddr_in)`.
+/// IPv6: `getsockopt(IPPROTO_IPV6, IP6T_SO_ORIGINAL_DST=80,
+/// sockaddr_in6)` — same option *number*, different level, larger
+/// struct. The two ABIs are distinct and asking with the wrong
+/// one silently truncates or returns EOPNOTSUPP.
 pub fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
     use std::os::unix::io::AsRawFd;
-
     let fd = stream.as_raw_fd();
+    match stream.local_addr().ok()? {
+        SocketAddr::V4(_) => get_original_dst_v4(fd),
+        SocketAddr::V6(_) => get_original_dst_v6(fd),
+    }
+}
 
-    // SOL_IP = 0, SO_ORIGINAL_DST = 80
+fn get_original_dst_v4(fd: std::os::unix::io::RawFd) -> Option<SocketAddr> {
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-
+    let mut len: libc::socklen_t =
+        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     let ret = unsafe {
         libc::getsockopt(
             fd,
@@ -222,12 +233,39 @@ pub fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
             &mut len,
         )
     };
-
-    if ret == 0 {
-        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-        let port = u16::from_be(addr.sin_port);
-        Some(SocketAddr::new(ip.into(), port))
-    } else {
-        None
+    if ret != 0 {
+        return None;
     }
+    let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+    let port = u16::from_be(addr.sin_port);
+    Some(SocketAddr::new(ip.into(), port))
+}
+
+fn get_original_dst_v6(fd: std::os::unix::io::RawFd) -> Option<SocketAddr> {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+    let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t =
+        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    // `IP6T_SO_ORIGINAL_DST` is 80 (same number as the v4 option,
+    // but at `IPPROTO_IPV6`). libc doesn't expose the constant
+    // directly; the kernel header `linux/netfilter_ipv6/ip6_tables.h`
+    // defines it as 80.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            80, // IP6T_SO_ORIGINAL_DST
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    Some(SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::from(addr.sin6_addr.s6_addr),
+        u16::from_be(addr.sin6_port),
+        u32::from_be(addr.sin6_flowinfo),
+        u32::from_be(addr.sin6_scope_id),
+    )))
 }

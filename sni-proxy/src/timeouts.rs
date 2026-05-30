@@ -38,3 +38,11 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// some servers), this trips before the rest of the request can
 /// be parked behind it.
 pub const UPSTREAM_TLS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Max idle window on a bypass-tcp splice. If neither direction
+/// has moved a byte for this long, the relay aborts the splice
+/// instead of holding the connection open forever. Bounds the
+/// "well-behaved silent peer" case where `copy_bidirectional`
+/// would otherwise wait indefinitely. Generous default (10 min)
+/// so legitimately idle SSH / persistent LDAP doesn't trip.
+pub const BYPASS_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(600);

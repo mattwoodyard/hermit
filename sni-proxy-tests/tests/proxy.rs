@@ -22,3 +22,25 @@ fn get_original_dst_returns_none_on_normal_socket() {
         assert!(get_original_dst(&client).is_none());
     });
 }
+
+#[test]
+fn get_original_dst_handles_ipv6_socket_without_crashing() {
+    // Regression for the v4-only assumption in get_original_dst:
+    // probing an IPv6 socket used to call getsockopt with the v4
+    // (sockaddr_in) ABI, which would either truncate the reply or
+    // return success with garbage. After the v6 patch, a non-DNAT'd
+    // v6 socket must return None just like the v4 path — no panic,
+    // no junk address. We can't easily stage a real DNAT'd v6 tuple
+    // in a unit test, but the no-DNAT loopback path exercises the
+    // family-probe + the v6 getsockopt branch.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        assert!(get_original_dst(&client).is_none());
+    });
+}

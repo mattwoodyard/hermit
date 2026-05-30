@@ -38,7 +38,7 @@ use crate::connector::UpstreamConnector;
 use crate::dns_cache::DnsCache;
 use crate::policy::{BypassProtocol, RuleSet};
 use crate::proxy::{get_original_dst, MAX_CONCURRENT_CONNECTIONS};
-use crate::timeouts::UPSTREAM_CONNECT_TIMEOUT;
+use crate::timeouts::{BYPASS_TCP_IDLE_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT};
 
 /// Per-listener configuration. Each bypass `(protocol=tcp, port=N)`
 /// gets its own `BypassTcpConfig` and its own accept loop.
@@ -60,12 +60,22 @@ where
     let local = listener.local_addr().ok();
     tracing::info!(port = config.port, ?local, "bypass-tcp: accept loop starting");
     let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // Exponential backoff on accept failure: 10ms → 20ms → … →
+    // capped at 1s. Reset on success. Constant-10ms-forever spins
+    // CPU and floods logs when the listener is in a hot-broken
+    // state (e.g. fd closed under us).
+    let mut accept_backoff_ms = 10u64;
     loop {
         let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
+            Ok(v) => {
+                accept_backoff_ms = 10;
+                v
+            }
             Err(e) => {
-                warn!(error = %e, "bypass-tcp: accept failed; continuing");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                warn!(error = %e, backoff_ms = accept_backoff_ms,
+                    "bypass-tcp: accept failed; backing off");
+                tokio::time::sleep(Duration::from_millis(accept_backoff_ms)).await;
+                accept_backoff_ms = (accept_backoff_ms.saturating_mul(2)).min(1000);
                 continue;
             }
         };
@@ -153,8 +163,13 @@ where
     debug!(%client_addr, hostname = ?hostname_opt, allowed,
         "bypass-tcp: policy decision");
     if !allowed {
-        debug!(%client_addr, ?hostname_opt, %dst_ip, port = config.port,
-            "bypass-tcp: no matching rule, denying");
+        // Visible at the default log level (warn) so a denied flow
+        // doesn't require -vv to diagnose. The block-log entry below
+        // still carries the structured payload for offline analysis;
+        // this warn! is for "the user is staring at stderr asking
+        // why their connection just hung".
+        warn!(%client_addr, ?hostname_opt, %dst_ip, port = config.port,
+            "bypass-tcp: deny (no matching rule)");
         config.block_log.log(BlockEvent {
             time_unix_ms: now_unix_ms(),
             kind: BlockKind::Http,
@@ -227,8 +242,23 @@ where
     let splice_start = std::time::Instant::now();
     debug!(%client_addr, %dial_target, port = dst_port,
         "bypass-tcp: splice begin");
-    let splice =
-        tokio::io::copy_bidirectional(&mut client_wrapped, &mut upstream_wrapped).await;
+    // Race the splice against an idle watchdog: poll the existing
+    // direction counters; if neither has advanced for
+    // BYPASS_TCP_IDLE_TIMEOUT we abort the splice. Without this a
+    // well-behaved-but-silent peer (or a NAT-eaten ESTABLISHED
+    // entry) holds a relay slot indefinitely.
+    let watchdog = watch_idle_splice(
+        Arc::clone(&c2u_counter),
+        Arc::clone(&u2c_counter),
+        BYPASS_TCP_IDLE_TIMEOUT,
+        Duration::from_secs(1),
+    );
+    let splice = tokio::select! {
+        r = tokio::io::copy_bidirectional(
+            &mut client_wrapped, &mut upstream_wrapped,
+        ) => r,
+        e = watchdog => Err(e),
+    };
     let elapsed_ms = splice_start.elapsed().as_millis();
     let c2u = c2u_counter.load(Ordering::Relaxed);
     let u2c = u2c_counter.load(Ordering::Relaxed);
@@ -289,6 +319,41 @@ where
         libc::shutdown(upstream_fd, libc::SHUT_RDWR);
     }
     Ok(())
+}
+
+/// Splice-idle watchdog. Polls both direction counters every
+/// `poll_interval`; returns when the *sum* hasn't advanced for
+/// `idle_timeout`. Always returns an error (the future is meant
+/// to be raced against the real splice via `tokio::select!`; if
+/// the splice wins this future is dropped).
+///
+/// Reads the existing `AtomicU64` counters maintained by the two
+/// `WriteCounter` wrappers, so there's no extra accounting on the
+/// hot data path. Counter sum is enough — a direction-specific
+/// stall (e.g. half-close) doesn't trip the watchdog as long as
+/// the *other* direction is still moving bytes, which matches the
+/// semantics we want.
+pub(crate) async fn watch_idle_splice(
+    c2u: Arc<AtomicU64>,
+    u2c: Arc<AtomicU64>,
+    idle_timeout: Duration,
+    poll_interval: Duration,
+) -> std::io::Error {
+    let mut last_total = 0u64;
+    let mut last_progress = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        let now_total = c2u.load(Ordering::Relaxed) + u2c.load(Ordering::Relaxed);
+        if now_total != last_total {
+            last_total = now_total;
+            last_progress = std::time::Instant::now();
+        } else if last_progress.elapsed() >= idle_timeout {
+            return std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "bypass-tcp splice idle timeout",
+            );
+        }
+    }
 }
 
 /// `getsockopt(TCP_INFO)` on `fd`. Returns `None` if the call fails
@@ -431,5 +496,18 @@ pub mod __test_internals {
     pub fn tcp_info_for_test(fd: i32) -> Option<(&'static str, u32)> {
         let info = super::tcp_info_snapshot(fd)?;
         Some((super::tcp_info_state_name(&Some(info)), info.tcpi_last_data_recv))
+    }
+
+    /// Run the splice-idle watchdog with caller-supplied poll
+    /// interval (production uses 1s; tests use ~10ms so the
+    /// `idle_timeout` can also be small and the test runs fast).
+    /// Returns the `io::Error` the watchdog would have surfaced.
+    pub async fn watch_idle_splice(
+        c2u: Arc<AtomicU64>,
+        u2c: Arc<AtomicU64>,
+        idle_timeout: std::time::Duration,
+        poll_interval: std::time::Duration,
+    ) -> std::io::Error {
+        super::watch_idle_splice(c2u, u2c, idle_timeout, poll_interval).await
     }
 }
