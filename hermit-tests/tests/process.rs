@@ -188,6 +188,7 @@ fn sample_layout(tcp: usize, udp: usize, learn: bool) -> FdLayout {
         bypass_tcp,
         bypass_udp_v4,
         bypass_udp_v6,
+        conntrack: 777,
         observer: if learn { Some(999) } else { None },
     }
 }
@@ -195,13 +196,13 @@ fn sample_layout(tcp: usize, udp: usize, learn: bool) -> FdLayout {
 #[test]
 fn fd_layout_to_vec_no_bypass_no_learn() {
     let l = sample_layout(0, 0, false);
-    assert_eq!(l.to_vec(), vec![3, 4, 5]);
+    assert_eq!(l.to_vec(), vec![3, 4, 5, 777]);
 }
 
 #[test]
-fn fd_layout_to_vec_includes_bypass_tcp_then_udp_then_observer() {
+fn fd_layout_to_vec_includes_bypass_tcp_then_udp_then_conntrack_then_observer() {
     let l = sample_layout(2, 1, true);
-    assert_eq!(l.to_vec(), vec![3, 4, 5, 10, 11, 100, 200, 999]);
+    assert_eq!(l.to_vec(), vec![3, 4, 5, 10, 11, 100, 200, 777, 999]);
 }
 
 #[test]
@@ -214,6 +215,7 @@ fn fd_layout_round_trip_no_bypass() {
     assert!(parsed.bypass_tcp.is_empty());
     assert!(parsed.bypass_udp_v4.is_empty());
     assert!(parsed.bypass_udp_v6.is_empty());
+    assert_eq!(parsed.conntrack, original.conntrack);
     assert!(parsed.observer.is_none());
 }
 
@@ -225,6 +227,7 @@ fn fd_layout_round_trip_with_bypass_and_learn() {
     assert_eq!(parsed.bypass_tcp, vec![10, 11, 12]);
     assert_eq!(parsed.bypass_udp_v4, vec![100, 101]);
     assert_eq!(parsed.bypass_udp_v6, vec![200, 201]);
+    assert_eq!(parsed.conntrack, 777);
     assert_eq!(parsed.observer, Some(999));
 }
 
@@ -232,7 +235,8 @@ fn fd_layout_round_trip_with_bypass_and_learn() {
 fn fd_layout_from_vec_rejects_short_buffer() {
     let err = FdLayout::from_vec(vec![3, 4, 5], 1, 0, false).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("expected 4"), "got: {msg}");
+    // (3 fixed + 1 tcp + 1 conntrack) = 5
+    assert!(msg.contains("expected 5"), "got: {msg}");
     assert!(msg.contains("got 3"), "got: {msg}");
 }
 

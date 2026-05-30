@@ -3,6 +3,7 @@ pub mod bypass_tcp;
 pub mod bypass_udp;
 pub mod ca;
 pub mod connector;
+pub mod conntrack;
 pub mod credential;
 pub mod dispatch;
 pub mod dns;

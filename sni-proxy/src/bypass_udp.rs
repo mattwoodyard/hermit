@@ -99,9 +99,22 @@ pub struct Session {
 pub type Sessions = Arc<Mutex<HashMap<SocketAddr, Session>>>;
 
 /// Run the UDP bypass relay on a socket the child bound and handed
-/// over via SCM_RIGHTS. The returned future never completes under
-/// normal operation — it lives as long as the sandbox does.
-pub async fn run(raw_fd: RawFd, config: Arc<BypassUdpConfig>) -> Result<()> {
+/// over via SCM_RIGHTS. `conntrack` is a [`crate::conntrack::Conntrack`]
+/// whose underlying fd was opened *in the child netns* so we can ask
+/// conntrack what the pre-NAT destination of each DNAT'd datagram
+/// was — `IP_RECVORIGDSTADDR` cmsg only returns the post-NAT dst,
+/// which is the listener's own address. The same `Conntrack`
+/// instance is shared across all bypass-udp relays (one per
+/// `(real_port, family)` pair) so concurrent lookups serialize
+/// through a single mutex on the netlink fd.
+///
+/// The returned future never completes under normal operation — it
+/// lives as long as the sandbox does.
+pub async fn run(
+    raw_fd: RawFd,
+    conntrack: Arc<crate::conntrack::Conntrack>,
+    config: Arc<BypassUdpConfig>,
+) -> Result<()> {
     // Ownership: wrapping the raw fd in a std UdpSocket makes sure
     // the fd is closed on drop. AsyncFd will take ownership below.
     let listener = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
@@ -116,7 +129,15 @@ pub async fn run(raw_fd: RawFd, config: Arc<BypassUdpConfig>) -> Result<()> {
 
     let listener_fd = listener.as_raw_fd();
     let family = config.family;
+    // Snapshot the listener's bound address up front — used as the
+    // src half of every conntrack reply-tuple lookup. getsockname
+    // gives us the actual port the child bound (e.g. relay_port),
+    // which is *not* the same as `config.port` (the real service
+    // port like 88).
+    let listener_addr = getsockname(listener_fd, family)
+        .context("getsockname on bypass-udp listener")?;
     info!(port = config.port, ?family, fd = listener_fd,
+        %listener_addr,
         "bypass-udp: relay starting");
     let async_fd = AsyncFd::new(listener)
         .context("wrapping bypass-udp fd with AsyncFd")?;
@@ -132,7 +153,32 @@ pub async fn run(raw_fd: RawFd, config: Arc<BypassUdpConfig>) -> Result<()> {
             }
         };
         match recv_with_orig_dst(listener_fd, family) {
-            Ok(Some(pkt)) => {
+            Ok(Some(mut pkt)) => {
+                // Replace the cmsg-derived `orig_dst` (which is the
+                // post-NAT listener addr — useless for policy) with
+                // the pre-NAT addr from conntrack. The cmsg path is
+                // kept upstream so tests injecting `RecvPacket`
+                // directly can still bypass conntrack.
+                match conntrack.lookup_udp_orig_dst(listener_addr, pkt.src) {
+                    Ok(real_dst) => pkt.orig_dst = Some(real_dst),
+                    Err(e) => {
+                        debug!(src = ?pkt.src, error = %e,
+                            "bypass-udp: conntrack lookup failed; dropping");
+                        config.block_log.log(BlockEvent {
+                            time_unix_ms: now_unix_ms(),
+                            kind: BlockKind::Http,
+                            client: Some(pkt.src.to_string()),
+                            hostname: None,
+                            method: None,
+                            path: None,
+                            port: None,
+                            reason: Some(format!(
+                                "bypass-udp: conntrack lookup failed: {e}"
+                            )),
+                        });
+                        continue;
+                    }
+                }
                 trace!(port = config.port, ?family, src = ?pkt.src,
                     orig_dst = ?pkt.orig_dst, bytes = pkt.data.len(),
                     "bypass-udp: received datagram");
@@ -150,6 +196,23 @@ pub async fn run(raw_fd: RawFd, config: Arc<BypassUdpConfig>) -> Result<()> {
             }
         }
     }
+}
+
+/// `getsockname` on a UDP fd, returning the bound address. Family is
+/// passed in (rather than inspecting the sockaddr) because we know
+/// it from `config` and a length-check on the v4 path catches kernel
+/// surprises.
+fn getsockname(fd: RawFd, family: IpFamily) -> io::Result<SocketAddr> {
+    let mut storage: std::mem::MaybeUninit<libc::sockaddr_in6> =
+        std::mem::MaybeUninit::zeroed();
+    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(fd, storage.as_mut_ptr() as *mut _, &mut len)
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { sockaddr_to_socket_addr(storage.as_ptr() as *const libc::sockaddr, family) }
 }
 
 /// One datagram pulled off the listener.

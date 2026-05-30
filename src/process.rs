@@ -582,21 +582,30 @@ pub struct FdLayout {
     pub bypass_tcp: Vec<i32>,
     pub bypass_udp_v4: Vec<i32>,
     pub bypass_udp_v6: Vec<i32>,
+    /// `NETLINK_NETFILTER` socket opened in the child netns, used
+    /// by the parent-side bypass-udp relay to ask conntrack for the
+    /// pre-NAT destination of each DNAT'd datagram (the
+    /// `IP_RECVORIGDSTADDR` cmsg only returns the listener's own
+    /// post-NAT address, which is useless for policy matching).
+    pub conntrack: i32,
     /// Present only in `hermit learn`; never sent in normal runs.
     pub observer: Option<i32>,
 }
 
 impl FdLayout {
     /// Total fd count for a given (tcp, udp, learn_mode) shape.
+    /// `3` = HTTPS + HTTP + DNS; `+1` for the conntrack netlink fd
+    /// (always sent); `+1` for the learn-mode observer when set.
     pub fn expected_total(tcp_count: usize, udp_count: usize, learn_mode: bool) -> usize {
-        3 + tcp_count + 2 * udp_count + if learn_mode { 1 } else { 0 }
+        3 + tcp_count + 2 * udp_count + 1 + if learn_mode { 1 } else { 0 }
     }
 
     /// Canonical wire order: HTTPS, HTTP, DNS, bypass_tcp[..],
-    /// bypass_udp_v4[..], bypass_udp_v6[..], (observer).
+    /// bypass_udp_v4[..], bypass_udp_v6[..], conntrack, (observer).
     pub fn to_vec(&self) -> Vec<i32> {
         let mut out = Vec::with_capacity(
             3 + self.bypass_tcp.len() + self.bypass_udp_v4.len() + self.bypass_udp_v6.len()
+                + 1
                 + if self.observer.is_some() { 1 } else { 0 },
         );
         out.push(self.https);
@@ -605,6 +614,7 @@ impl FdLayout {
         out.extend_from_slice(&self.bypass_tcp);
         out.extend_from_slice(&self.bypass_udp_v4);
         out.extend_from_slice(&self.bypass_udp_v6);
+        out.push(self.conntrack);
         if let Some(o) = self.observer {
             out.push(o);
         }
@@ -624,7 +634,7 @@ impl FdLayout {
         let expected = Self::expected_total(tcp_count, udp_count, learn_mode);
         if fds.len() != expected {
             bail!(
-                "fd layout mismatch: expected {} fds (3 fixed + {} tcp + 2×{} udp{}), got {}",
+                "fd layout mismatch: expected {} fds (3 fixed + {} tcp + 2×{} udp + 1 conntrack{}), got {}",
                 expected,
                 tcp_count,
                 udp_count,
@@ -635,15 +645,17 @@ impl FdLayout {
         let tcp_start = 3;
         let udp_v4_start = tcp_start + tcp_count;
         let udp_v6_start = udp_v4_start + udp_count;
-        let observer_start = udp_v6_start + udp_count;
+        let conntrack_idx = udp_v6_start + udp_count;
+        let observer_idx = conntrack_idx + 1;
         Ok(FdLayout {
             https: fds[0],
             http: fds[1],
             dns: fds[2],
             bypass_tcp: fds[tcp_start..udp_v4_start].to_vec(),
             bypass_udp_v4: fds[udp_v4_start..udp_v6_start].to_vec(),
-            bypass_udp_v6: fds[udp_v6_start..observer_start].to_vec(),
-            observer: if learn_mode { Some(fds[observer_start]) } else { None },
+            bypass_udp_v6: fds[udp_v6_start..conntrack_idx].to_vec(),
+            conntrack: fds[conntrack_idx],
+            observer: if learn_mode { Some(fds[observer_idx]) } else { None },
         })
     }
 }
@@ -791,6 +803,16 @@ fn child_proxied_setup(
         bypass_udp_v4.len(),
     );
 
+    // Open a `NETLINK_NETFILTER` socket in the child netns so the
+    // parent-side bypass-udp relay can ask conntrack for the pre-NAT
+    // destination of DNAT'd datagrams (the cmsg path returns the
+    // post-NAT listener address, which is no help for policy
+    // matching). The fd retains its netns affiliation across the
+    // SCM_RIGHTS handoff — operations on it from the parent still
+    // hit the child's conntrack table.
+    let conntrack_fd = sni_proxy::conntrack::open_socket()
+        .context("opening conntrack netlink socket in child netns")?;
+
     // Send the fds to the parent. `FdLayout::to_vec` is the single
     // source of truth for the wire order; the parent reconstructs the
     // same shape via `FdLayout::from_vec` keyed on `learn_mode` and
@@ -802,11 +824,15 @@ fn child_proxied_setup(
         bypass_tcp: bypass_tcp_listeners.iter().map(|l| l.as_raw_fd()).collect(),
         bypass_udp_v4: bypass_udp_v4.iter().map(|s| s.as_raw_fd()).collect(),
         bypass_udp_v6: bypass_udp_v6.iter().map(|s| s.as_raw_fd()).collect(),
+        conntrack: conntrack_fd,
         observer: learn_observer_listener.as_ref().map(|l| l.as_raw_fd()),
     };
     fdpass::send_fds(sock_fd, &layout.to_vec())
         .context("failed to send listener fds to parent")?;
     fdpass::close_fd(sock_fd);
+    // Drop our copy of the conntrack fd in the child — the parent
+    // owns it now and the child doesn't query conntrack.
+    unsafe { libc::close(conntrack_fd) };
 
     // Override /etc/resolv.conf to point at our fake DNS server
     netns::write_resolv_conf()?;
@@ -865,6 +891,10 @@ fn parent_main_proxied(
     let bypass_tcp_raw_fds: Vec<i32> = layout.bypass_tcp;
     let bypass_udp_v4_raw_fds: Vec<i32> = layout.bypass_udp_v4;
     let bypass_udp_v6_raw_fds: Vec<i32> = layout.bypass_udp_v6;
+    // Shared across all bypass-udp tasks (v4 + v6 × per port). Holds
+    // the netlink fd plus a mutex so concurrent CT lookups can't
+    // interleave on the wire — see `sni_proxy::conntrack::Conntrack`.
+    let conntrack = Arc::new(sni_proxy::conntrack::Conntrack::new(layout.conntrack));
     let learn_observer_raw_fd: Option<i32> = layout.observer;
 
     // Wait for child to complete all setup (namespace, nftables, landlock)
@@ -1057,8 +1087,9 @@ fn parent_main_proxied(
             let real_port = alloc.real_port;
             let label = label.to_string();
             let label_for_task = label.clone();
+            let ct = Arc::clone(&conntrack);
             let handle = rt.spawn(async move {
-                if let Err(e) = sni_proxy::bypass_udp::run(raw_fd, cfg).await {
+                if let Err(e) = sni_proxy::bypass_udp::run(raw_fd, ct, cfg).await {
                     error!("bypass-udp relay ({} port {}) error: {}", label_for_task, real_port, e);
                 }
             });
